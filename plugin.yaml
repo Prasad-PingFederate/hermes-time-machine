@@ -1,6 +1,7 @@
 name: hermes-time-machine
-version: 0.1.0
-description: "Visual timeline + one-click restore & branch for autonomous Hermes sessions. Makes checkpoints fearless."
+version: "0.2.0"
+description: "Unified Time Machine for Hermes Agent: pairs shadow-git filesystem checkpoints with state.db conversation turns for atomic rewind, diff, and session branching."
+author: "Prasad-PingFederate"
 manifest_version: 2
 api_version: 1
 license: MIT
