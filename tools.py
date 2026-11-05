@@ -12,7 +12,10 @@ import logging
 from functools import partial
 from typing import Any, Dict, Optional
 
-from .ledger import TimeMachineLedger, resolve_working_dir
+try:
+    from .ledger import TimeMachineLedger, resolve_working_dir
+except (ImportError, ValueError):
+    from ledger import TimeMachineLedger, resolve_working_dir
 
 logger = logging.getLogger(__name__)
 
