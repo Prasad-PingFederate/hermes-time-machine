@@ -67,7 +67,6 @@ def resolve_working_dir(
             p = Path(val).expanduser().resolve()
             parent = p if p.is_dir() else p.parent
             if parent.exists():
-                # Walk up to git root if inside a repo, else parent
                 cur = parent
                 while cur != cur.parent:
                     if (cur / ".git").exists():
@@ -161,6 +160,15 @@ class TimeMachineLedger:
             logger.debug("CheckpointManager import failed: %s", exc)
             return None
 
+    def _get_session_db(self):
+        """Return an active Hermes SessionDB instance if available."""
+        try:
+            from hermes_state import SessionDB
+            return SessionDB(db_path=self.hermes_home / "state.db")
+        except Exception as exc:
+            logger.debug("SessionDB import failed: %s", exc)
+            return None
+
     def _project_hash16(self, working_dir: str) -> str:
         abs_dir = str(Path(working_dir).expanduser().resolve())
         return hashlib.sha256(abs_dir.encode("utf-8")).hexdigest()[:16]
@@ -241,7 +249,6 @@ class TimeMachineLedger:
 
         wdir = working_dir or resolve_working_dir(args, session_id, self.hermes_home)
         reason = f"pre:{tool_name}"
-        checkpoint_hash = None
         if tool_name in MUTATING_TOOLS:
             checkpoint_hash = self.ensure_and_get_checkpoint(wdir, reason=reason)
         else:
@@ -325,13 +332,13 @@ class TimeMachineLedger:
         deletions = 0
 
         if tool_name in MUTATING_TOOLS and status == "ok":
+            post_hash = self.ensure_and_get_checkpoint(wdir, reason=f"post:{tool_name}") or post_hash
             mgr = self._get_checkpoint_manager()
             if mgr is not None:
                 try:
                     checkpoints = mgr.list_checkpoints(wdir)
                     if checkpoints:
                         latest = checkpoints[0]
-                        post_hash = latest.get("hash") or post_hash
                         files_changed = int(latest.get("files_changed") or 0)
                         insertions = int(latest.get("insertions") or 0)
                         deletions = int(latest.get("deletions") or 0)
@@ -364,19 +371,461 @@ class TimeMachineLedger:
 
         return self.get_snapshot(snap["id"])
 
-    def get_snapshot(self, snap_id: str) -> Optional[Dict[str, Any]]:
+    def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        if not snapshot_id:
+            return None
         with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT * FROM snapshots WHERE id = ?", (snap_id,))
+            cur = conn.execute("SELECT * FROM snapshots WHERE id = ?", (snapshot_id,))
             row = cur.fetchone()
+            if not row:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM snapshots
+                    WHERE id LIKE ? OR checkpoint_hash LIKE ? OR post_checkpoint_hash LIKE ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (f"{snapshot_id}%", f"{snapshot_id}%", f"{snapshot_id}%"),
+                )
+                row = cur.fetchone()
             return dict(row) if row else None
 
-    def list_for_session(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_snapshots(
+        self,
+        session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+        limit: int = 50,
+        include_raw_checkpoints: bool = True,
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if working_dir:
+            abs_wdir = str(Path(working_dir).expanduser().resolve())
+            clauses.append("working_dir = ?")
+            params.append(abs_wdir)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM snapshots {where_sql} ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+
         with self._lock, self._connect() as conn:
-            cur = conn.execute(
-                "SELECT * FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, limit),
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+        if include_raw_checkpoints:
+            target_dir = working_dir or (rows[0]["working_dir"] if rows else None)
+            if target_dir:
+                known_hashes = {
+                    r.get("checkpoint_hash") for r in rows if r.get("checkpoint_hash")
+                } | {
+                    r.get("post_checkpoint_hash") for r in rows if r.get("post_checkpoint_hash")
+                }
+                mgr = self._get_checkpoint_manager()
+                if mgr is not None:
+                    try:
+                        for cp in mgr.list_checkpoints(target_dir)[:limit]:
+                            cp_hash = cp.get("hash")
+                            if cp_hash and cp_hash not in known_hashes:
+                                rows.append(
+                                    {
+                                        "id": f"cp_{cp.get('short_hash', cp_hash[:8])}",
+                                        "session_id": session_id or "shadow-store",
+                                        "turn_id": None,
+                                        "tool_call_id": None,
+                                        "tool_name": "checkpoint",
+                                        "tool_args_summary": cp.get("reason", "auto checkpoint"),
+                                        "working_dir": str(Path(target_dir).expanduser().resolve()),
+                                        "checkpoint_hash": cp_hash,
+                                        "post_checkpoint_hash": cp_hash,
+                                        "reason": cp.get("reason", "checkpoint"),
+                                        "message_id_watermark": None,
+                                        "message_count_watermark": 0,
+                                        "status": "ok",
+                                        "duration_ms": None,
+                                        "files_changed": int(cp.get("files_changed") or 0),
+                                        "insertions": int(cp.get("insertions") or 0),
+                                        "deletions": int(cp.get("deletions") or 0),
+                                        "created_at": time.time(),
+                                    }
+                                )
+                    except Exception:
+                        pass
+
+        return rows[:limit]
+
+    def get_diff(
+        self,
+        snapshot_id: str,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        snap = self.get_snapshot(snapshot_id)
+        commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
+        wdir = (
+            snap["working_dir"]
+            if snap and snap.get("working_dir")
+            else (working_dir or resolve_working_dir(hermes_home=self.hermes_home))
+        )
+
+        if not commit_hash:
+            return {
+                "ok": False,
+                "snapshot_id": snapshot_id,
+                "working_dir": wdir,
+                "error": f"Snapshot '{snapshot_id}' does not have an associated checkpoint hash.",
+            }
+
+        mgr = self._get_checkpoint_manager()
+        if mgr is not None:
+            try:
+                diff_text = mgr.diff(wdir, commit_hash)
+                return {
+                    "ok": True,
+                    "snapshot_id": snap["id"] if snap else snapshot_id,
+                    "checkpoint_hash": commit_hash,
+                    "working_dir": wdir,
+                    "diff": diff_text or "(No filesystem differences vs current working tree)",
+                    "snapshot": snap,
+                }
+            except Exception as exc:
+                logger.warning("CheckpointManager.diff failed, falling back to git diff: %s", exc)
+
+        store_dir = self.hermes_home / "checkpoints" / "store"
+        hash16 = self._project_hash16(wdir)
+        env = {
+            **os.environ,
+            "GIT_DIR": str(store_dir),
+            "GIT_WORK_TREE": str(Path(wdir).resolve()),
+            "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+        }
+        try:
+            res = subprocess.run(
+                ["git", "diff", commit_hash],
+                cwd=wdir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
-            return [dict(r) for r in cur.fetchall()]
+            return {
+                "ok": res.returncode == 0,
+                "snapshot_id": snap["id"] if snap else snapshot_id,
+                "checkpoint_hash": commit_hash,
+                "working_dir": wdir,
+                "diff": res.stdout or res.stderr or "(No differences)",
+                "snapshot": snap,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "snapshot_id": snapshot_id,
+                "checkpoint_hash": commit_hash,
+                "working_dir": wdir,
+                "error": str(exc),
+            }
+
+    def restore_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        restore_files: bool = True,
+        rewind_conversation: bool = False,
+        file_path: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        snap = self.get_snapshot(snapshot_id)
+        commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
+        wdir = (
+            snap["working_dir"]
+            if snap and snap.get("working_dir")
+            else (working_dir or resolve_working_dir(hermes_home=self.hermes_home))
+        )
+
+        result: Dict[str, Any] = {
+            "ok": True,
+            "snapshot_id": snap["id"] if snap else snapshot_id,
+            "checkpoint_hash": commit_hash,
+            "working_dir": wdir,
+            "files_restored": False,
+            "conversation_rewound": False,
+            "messages_deactivated": 0,
+        }
+
+        if restore_files:
+            if not commit_hash:
+                return {
+                    **result,
+                    "ok": False,
+                    "error": f"No checkpoint hash available for snapshot '{snapshot_id}'.",
+                }
+            mgr = self._get_checkpoint_manager()
+            if mgr is None:
+                return {
+                    **result,
+                    "ok": False,
+                    "error": "CheckpointManager is unavailable in this environment.",
+                }
+            restore_res = mgr.restore(wdir, commit_hash, file_path=file_path)
+            result["checkpoint_restore_result"] = restore_res
+            if isinstance(restore_res, dict) and not restore_res.get("ok", True):
+                result["ok"] = False
+                result["error"] = restore_res.get("error") or restore_res.get("reason")
+                return result
+            result["files_restored"] = True
+
+        if rewind_conversation and snap and snap.get("session_id"):
+            session_id = snap["session_id"]
+            watermark_id = snap.get("message_id_watermark")
+            deactivated = self._rewind_session_to_watermark(session_id, watermark_id)
+            result["conversation_rewound"] = True
+            result["messages_deactivated"] = deactivated
+            result["session_id"] = session_id
+            result["message_id_watermark"] = watermark_id
+
+        return result
+
+    def _rewind_session_to_watermark(
+        self, session_id: str, watermark_id: Optional[int]
+    ) -> int:
+        if watermark_id is None:
+            return 0
+
+        state_db_path = self.hermes_home / "state.db"
+        if not state_db_path.exists():
+            return 0
+
+        db = self._get_session_db()
+        deactivated = 0
+        try:
+            with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
+                conn.row_factory = sqlite3.Row
+                first_user_after = conn.execute(
+                    """
+                    SELECT id FROM messages
+                    WHERE session_id = ? AND id > ? AND role = 'user' AND COALESCE(active, 1) = 1
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (session_id, watermark_id),
+                ).fetchone()
+
+                if first_user_after and db is not None and hasattr(db, "rewind_to_message"):
+                    try:
+                        deactivated += int(
+                            db.rewind_to_message(session_id, int(first_user_after["id"])) or 0
+                        )
+                    except Exception as exc:
+                        logger.debug("SessionDB.rewind_to_message fallback: %s", exc)
+
+                cur = conn.execute(
+                    """
+                    UPDATE messages
+                    SET active = 0
+                    WHERE session_id = ? AND id > ? AND COALESCE(active, 1) = 1
+                    """,
+                    (session_id, watermark_id),
+                )
+                extra = cur.rowcount or 0
+                deactivated += extra
+
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET message_count = (
+                        SELECT COUNT(*) FROM messages
+                        WHERE session_id = ? AND COALESCE(active, 1) = 1
+                    ),
+                    rewind_count = COALESCE(rewind_count, 0) + CASE WHEN ? > 0 THEN 1 ELSE 0 END
+                    WHERE id = ?
+                    """,
+                    (session_id, extra, session_id),
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.error("Failed rewinding session %s to watermark %s: %s", session_id, watermark_id, exc)
+
+        return deactivated
+
+    def branch_from_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        branch_title: Optional[str] = None,
+        restore_files: bool = True,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        snap = self.get_snapshot(snapshot_id)
+        if not snap:
+            return {
+                "ok": False,
+                "error": f"Snapshot '{snapshot_id}' not found in Time Machine ledger.",
+            }
+
+        parent_session_id = snap["session_id"]
+        watermark_id = snap.get("message_id_watermark")
+        commit_hash = snap.get("checkpoint_hash")
+        wdir = snap.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
+
+        new_session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        db = self._get_session_db()
+        state_db_path = self.hermes_home / "state.db"
+
+        parent_meta: Dict[str, Any] = {}
+        copied_messages = 0
+
+        if state_db_path.exists():
+            try:
+                with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
+                    conn.row_factory = sqlite3.Row
+                    parent_row = conn.execute(
+                        "SELECT * FROM sessions WHERE id = ?", (parent_session_id,)
+                    ).fetchone()
+                    if parent_row:
+                        parent_meta = dict(parent_row)
+            except Exception as exc:
+                logger.warning("Could not read parent session %s: %s", parent_session_id, exc)
+
+        title = branch_title or (
+            f"{parent_meta.get('title') or parent_session_id} [branch @{snap['id'][:12]}]"
+        )
+
+        created_via_db = False
+        if db is not None and hasattr(db, "create_session"):
+            try:
+                db.create_session(
+                    session_id=new_session_id,
+                    source=parent_meta.get("source") or "cli",
+                    user_id=parent_meta.get("user_id"),
+                    model=parent_meta.get("model"),
+                    system_prompt=parent_meta.get("system_prompt"),
+                    parent_session_id=parent_session_id,
+                    title=title,
+                )
+                created_via_db = True
+            except TypeError:
+                try:
+                    db.create_session(
+                        session_id=new_session_id,
+                        source=parent_meta.get("source") or "cli",
+                        model=parent_meta.get("model"),
+                        parent_session_id=parent_session_id,
+                    )
+                    created_via_db = True
+                except Exception as exc:
+                    logger.debug("SessionDB.create_session fallback: %s", exc)
+
+        if state_db_path.exists():
+            with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
+                conn.row_factory = sqlite3.Row
+                if not created_via_db:
+                    conn.execute(
+                        """
+                        INSERT INTO sessions (
+                            id, source, user_id, model, system_prompt,
+                            parent_session_id, title, started_at, message_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        """,
+                        (
+                            new_session_id,
+                            parent_meta.get("source") or "cli",
+                            parent_meta.get("user_id"),
+                            parent_meta.get("model"),
+                            parent_meta.get("system_prompt"),
+                            parent_session_id,
+                            title,
+                            time.time(),
+                        ),
+                    )
+                else:
+                    try:
+                        conn.execute(
+                            "UPDATE sessions SET title = ? WHERE id = ?",
+                            (title, new_session_id),
+                        )
+                    except Exception:
+                        pass
+
+                if watermark_id is not None:
+                    msg_rows = conn.execute(
+                        """
+                        SELECT role, content, tool_call_id, tool_calls, name,
+                               timestamp, token_count, finish_reason, reasoning,
+                               reasoning_details, codex_reasoning_items
+                        FROM messages
+                        WHERE session_id = ? AND COALESCE(active, 1) = 1 AND id <= ?
+                        ORDER BY id ASC
+                        """,
+                        (parent_session_id, watermark_id),
+                    ).fetchall()
+                else:
+                    msg_rows = conn.execute(
+                        """
+                        SELECT role, content, tool_call_id, tool_calls, name,
+                               timestamp, token_count, finish_reason, reasoning,
+                               reasoning_details, codex_reasoning_items
+                        FROM messages
+                        WHERE session_id = ? AND COALESCE(active, 1) = 1
+                        ORDER BY id ASC
+                        """,
+                        (parent_session_id,),
+                    ).fetchall()
+
+                for m in msg_rows:
+                    conn.execute(
+                        """
+                        INSERT INTO messages (
+                            session_id, role, content, tool_call_id, tool_calls,
+                            name, timestamp, token_count, finish_reason,
+                            reasoning, reasoning_details, codex_reasoning_items, active
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (
+                            new_session_id,
+                            m["role"],
+                            m["content"],
+                            m["tool_call_id"],
+                            m["tool_calls"],
+                            m["name"],
+                            m["timestamp"] or time.time(),
+                            m["token_count"],
+                            m["finish_reason"],
+                            m["reasoning"],
+                            m["reasoning_details"],
+                            m["codex_reasoning_items"],
+                        ),
+                    )
+                    copied_messages += 1
+
+                conn.execute(
+                    "UPDATE sessions SET message_count = ? WHERE id = ?",
+                    (copied_messages, new_session_id),
+                )
+                conn.commit()
+
+        files_restored = False
+        restore_details = None
+        if restore_files and commit_hash:
+            mgr = self._get_checkpoint_manager()
+            if mgr is not None:
+                restore_details = mgr.restore(wdir, commit_hash)
+                files_restored = bool(
+                    restore_details.get("ok", True)
+                    if isinstance(restore_details, dict)
+                    else True
+                )
+
+        return {
+            "ok": True,
+            "snapshot_id": snap["id"],
+            "parent_session_id": parent_session_id,
+            "new_session_id": new_session_id,
+            "title": title,
+            "copied_messages": copied_messages,
+            "message_id_watermark": watermark_id,
+            "checkpoint_hash": commit_hash,
+            "working_dir": wdir,
+            "files_restored": files_restored,
+            "checkpoint_restore_result": restore_details,
+        }
 
     @staticmethod
     def _summarize_args(tool_name: str, args: Dict[str, Any]) -> str:
@@ -387,4 +836,4 @@ class TimeMachineLedger:
                 val = args[k].strip().replace("\n", " ")
                 return f"{k}={val[:80]}"
         raw = json.dumps(args, ensure_ascii=False, default=str)
-        return raw[:120]
+        return raw[:100]

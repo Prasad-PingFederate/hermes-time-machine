@@ -1,83 +1,72 @@
-"""hermes-time-machine plugin entry point."""
+"""
+Hermes Time Machine Plugin Entrypoint.
+Registers pre_tool_call / post_tool_call hooks and the 4 time_machine_* tools.
+"""
+from __future__ import annotations
 
-from functools import partial
-from .ledger import TimeMachineLedger, resolve_hermes_home
-from .tools import (
-    list_snapshots_handler,
-    diff_handler,
-    restore_handler,
-    branch_handler,
-)
-from .schemas import (
-    LIST_SCHEMA,
-    DIFF_SCHEMA,
-    RESTORE_SCHEMA,
-    BRANCH_SCHEMA,
-)
+import logging
+from typing import Any, Dict, Optional
 
-_ledger = None
+from .ledger import TimeMachineLedger, resolve_working_dir
+from .tools import register_time_machine_tools
 
-def get_ledger() -> TimeMachineLedger:
-    global _ledger
-    if _ledger is None:
-        _ledger = TimeMachineLedger()
-    return _ledger
+logger = logging.getLogger(__name__)
 
-def on_pre_tool(tool_name: str, args: dict, **kwargs):
-    ledger = get_ledger()
-    ledger.record_pre_tool(
-        session_id=kwargs.get("session_id"),
-        turn_id=kwargs.get("turn_id"),
-        tool_call_id=kwargs.get("tool_call_id"),
-        tool_name=tool_name,
-        args=args,
-    )
 
-def on_post_tool(tool_name: str, args: dict, result: str, **kwargs):
-    ledger = get_ledger()
-    ledger.record_post_tool(
-        session_id=kwargs.get("session_id"),
-        turn_id=kwargs.get("turn_id"),
-        tool_call_id=kwargs.get("tool_call_id"),
-        tool_name=tool_name,
-        args=args,
-        status=kwargs.get("status", "ok"),
-        duration_ms=kwargs.get("duration_ms"),
-    )
+def register(ctx) -> None:
+    """Called by Hermes PluginManager on startup."""
+    ledger = TimeMachineLedger()
 
-def on_session_start(**kwargs):
-    # Ensure checkpoints are enabled if configured
-    pass
+    def on_pre_tool_call(
+        tool_name: str = "",
+        args: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            sess = session_id or task_id or "default"
+            wdir = resolve_working_dir(args=args, session_id=sess)
+            ledger.record_pre_tool(
+                session_id=sess,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args=args or {},
+                working_dir=wdir,
+            )
+        except Exception as exc:
+            logger.debug("hermes-time-machine pre_tool_call error: %s", exc)
 
-def register(ctx):
-    # Hooks
-    ctx.register_hook("pre_tool_call", on_pre_tool)
-    ctx.register_hook("post_tool_call", on_post_tool)
-    ctx.register_hook("on_session_start", on_session_start)
+    def on_post_tool_call(
+        tool_name: str = "",
+        args: Optional[Dict[str, Any]] = None,
+        result: Any = None,
+        task_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+        status: str = "ok",
+        **kwargs: Any,
+    ) -> None:
+        try:
+            sess = session_id or task_id or "default"
+            ledger.record_post_tool(
+                session_id=sess,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args=args or {},
+                status=status,
+                duration_ms=duration_ms,
+            )
+        except Exception as exc:
+            logger.debug("hermes-time-machine post_tool_call error: %s", exc)
 
-    # Tools — inject ledger via partial
-    ledger = get_ledger()
-    ctx.register_tool(
-        name="time_machine_list_snapshots",
-        toolset="time-machine",
-        schema=LIST_SCHEMA,
-        handler=partial(list_snapshots_handler, ledger=ledger),
-    )
-    ctx.register_tool(
-        name="time_machine_diff",
-        toolset="time-machine",
-        schema=DIFF_SCHEMA,
-        handler=partial(diff_handler, ledger=ledger),
-    )
-    ctx.register_tool(
-        name="time_machine_restore",
-        toolset="time-machine",
-        schema=RESTORE_SCHEMA,
-        handler=partial(restore_handler, ledger=ledger),
-    )
-    ctx.register_tool(
-        name="time_machine_branch",
-        toolset="time-machine",
-        schema=BRANCH_SCHEMA,
-        handler=partial(branch_handler, ledger=ledger),
-    )
+    ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    ctx.register_hook("post_tool_call", on_post_tool_call)
+
+    register_time_machine_tools(ctx, ledger=ledger)
