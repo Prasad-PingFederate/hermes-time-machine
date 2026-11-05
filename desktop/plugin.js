@@ -1,19 +1,29 @@
 /**
  * Hermes Time Machine — Desktop Plugin (desktop/plugin.js)
- * Provides:
- *   1. Status Bar Shield (live snapshot count + latest checkpoint status)
- *   2. Right-Rail Timeline (per-turn/per-tool timeline with quick Restore & Branch)
- *   3. Full Time Machine Studio View (split-pane diff inspector, restore & fork controls)
+ * Targets @hermes/plugin-sdk ctx.register({ area: 'statusBar.right' | 'rail.right' | 'pane' })
  */
 
-const PLUGIN_NAME = 'hermes-time-machine';
-const API_BASE = `/api/plugins/${PLUGIN_NAME}`;
+const PLUGIN_ID = 'hermes-time-machine';
+const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 
 async function apiCall(ctx, path, options = {}) {
   const cleanPath = path.startsWith('/') ? path : `/${path}`;
   if (ctx && typeof ctx.rest === 'function') {
-    return await ctx.rest(cleanPath, options);
+    const method = (options.method || 'GET').toUpperCase();
+    let bodyObj = options.body;
+    if (typeof bodyObj === 'string') {
+      try {
+        bodyObj = JSON.parse(bodyObj);
+      } catch (_) {}
+    }
+    return await ctx.rest(cleanPath, {
+      ...options,
+      method,
+      body: options.body,
+      json: bodyObj,
+    });
   }
+
   const res = await fetch(`${API_BASE}${cleanPath}`, {
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     ...options,
@@ -32,7 +42,11 @@ async function apiCall(ctx, path, options = {}) {
 function formatTime(epochSeconds) {
   if (!epochSeconds) return '';
   const d = new Date(epochSeconds * 1000);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return d.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
 }
 
 function escapeHtml(str) {
@@ -73,6 +87,7 @@ const STUDIO_STYLES = `
     color: var(--text-primary, #e6edf3);
     background: var(--bg-primary, #0d1117);
     height: 100%;
+    width: 100%;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -81,13 +96,13 @@ const STUDIO_STYLES = `
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 16px;
+    padding: 10px 14px;
     border-bottom: 1px solid var(--border-color, #30363d);
     background: var(--bg-secondary, #161b22);
-    gap: 10px;
+    gap: 8px;
   }
   .tm-title {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     display: flex;
     align-items: center;
@@ -96,15 +111,15 @@ const STUDIO_STYLES = `
   .tm-actions {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
   .tm-btn {
     background: #21262d;
     color: #c9d1d9;
     border: 1px solid #30363d;
     border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 12px;
+    padding: 4px 9px;
+    font-size: 11px;
     cursor: pointer;
     transition: background 0.15s ease;
   }
@@ -129,7 +144,7 @@ const STUDIO_STYLES = `
   .tm-btn-branch:hover { background: #388bfd; }
   .tm-body {
     display: grid;
-    grid-template-columns: 340px 1fr;
+    grid-template-columns: 320px 1fr;
     flex: 1;
     min-height: 0;
   }
@@ -144,7 +159,7 @@ const STUDIO_STYLES = `
   .tm-card {
     border: 1px solid #30363d;
     border-radius: 8px;
-    padding: 10px;
+    padding: 9px 10px;
     background: #161b22;
     cursor: pointer;
     transition: border-color 0.15s ease, background 0.15s ease;
@@ -163,7 +178,7 @@ const STUDIO_STYLES = `
   }
   .tm-badge {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
+    font-size: 10px;
     padding: 1px 6px;
     border-radius: 4px;
     background: rgba(88,166,255,0.15);
@@ -182,7 +197,7 @@ const STUDIO_STYLES = `
     overflow: hidden;
   }
   .tm-detail-bar {
-    padding: 10px 16px;
+    padding: 10px 14px;
     border-bottom: 1px solid #30363d;
     display: flex;
     justify-content: space-between;
@@ -194,9 +209,9 @@ const STUDIO_STYLES = `
   .tm-diff-container, .tm-diff-scroll {
     flex: 1;
     overflow: auto;
-    padding: 12px 16px;
+    padding: 10px 14px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
+    font-size: 11.5px;
     line-height: 1.5;
   }
   .tm-diff-line { white-space: pre-wrap; word-break: break-all; padding: 1px 4px; }
@@ -205,16 +220,16 @@ const STUDIO_STYLES = `
   .tm-diff-hunk { color: #79c0ff; background: rgba(56, 139, 253, 0.1); }
   .tm-diff-meta { color: #8b949e; font-weight: 600; }
   .tm-toast {
-    margin: 8px 16px 0;
-    padding: 8px 12px;
+    margin: 8px 14px 0;
+    padding: 7px 11px;
     border-radius: 6px;
-    font-size: 12px;
+    font-size: 11.5px;
     background: rgba(56, 139, 253, 0.15);
     border: 1px solid #388bfd;
     color: #c9d1d9;
   }
   .tm-empty {
-    padding: 24px;
+    padding: 20px;
     text-align: center;
     color: #8b949e;
     font-size: 12px;
@@ -222,6 +237,7 @@ const STUDIO_STYLES = `
 `;
 
 function mountTimeMachineDOM(container, ctx, mode = 'studio') {
+  let disposed = false;
   let state = {
     snapshots: [],
     selectedId: null,
@@ -233,10 +249,11 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   };
 
   function setToast(msg) {
+    if (disposed) return;
     state.toast = msg;
     render();
     setTimeout(() => {
-      if (state.toast === msg) {
+      if (!disposed && state.toast === msg) {
         state.toast = null;
         render();
       }
@@ -244,18 +261,24 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   }
 
   async function loadSnapshots(selectFirst = false) {
+    if (disposed) return;
     state.loading = true;
     render();
     try {
-      const q = state.sessionFilter
-        ? `?session_id=${encodeURIComponent(state.sessionFilter)}&limit=50`
+      const activeSession =
+        state.sessionFilter ||
+        (ctx && ctx.session && ctx.session.id) ||
+        '';
+      const q = activeSession
+        ? `?session_id=${encodeURIComponent(activeSession)}&limit=50`
         : '?limit=50';
       const data = await apiCall(ctx, `/snapshots${q}`);
       state.snapshots = data.snapshots || [];
-      if (
-        (selectFirst || !state.selectedId) &&
-        state.snapshots.length > 0
-      ) {
+      if (state.snapshots.length === 0 && activeSession && !state.sessionFilter) {
+        const allData = await apiCall(ctx, '/snapshots?limit=50');
+        state.snapshots = allData.snapshots || [];
+      }
+      if ((selectFirst || !state.selectedId) && state.snapshots.length > 0) {
         await selectSnapshot(state.snapshots[0].id);
       }
     } catch (err) {
@@ -267,6 +290,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   }
 
   async function selectSnapshot(snapshotId) {
+    if (disposed) return;
     state.selectedId = snapshotId;
     state.selectedSnapshot =
       state.snapshots.find((s) => s.id === snapshotId) || null;
@@ -290,7 +314,10 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       setToast('Creating checkpoint...');
       await apiCall(ctx, '/snapshots', {
         method: 'POST',
-        body: JSON.stringify({ reason: 'manual_desktop_snapshot' }),
+        body: JSON.stringify({
+          session_id: (ctx && ctx.session && ctx.session.id) || undefined,
+          reason: 'manual_desktop_snapshot',
+        }),
       });
       setToast('Snapshot captured.');
       await loadSnapshots(true);
@@ -301,8 +328,8 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
 
   async function triggerRestore(snapshotId, rewindConversation = false) {
     const label = rewindConversation
-      ? 'Restore files AND rewind conversation messages in state.db?'
-      : 'Restore working tree files to this snapshot? (A safety checkpoint will be created automatically)';
+      ? 'Restore working tree files AND rewind conversation messages in state.db?'
+      : 'Restore working tree files to this snapshot? (A safety checkpoint is created automatically first)';
     if (typeof window !== 'undefined' && !window.confirm(label)) {
       return;
     }
@@ -320,7 +347,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       );
       setToast(
         rewindConversation
-          ? `Restored files & deactivated ${res.messages_deactivated || 0} message(s).`
+          ? `Restored files & rewound ${res.messages_deactivated || 0} message(s).`
           : `Restored files to ${(res.checkpoint_hash || '').slice(0, 8)}.`
       );
       await loadSnapshots(false);
@@ -349,7 +376,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
         }
       );
       setToast(
-        `Created branch session ${res.new_session_id} (${res.copied_messages} messages copied).`
+        `Forked session ${res.new_session_id} (${res.copied_messages} messages).`
       );
       await loadSnapshots(false);
     } catch (err) {
@@ -358,7 +385,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   }
 
   function render() {
-    if (!container) return;
+    if (disposed || !container) return;
     const isRail = mode === 'rail';
     const cardsHtml =
       state.snapshots.length === 0
@@ -396,6 +423,9 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
                           <button class="tm-btn tm-btn-warn" data-action="restore-files" data-id="${escapeHtml(
                             s.id
                           )}">Restore</button>
+                          <button class="tm-btn tm-btn-warn" data-action="restore-all" data-id="${escapeHtml(
+                            s.id
+                          )}">Rewind All</button>
                           <button class="tm-btn tm-btn-branch" data-action="branch" data-id="${escapeHtml(
                             s.id
                           )}">Branch</button>
@@ -481,6 +511,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
           const act = actionBtn.getAttribute('data-action');
           const id = actionBtn.getAttribute('data-id');
           if (act === 'restore-files') triggerRestore(id, false);
+          if (act === 'restore-all') triggerRestore(id, true);
           if (act === 'branch') triggerBranch(id);
           return;
         }
@@ -505,78 +536,135 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   }
 
   loadSnapshots(true);
-  return { refresh: () => loadSnapshots(false) };
+  return () => {
+    disposed = true;
+  };
 }
 
 function mountStatusBarShield(container, ctx) {
+  let disposed = false;
   let count = 0;
-  let latestTool = 'idle';
+  let latestTool = 'ready';
 
   async function poll() {
+    if (disposed) return;
     try {
       const status = await apiCall(ctx, '/status');
       count = status.snapshot_count || 0;
       latestTool = status.latest_snapshot?.tool_name || 'ready';
       render();
-    } catch (_) {
-      // Keep status bar quiet on transient network reload
-    }
+    } catch (_) {}
   }
 
   function render() {
-    if (!container) return;
+    if (disposed || !container) return;
     container.innerHTML = `
       <button
         style="background:transparent;border:none;color:inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:2px 6px;"
         title="Hermes Time Machine — Click to open timeline"
       >
         <span>🛡️ TM: <strong>${count}</strong></span>
-        <span style="opacity:0.7;">(${escapeHtml(latestTool)})</span>
+        <span style="opacity:0.75;">(${escapeHtml(latestTool)})</span>
       </button>
     `;
     const btn = container.querySelector('button');
-    if (btn && ctx && typeof ctx.openView === 'function') {
-      btn.onclick = () => ctx.openView('time-machine-studio');
+    if (btn && ctx) {
+      btn.onclick = () => {
+        if (typeof ctx.openPane === 'function') {
+          ctx.openPane('time-machine-studio');
+        } else if (typeof ctx.openView === 'function') {
+          ctx.openView('time-machine-studio');
+        } else if (typeof ctx.toggleRail === 'function') {
+          ctx.toggleRail('time-machine-rail');
+        }
+      };
     }
   }
 
   render();
   poll();
-  const timer = setInterval(poll, 10000);
-  return () => clearInterval(timer);
+  const timer = setInterval(poll, 8000);
+  return () => {
+    disposed = true;
+    clearInterval(timer);
+  };
+}
+
+function registerSlot(ctx, spec) {
+  if (typeof ctx.register === 'function') {
+    ctx.register({
+      id: spec.id,
+      area: spec.area,
+      label: spec.label,
+      title: spec.label,
+      icon: spec.icon,
+      priority: spec.priority,
+      mount: (el) => spec.mount(el, ctx),
+      render: (el) => {
+        if (el && typeof el === 'object' && 'innerHTML' in el) {
+          return spec.mount(el, ctx);
+        }
+        return null;
+      },
+    });
+    return;
+  }
+
+  if (spec.area === 'statusBar.right' && typeof ctx.registerStatusBarItem === 'function') {
+    ctx.registerStatusBarItem({
+      id: spec.id,
+      position: 'right',
+      priority: spec.priority || 90,
+      mount: (el) => spec.mount(el, ctx),
+    });
+  } else if (spec.area === 'rail.right' && typeof ctx.registerRailItem === 'function') {
+    ctx.registerRailItem({
+      id: spec.id,
+      title: spec.label,
+      icon: spec.icon,
+      mount: (el) => spec.mount(el, ctx),
+    });
+  } else if (spec.area === 'pane' && typeof ctx.registerView === 'function') {
+    ctx.registerView({
+      id: spec.id,
+      title: spec.label,
+      icon: spec.icon,
+      mount: (el) => spec.mount(el, ctx),
+    });
+  }
 }
 
 export default {
-  id: PLUGIN_NAME,
+  id: PLUGIN_ID,
   name: 'Hermes Time Machine',
   version: '0.2.0',
 
   activate(ctx) {
-    if (typeof ctx.registerStatusBarItem === 'function') {
-      ctx.registerStatusBarItem({
-        id: 'time-machine-shield',
-        position: 'right',
-        priority: 90,
-        mount: (el) => mountStatusBarShield(el, ctx),
-      });
-    }
+    registerSlot(ctx, {
+      id: 'time-machine-shield',
+      area: 'statusBar.right',
+      label: 'Time Machine',
+      icon: 'shield',
+      priority: 90,
+      mount: mountStatusBarShield,
+    });
 
-    if (typeof ctx.registerRailItem === 'function') {
-      ctx.registerRailItem({
-        id: 'time-machine-rail',
-        title: 'Time Machine',
-        icon: 'history',
-        mount: (el) => mountTimeMachineDOM(el, ctx, 'rail'),
-      });
-    }
+    registerSlot(ctx, {
+      id: 'time-machine-rail',
+      area: 'rail.right',
+      label: 'Time Machine',
+      icon: 'history',
+      priority: 80,
+      mount: (el, c) => mountTimeMachineDOM(el, c, 'rail'),
+    });
 
-    if (typeof ctx.registerView === 'function') {
-      ctx.registerView({
-        id: 'time-machine-studio',
-        title: 'Time Machine Studio',
-        icon: 'history',
-        mount: (el) => mountTimeMachineDOM(el, ctx, 'studio'),
-      });
-    }
+    registerSlot(ctx, {
+      id: 'time-machine-studio',
+      area: 'pane',
+      label: 'Time Machine Studio',
+      icon: 'history',
+      priority: 70,
+      mount: (el, c) => mountTimeMachineDOM(el, c, 'studio'),
+    });
   },
 };
