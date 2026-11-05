@@ -12,11 +12,16 @@ LIST_SCHEMA = {
 
 DIFF_SCHEMA = {
     "name": "time_machine_diff",
-    "description": "Show the unified diff and metadata for a specific snapshot ID.",
+    "description": "Show unified and structured diff for a specific snapshot ID against its parent, another snapshot, or the live working tree.",
     "parameters": {
         "type": "object",
         "properties": {
-            "snapshot_id": {"type": "string", "description": "Snapshot ID from the ledger"},
+            "snapshot_id": {"type": "string", "description": "Target snapshot ID to inspect"},
+            "compare_to_id": {
+                "type": "string",
+                "description": "Optional snapshot ID to diff against, or 'WORKING_TREE' to inspect uncommitted drift since the snapshot. Omit to diff against the previous turn.",
+            },
+            "working_dir": {"type": "string", "description": "Optional working directory override"},
         },
         "required": ["snapshot_id"],
     },
@@ -24,7 +29,7 @@ DIFF_SCHEMA = {
 
 RESTORE_SCHEMA = {
     "name": "time_machine_restore",
-    "description": "Restore workspace files to the state of a given snapshot. Optionally also rewind the conversation or restore only specific files.",
+    "description": "Restore workspace files to the state of a given snapshot. Supports surgical single/multi-file restore without rewinding conversation, or full workspace rollback.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -37,6 +42,7 @@ RESTORE_SCHEMA = {
             },
             "rewind_conversation": {"type": "boolean", "default": False, "description": "Also rewind conversation to this point"},
             "confirm": {"type": "boolean", "default": True, "description": "Must be true to apply restore"},
+            "working_dir": {"type": "string", "description": "Optional working directory override"},
         },
         "required": ["snapshot_id"],
     },
@@ -50,6 +56,8 @@ BRANCH_SCHEMA = {
         "properties": {
             "snapshot_id": {"type": "string"},
             "branch_title": {"type": "string", "default": "Branched from Time Machine"},
+            "restore_files": {"type": "boolean", "default": True},
+            "working_dir": {"type": "string", "description": "Optional working directory override"},
         },
         "required": ["snapshot_id"],
     },

@@ -1,5 +1,5 @@
 name: hermes-time-machine
-version: "0.2.0"
+version: "0.3.0"
 description: "Unified Time Machine for Hermes Agent: pairs shadow-git filesystem checkpoints with state.db conversation turns for atomic rewind, diff, and session branching."
 author: "Prasad-PingFederate"
 manifest_version: 2
@@ -30,3 +30,7 @@ config_schema:
     type: bool
     default: false
     description: "Aggressive mode (higher disk use)"
+  max_snapshots_per_session:
+    type: int
+    default: 50
+    description: "Maximum snapshots retained per session before pruning oldest"

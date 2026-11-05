@@ -72,10 +72,16 @@ async def get_status(session_id: Optional[str] = Query(default=None)) -> Dict[st
     latest = snapshots[0] if snapshots else None
     safe_snap = ledger.get_last_safe_snapshot(active_session) if active_session else None
     has_self_heal = bool(latest and (latest.get("self_heal_candidate") or latest.get("status") == "error"))
+    storage = ledger.get_storage_stats() if hasattr(ledger, "get_storage_stats") else {}
     return {
         "ok": True,
         "active_session_id": active_session,
         "snapshot_count": len(snapshots),
+        "total_snapshots": storage.get("total_snapshots", len(snapshots)),
+        "total_sessions": storage.get("total_sessions", 1),
+        "self_heal_alerts_count": storage.get("self_heal_alerts_count", 1 if has_self_heal else 0),
+        "store_size_bytes": storage.get("store_size_bytes", 0),
+        "total_storage_bytes": storage.get("total_storage_bytes", 0),
         "latest_snapshot": latest,
         "last_safe_snapshot": safe_snap,
         "self_heal_available": has_self_heal,
@@ -189,13 +195,23 @@ async def get_snapshot_detail(
 @router.get("/snapshots/{snapshot_id}/diff")
 async def get_snapshot_diff(
     snapshot_id: str,
+    compare_to: Optional[str] = Query(default=None),
     working_dir: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
     ledger = _get_ledger()
-    res = ledger.get_diff(snapshot_id, working_dir=working_dir)
+    res = ledger.get_diff(snapshot_id, compare_to_id=compare_to, working_dir=working_dir)
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Diff failed"))
     return res
+
+
+@router.post("/snapshots/prune")
+async def prune_snapshots(
+    session_id: Optional[str] = Query(default=None),
+    keep_last: int = Query(default=50, ge=5, le=500),
+) -> Dict[str, Any]:
+    ledger = _get_ledger()
+    return ledger.prune_snapshots(session_id=session_id, keep_last=keep_last)
 
 
 @router.post("/snapshots/{snapshot_id}/restore")

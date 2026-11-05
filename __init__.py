@@ -153,8 +153,35 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 fc = str(s.get("files_changed", 0))
                 diff_stat = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
                 lines.append(f"{sid:<28} {tool:<14} {st:<8} {fc:<6} {diff_stat}")
-            lines.append("\nCommands: /rewind diff <id> | /rewind restore <id> [--files f1,f2]")
+            lines.append("\nCommands: /rewind diff <id> [compare_to] | /rewind restore <id> [--files f1,f2] | /rewind demo")
             return "\n".join(lines)
+
+        elif subcmd == "demo":
+            try:
+                from scripts.demo_walkthrough import run_demo
+            except ImportError:
+                import sys
+                from pathlib import Path
+                root = Path(__file__).resolve().parent
+                if str(root) not in sys.path:
+                    sys.path.insert(0, str(root))
+                from scripts.demo_walkthrough import run_demo
+
+            res = run_demo(ledger=ledger, quiet=True)
+            if res.get("ok"):
+                st = res.get("steps", {})
+                b_snap = (st.get("step1_baseline") or {}).get("snapshot_id", "snap_1")
+                f_snap = (st.get("step2_feature") or {}).get("snapshot_id", "snap_2")
+                return (
+                    f"🎉 Time Machine E2E Live Demo Passed 100%!\n"
+                    f"- Step 1: Baseline project created & snapshotted ({b_snap})\n"
+                    f"- Step 2: Feature 'tax.py' added & checkpointed ({f_snap})\n"
+                    f"- Step 3: Buggy edit + new temporary file triggered pytest failure\n"
+                    f"- Step 4: Autonomous Self-Heal recommended restore to {f_snap}\n"
+                    f"- Step 5: Surgical restore reverted billing.py, unlinked temp file, preserved tax.py\n"
+                    f"- Step 6: Pytest GREEN (100% pass) and net diff verified"
+                )
+            return f"❌ Demo walkthrough failed: {res.get('steps')}"
 
         elif subcmd == "diff":
             if len(parts) < 2:
@@ -162,13 +189,16 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 if not snaps:
                     return "Error: No snapshot available to diff."
                 target_id = snaps[0]["id"]
+                compare_to_id = None
             else:
                 target_id = parts[1]
-            res = ledger.get_diff(target_id)
+                compare_to_id = parts[2] if len(parts) > 2 else None
+            res = ledger.get_diff(target_id, compare_to_id=compare_to_id)
             if not res.get("ok"):
                 return f"Error retrieving diff: {res.get('error')}"
             diff_preview = res.get("diff", "")[:1500]
-            return f"📄 Diff for {target_id} ({res.get('total_files', 0)} files, +{res.get('total_additions', 0)}/-{res.get('total_deletions', 0)}):\n```diff\n{diff_preview}\n```"
+            cmp_label = f" vs {compare_to_id}" if compare_to_id else ""
+            return f"📄 Diff for {target_id}{cmp_label} ({res.get('total_files', 0)} files, +{res.get('total_additions', 0)}/-{res.get('total_deletions', 0)}):\n```diff\n{diff_preview}\n```"
 
         elif subcmd == "restore":
             if len(parts) < 2:
@@ -188,7 +218,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             safety = f" (Safety backup saved: {res.get('pre_restore_backup_id')})" if res.get('pre_restore_backup_id') else ""
             return f"✅ Successfully restored {restored_what} to {target_id}!{safety}"
 
-        return "Usage: /rewind [list|diff <id>|restore <id> [--files f1,f2]]"
+        return "Usage: /rewind [list|diff <id> [compare_to]|restore <id> [--files f1,f2]|demo]"
 
     # Register hooks
     ctx.register_hook("on_session_start", on_session_start)
@@ -205,7 +235,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             name="rewind",
             handler=handle_rewind_command,
             description="Hermes Time Machine: inspect timeline, diff, or restore snapshots",
-            args_hint="[list|diff|restore]",
+            args_hint="[list|diff|restore|demo]",
         )
 
     # Register system prompt section for autonomous self-healing

@@ -299,3 +299,148 @@ def test_dashboard_api_endpoints(test_ledger):
     res = client.get("/snapshots")
     assert res.status_code == 200
     assert "snapshots" in res.json()
+
+
+# ─── 8. Path Traversal Security & Newly-Created File Rollback ─────────────────
+
+def test_path_traversal_rejection(test_ledger, temp_dir):
+    snap = test_ledger.record_pre_tool(
+        session_id="s_sec",
+        tool_name="write_file",
+        args={"path": "safe.py"},
+        working_dir=str(temp_dir),
+    )
+    # Attempt directory traversal outside temp_dir
+    res = test_ledger.restore_snapshot(
+        snapshot_id=snap["id"],
+        file_paths=["../../etc/passwd"],
+        working_dir=str(temp_dir),
+    )
+    assert res["ok"] is False
+    assert "escapes workspace root" in res["error"]
+
+
+def test_newly_created_file_unlinked_on_restore(git_repo, test_ledger):
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+
+    snap = test_ledger.record_pre_tool(
+        session_id="s_newfile",
+        tool_name="write_file",
+        args={"path": "file_a.py"},
+        working_dir=str(wdir),
+    )
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
+
+    # Now create a brand-new file that NEVER existed in c1
+    new_file = wdir / "unwanted_generated.tmp"
+    new_file.write_text("temporary bad dump", encoding="utf-8")
+    assert new_file.exists()
+
+    # Revert file_a.py AND unwanted_generated.tmp
+    res = test_ledger.restore_snapshot(
+        snapshot_id=snap["id"],
+        file_paths=["file_a.py", "unwanted_generated.tmp"],
+        working_dir=str(wdir),
+    )
+    assert res["ok"] is True
+    assert "unwanted_generated.tmp" in res["unlinked_new_files"]
+    assert not new_file.exists()  # Cleanly removed from disk!
+
+
+# ─── 9. Arbitrary A <-> B & Live Working Tree Diff ───────────────────────────
+
+def test_arbitrary_and_working_tree_diff(git_repo, test_ledger):
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+    f1 = git_repo["f1"]
+
+    # Make change and commit c2
+    f1.write_text("print('version 2')", encoding="utf-8")
+    env = os.environ.copy()
+    subprocess.run(["git", "add", "."], cwd=str(wdir), env=env, check=True)
+    subprocess.run(["git", "commit", "-m", "second"], cwd=str(wdir), env=env, check=True)
+    c2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(wdir), env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    snap1 = test_ledger.record_pre_tool(session_id="s_diff", tool_name="edit", args={}, working_dir=str(wdir))
+    snap2 = test_ledger.record_pre_tool(session_id="s_diff", tool_name="edit", args={}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap1["id"]))
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c2, snap2["id"]))
+
+    # Test arbitrary A <-> B diff
+    diff_ab = test_ledger.get_diff(snapshot_id=snap2["id"], compare_to_id=snap1["id"], working_dir=str(wdir))
+    assert diff_ab["ok"] is True
+    assert diff_ab["mode"] == "arbitrary"
+    assert any(f["path"] == "file_a.py" for f in diff_ab.get("files", []))
+
+    # Test uncommitted live drift against WORKING_TREE
+    f1.write_text("print('version 3 uncommitted')", encoding="utf-8")
+    diff_wt = test_ledger.get_diff(snapshot_id=snap2["id"], compare_to_id="WORKING_TREE", working_dir=str(wdir))
+    assert diff_wt["ok"] is True
+    assert diff_wt["mode"] == "working_tree"
+    assert "version 3 uncommitted" in diff_wt["diff"]
+
+
+# ─── 10. Storage Pruning & Storage Stats ─────────────────────────────────────
+
+def test_prune_snapshots_and_storage_stats(test_ledger, temp_dir):
+    # Create 15 regular snapshots and 1 protected safety backup
+    for i in range(15):
+        test_ledger.record_pre_tool(
+            session_id="s_prune",
+            tool_name="edit_file",
+            args={"index": i},
+            working_dir=str(temp_dir),
+        )
+
+    prot_snap = test_ledger.record_pre_tool(
+        session_id="s_prune",
+        tool_name="pre_restore_safety_backup",
+        args={"target": "baseline"},
+        working_dir=str(temp_dir),
+    )
+
+    stats = test_ledger.get_storage_stats()
+    assert stats["total_snapshots"] >= 16
+    assert stats["total_sessions"] >= 1
+
+    prune_res = test_ledger.prune_snapshots(session_id="s_prune", keep_last=5)
+    assert prune_res["ok"] is True
+    assert prune_res["pruned_count"] > 0
+
+    # Ensure protected safety snapshot was NOT pruned
+    remaining = test_ledger.list_snapshots(session_id="s_prune", limit=100)
+    remaining_ids = [s["id"] for s in remaining]
+    assert prot_snap["id"] in remaining_ids
+
+
+# ─── 11. Live Demo Walkthrough Integration & Slash Command ───────────────────
+
+def test_demo_walkthrough_e2e():
+    from scripts.demo_walkthrough import run_demo
+    demo_result = run_demo(quiet=True)
+    assert demo_result["ok"] is True
+    steps = demo_result["steps"]
+    assert steps["step1_baseline"]["pytest_passed"] is True
+    assert steps["step3_bad_edit"]["test_failed_as_expected"] is True
+    assert steps["step5_restore"]["billing_restored"] is True
+    assert steps["step5_restore"]["new_file_unlinked"] is True
+    assert steps["step5_restore"]["tax_feature_preserved"] is True
+    assert steps["step5_restore"]["pytest_passed"] is True
+
+
+def test_slash_command_rewind_demo(test_ledger):
+    class CtxStub:
+        def __init__(self):
+            self.command_handler = None
+        def register_hook(self, *a, **kw): pass
+        def register_tool(self, *a, **kw): pass
+        def register_command(self, name, handler, **kw): self.command_handler = handler
+        def register_system_prompt_section(self, *a, **kw): pass
+
+    stub = CtxStub()
+    tm_plugin.register(stub, ledger=test_ledger)
+    out_demo = stub.command_handler("demo")
+    assert "🎉 Time Machine E2E Live Demo Passed 100%!" in out_demo

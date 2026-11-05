@@ -9,6 +9,7 @@ import json
 import re
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -40,6 +41,48 @@ def resolve_hermes_home() -> Path:
         if env_home:
             return Path(env_home).expanduser().resolve()
         return Path.home() / ".hermes"
+
+
+
+def validate_safe_path(working_dir: str, rel_path: str) -> Path:
+    """Validate that rel_path does not escape working_dir (prevents ../ path traversal attacks)."""
+    root = Path(working_dir).expanduser().resolve()
+    target = (root / rel_path).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}")
+    return target
+
+
+def file_exists_in_commit(
+    commit_hash: str,
+    rel_path: str,
+    working_dir: str,
+    store_dir: Optional[Path] = None,
+) -> bool:
+    """Check if rel_path existed at commit_hash in shadow git store or local git repository."""
+    norm_path = rel_path.replace("\\", "/").lstrip("/")
+    if store_dir and store_dir.exists():
+        try:
+            res = subprocess.run(
+                ["git", f"--git-dir={store_dir}", "cat-file", "-e", f"{commit_hash}:{norm_path}"],
+                capture_output=True,
+                timeout=5,
+            )
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    try:
+        res = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit_hash}:{norm_path}"],
+            cwd=working_dir,
+            capture_output=True,
+            timeout=5,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def resolve_working_dir(
@@ -508,16 +551,21 @@ class TimeMachineLedger:
 
         return rows[:limit]
 
-    def get_diff(self, snapshot_id: str, working_dir: Optional[str] = None) -> Dict[str, Any]:
+    def get_diff(
+        self,
+        snapshot_id: str,
+        compare_to_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
         snap = self.get_snapshot(snapshot_id)
-        commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
+        target_hash = snap["checkpoint_hash"] if snap else snapshot_id
         wdir = (
             snap["working_dir"]
             if snap and snap.get("working_dir")
             else (working_dir or resolve_working_dir(hermes_home=self.hermes_home))
         )
 
-        if not commit_hash:
+        if not target_hash:
             return {
                 "ok": False,
                 "snapshot_id": snapshot_id,
@@ -525,60 +573,134 @@ class TimeMachineLedger:
                 "error": f"Snapshot '{snapshot_id}' does not have an associated checkpoint hash.",
             }
 
-        diff_text = ""
-        mgr = self._get_checkpoint_manager()
-        if mgr is not None:
-            try:
-                diff_text = mgr.diff(wdir, commit_hash) or ""
-            except Exception as exc:
-                logger.warning("CheckpointManager.diff failed, falling back to git diff: %s", exc)
+        other_snap = None
+        base_hash = None
+        mode = "parent"
 
-        if not diff_text:
-            store_dir = self.hermes_home / "checkpoints" / "store"
-            hash16 = self._project_hash16(wdir)
-            env = {
-                **os.environ,
-                "GIT_DIR": str(store_dir),
-                "GIT_WORK_TREE": str(Path(wdir).resolve()),
-                "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
-            }
+        if compare_to_id == "WORKING_TREE":
+            mode = "working_tree"
+        elif compare_to_id:
+            other_snap = self.get_snapshot(compare_to_id)
+            base_hash = other_snap["checkpoint_hash"] if other_snap else compare_to_id
+            mode = "arbitrary"
+        elif snap and snap.get("session_id"):
+            # Find previous snapshot in same session
+            with self._lock, self._connect() as conn:
+                prev_row = conn.execute(
+                    """
+                    SELECT * FROM snapshots
+                    WHERE session_id = ? AND created_at < ? AND checkpoint_hash IS NOT NULL AND checkpoint_hash != ''
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (snap["session_id"], snap["created_at"]),
+                ).fetchone()
+                if prev_row:
+                    prev_dict = dict(prev_row)
+                    base_hash = prev_dict.get("checkpoint_hash")
+                    mode = "parent_snapshot"
+
+        diff_text = ""
+        store_dir = self.hermes_home / "checkpoints" / "store"
+        hash16 = self._project_hash16(wdir)
+        env = {
+            **os.environ,
+            "GIT_DIR": str(store_dir),
+            "GIT_WORK_TREE": str(Path(wdir).resolve()),
+            "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+        }
+
+        # Case 1: Live Working Tree Drift (diff target_hash against current uncommitted workspace)
+        if mode == "working_tree":
             try:
                 res = subprocess.run(
-                    ["git", "diff", commit_hash],
+                    ["git", "diff", target_hash],
                     cwd=wdir,
-                    env=env,
+                    env=env if store_dir.exists() else None,
                     capture_output=True,
                     text=True,
                     timeout=15,
                 )
-                if res.returncode == 0 and res.stdout:
+                if res.returncode == 0:
                     diff_text = res.stdout
                 else:
-                    # Try local git repo if applicable
-                    res_loc = subprocess.run(
-                        ["git", "diff", commit_hash],
+                    res_loc = subprocess.run(["git", "diff", target_hash], cwd=wdir, capture_output=True, text=True, timeout=15)
+                    if res_loc.returncode == 0:
+                        diff_text = res_loc.stdout
+            except Exception as exc:
+                logger.debug("working_tree diff error: %s", exc)
+
+        # Case 2: Arbitrary A <-> B or Parent Snapshot comparison
+        elif base_hash and base_hash != target_hash:
+            try:
+                res = subprocess.run(
+                    ["git", "diff", base_hash, target_hash],
+                    cwd=wdir,
+                    env=env if store_dir.exists() else None,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if res.returncode == 0:
+                    diff_text = res.stdout
+                else:
+                    res_loc = subprocess.run(["git", "diff", base_hash, target_hash], cwd=wdir, capture_output=True, text=True, timeout=15)
+                    if res_loc.returncode == 0:
+                        diff_text = res_loc.stdout
+            except Exception as exc:
+                logger.debug("arbitrary diff error: %s", exc)
+
+        # Case 3: Single commit delta (target_hash~1 .. target_hash or CheckpointManager.diff)
+        if not diff_text and mode != "working_tree":
+            mgr = self._get_checkpoint_manager()
+            if mgr is not None:
+                try:
+                    diff_text = mgr.diff(wdir, target_hash) or ""
+                except Exception:
+                    pass
+
+            if not diff_text:
+                try:
+                    res = subprocess.run(
+                        ["git", "show", target_hash, "--format="],
                         cwd=wdir,
+                        env=env if store_dir.exists() else None,
                         capture_output=True,
                         text=True,
                         timeout=15,
                     )
-                    if res_loc.returncode == 0:
-                        diff_text = res_loc.stdout
-            except Exception as exc:
-                logger.debug("git diff fallback error: %s", exc)
+                    if res.returncode == 0:
+                        diff_text = res.stdout
+                    else:
+                        res_loc = subprocess.run(["git", "show", target_hash, "--format="], cwd=wdir, capture_output=True, text=True, timeout=15)
+                        if res_loc.returncode == 0:
+                            diff_text = res_loc.stdout
+                except Exception as exc:
+                    logger.debug("git show fallback error: %s", exc)
 
         files_structured = parse_unified_diff(diff_text)
+        tot_adds = sum(f["additions"] for f in files_structured)
+        tot_dels = sum(f["deletions"] for f in files_structured)
+
         return {
             "ok": True,
             "snapshot_id": snap["id"] if snap else snapshot_id,
-            "checkpoint_hash": commit_hash,
+            "compare_to_id": compare_to_id or ("WORKING_TREE" if mode == "working_tree" else "parent"),
+            "checkpoint_hash": target_hash,
+            "base_hash": base_hash,
             "working_dir": wdir,
-            "diff": diff_text or "(No filesystem differences vs current working tree)",
+            "mode": mode,
+            "diff": diff_text or "(No filesystem differences)",
             "files": files_structured,
             "total_files": len(files_structured),
-            "total_additions": sum(f["additions"] for f in files_structured),
-            "total_deletions": sum(f["deletions"] for f in files_structured),
+            "total_additions": tot_adds,
+            "total_deletions": tot_dels,
+            "summary": {
+                "files_changed": len(files_structured),
+                "additions": tot_adds,
+                "deletions": tot_dels,
+            },
             "snapshot": snap,
+            "compare_to_snapshot": other_snap,
         }
 
     def restore_snapshot(
@@ -605,13 +727,29 @@ class TimeMachineLedger:
         if file_path and file_path.strip() not in target_files:
             target_files.append(file_path.strip())
 
+        # Path Traversal Security Check
+        validated_targets = []
+        for tf in target_files:
+            try:
+                abs_target = validate_safe_path(wdir, tf)
+                rel_target = str(abs_target.relative_to(Path(wdir).resolve())).replace("\\", "/")
+                validated_targets.append((rel_target, abs_target))
+            except ValueError as val_err:
+                return {
+                    "ok": False,
+                    "snapshot_id": snapshot_id,
+                    "working_dir": wdir,
+                    "error": str(val_err),
+                }
+
         result: Dict[str, Any] = {
             "ok": True,
             "snapshot_id": snap["id"] if snap else snapshot_id,
             "checkpoint_hash": commit_hash,
             "working_dir": wdir,
             "files_restored": False,
-            "restored_files": target_files if target_files else "all",
+            "restored_files": [vt[0] for vt in validated_targets] if validated_targets else "all",
+            "unlinked_new_files": [],
             "conversation_rewound": False,
             "messages_deactivated": 0,
             "pre_restore_backup_id": None,
@@ -625,7 +763,7 @@ class TimeMachineLedger:
                     "error": f"No checkpoint hash available for snapshot '{snapshot_id}'.",
                 }
 
-            # 1. "Rollback of a Rollback" Safety Backup: Capture a safety snapshot before modifying workspace
+            # 1. "Rollback of a Rollback" Safety Backup: Capture pre-restore safety snapshot
             try:
                 safety_snap = self.record_pre_tool(
                     session_id=snap.get("session_id") if snap else "default",
@@ -633,7 +771,7 @@ class TimeMachineLedger:
                     args={
                         "target_snapshot_id": snapshot_id,
                         "target_commit": commit_hash,
-                        "file_paths": target_files or None,
+                        "file_paths": [vt[0] for vt in validated_targets] or None,
                     },
                     working_dir=wdir,
                 )
@@ -642,74 +780,64 @@ class TimeMachineLedger:
             except Exception as exc:
                 logger.warning("Could not capture pre-restore safety snapshot: %s", exc)
 
-            mgr = self._get_checkpoint_manager()
+            store_dir = self.hermes_home / "checkpoints" / "store"
+            hash16 = self._project_hash16(wdir)
+            env = {
+                **os.environ,
+                "GIT_DIR": str(store_dir),
+                "GIT_WORK_TREE": str(Path(wdir).resolve()),
+                "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+            }
 
-            # 2. Surgical File Restoration if target_files specified
-            if target_files:
+            # 2. Surgical File Restoration (Handles newly created files without git pathspec failure)
+            if validated_targets:
                 restored_any = False
-                sig_params = set()
-                try:
-                    if mgr is not None:
-                        sig_params = set(inspect.signature(mgr.restore).parameters.keys())
-                except Exception:
-                    pass
-
-                store_dir = self.hermes_home / "checkpoints" / "store"
-                hash16 = self._project_hash16(wdir)
-                env = {
-                    **os.environ,
-                    "GIT_DIR": str(store_dir),
-                    "GIT_WORK_TREE": str(Path(wdir).resolve()),
-                    "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
-                }
-
+                unlinked = []
                 errors = []
-                for tf in target_files:
-                    success = False
-                    if mgr is not None and "file_path" in sig_params:
-                        try:
-                            m_res = mgr.restore(wdir, commit_hash, file_path=tf)
-                            if isinstance(m_res, dict) and m_res.get("ok", True):
-                                success = True
-                            elif m_res is not False:
-                                success = True
-                        except Exception as e:
-                            errors.append(f"{tf}: {e}")
 
-                    if not success:
+                for rel_tf, abs_tf in validated_targets:
+                    existed = file_exists_in_commit(commit_hash, rel_tf, wdir, store_dir)
+                    if existed:
+                        # Restore file from commit
                         res = subprocess.run(
-                            ["git", "checkout", commit_hash, "--", tf],
+                            ["git", "checkout", commit_hash, "--", rel_tf],
                             cwd=wdir,
-                            env=env,
+                            env=env if store_dir.exists() else None,
                             capture_output=True,
                             text=True,
                             timeout=15,
                         )
                         if res.returncode == 0:
-                            success = True
+                            restored_any = True
                         else:
-                            res_local = subprocess.run(
-                                ["git", "checkout", commit_hash, "--", tf],
-                                cwd=wdir,
-                                capture_output=True,
-                                text=True,
-                                timeout=15,
-                            )
-                            if res_local.returncode == 0:
-                                success = True
+                            res_loc = subprocess.run(["git", "checkout", commit_hash, "--", rel_tf], cwd=wdir, capture_output=True, text=True, timeout=15)
+                            if res_loc.returncode == 0:
+                                restored_any = True
                             else:
-                                errors.append(f"{tf}: {res.stderr or res_local.stderr or 'git checkout failed'}")
-
-                    if success:
-                        restored_any = True
+                                errors.append(f"{rel_tf}: {res.stderr or res_loc.stderr or 'checkout failed'}")
+                    else:
+                        # Newly created file that did not exist in commit_hash: unlink from disk!
+                        if abs_tf.exists():
+                            try:
+                                if abs_tf.is_file():
+                                    abs_tf.unlink()
+                                elif abs_tf.is_dir():
+                                    shutil.rmtree(abs_tf, ignore_errors=True)
+                                unlinked.append(rel_tf)
+                                restored_any = True
+                            except OSError as rm_err:
+                                errors.append(f"Could not remove newly created {rel_tf}: {rm_err}")
 
                 result["files_restored"] = restored_any
+                result["unlinked_new_files"] = unlinked
                 if not restored_any and errors:
                     result["ok"] = False
                     result["error"] = "; ".join(errors)
                     return result
+
             else:
                 # Full Workspace Restoration
+                mgr = self._get_checkpoint_manager()
                 if mgr is not None:
                     restore_res = mgr.restore(wdir, commit_hash)
                     result["checkpoint_restore_result"] = restore_res
@@ -727,36 +855,44 @@ class TimeMachineLedger:
                         return result
                     result["files_restored"] = True
                 else:
-                    store_dir = self.hermes_home / "checkpoints" / "store"
-                    hash16 = self._project_hash16(wdir)
-                    env = {
-                        **os.environ,
-                        "GIT_DIR": str(store_dir),
-                        "GIT_WORK_TREE": str(Path(wdir).resolve()),
-                        "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
-                    }
                     res = subprocess.run(
                         ["git", "checkout", "-f", commit_hash],
                         cwd=wdir,
-                        env=env,
+                        env=env if store_dir.exists() else None,
                         capture_output=True,
                         text=True,
                         timeout=15,
                     )
                     if res.returncode != 0:
-                        res_loc = subprocess.run(
-                            ["git", "checkout", "-f", commit_hash],
-                            cwd=wdir,
-                            capture_output=True,
-                            text=True,
-                            timeout=15,
-                        )
+                        res_loc = subprocess.run(["git", "checkout", "-f", commit_hash], cwd=wdir, capture_output=True, text=True, timeout=15)
                         if res_loc.returncode != 0:
                             result["ok"] = False
                             result["error"] = res.stderr or res_loc.stderr or "git checkout failed"
                             return result
                     result["files_restored"] = True
 
+                # Clean up newly-created files recorded in subsequent snapshots of this session
+                if snap and snap.get("session_id"):
+                    with self._lock, self._connect() as conn:
+                        later_rows = conn.execute(
+                            "SELECT tool_args_summary FROM snapshots WHERE session_id = ? AND created_at > ?",
+                            (snap["session_id"], snap["created_at"]),
+                        ).fetchall()
+                        for r in later_rows:
+                            summary = r[0] or ""
+                            # Simple regex matching file names in tool args
+                            for m_path in re.findall(r'[\'\"]([\w./\\-]+\.[a-zA-Z0-9]+)[\'\"]', summary):
+                                try:
+                                    abs_file = (Path(wdir) / m_path).resolve()
+                                    if abs_file.exists() and abs_file.is_file():
+                                        rel_f = str(abs_file.relative_to(Path(wdir).resolve())).replace("\\", "/")
+                                        if not file_exists_in_commit(commit_hash, rel_f, wdir, store_dir):
+                                            abs_file.unlink()
+                                            result["unlinked_new_files"].append(rel_f)
+                                except Exception:
+                                    pass
+
+        # Conversation rewind: Only if explicitly requested
         if rewind_conversation and snap and snap.get("session_id"):
             session_id = snap["session_id"]
             watermark_id = snap.get("message_id_watermark")
@@ -1047,3 +1183,83 @@ class TimeMachineLedger:
                 return f"{k}={val[:80]}"
         raw = json.dumps(args, ensure_ascii=False, default=str)
         return raw[:100]
+
+
+    def prune_snapshots(self, session_id: Optional[str] = None, keep_last: int = 50) -> Dict[str, Any]:
+        """Keep most recent keep_last snapshots per session, preserving baselines and safety backups."""
+        with self._lock, self._connect() as conn:
+            query = "SELECT id, tool_name, recommended_snapshot_id FROM snapshots"
+            params = []
+            if session_id:
+                query += " WHERE session_id = ?"
+                params.append(session_id)
+            query += " ORDER BY created_at DESC"
+
+            rows = [dict(r) for r in conn.execute(query, tuple(params)).fetchall()]
+            total_before = len(rows)
+
+            keep_ids = set()
+            # 1. Keep the most recent keep_last
+            for r in rows[:keep_last]:
+                keep_ids.add(r["id"])
+
+            # 2. Always keep protected snapshots
+            for r in rows:
+                if r.get("tool_name") in ("session_start", "pre_restore_safety_backup"):
+                    keep_ids.add(r["id"])
+                if r.get("recommended_snapshot_id"):
+                    keep_ids.add(r["id"])
+                    keep_ids.add(r["recommended_snapshot_id"])
+
+            delete_ids = [r["id"] for r in rows if r["id"] not in keep_ids]
+            if delete_ids:
+                placeholders = ",".join("?" for _ in delete_ids)
+                conn.execute(f"DELETE FROM snapshots WHERE id IN ({placeholders})", tuple(delete_ids))
+                conn.commit()
+
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "keep_last": keep_last,
+                "total_before": total_before,
+                "pruned_count": len(delete_ids),
+                "retained_count": len(keep_ids),
+            }
+
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Return total snapshots, sessions, self-heal alerts, and estimated store size."""
+        total_snaps = 0
+        total_sess = 0
+        heal_alerts = 0
+        db_size = 0
+
+        if self.db_path.exists():
+            db_size = self.db_path.stat().st_size
+
+        store_dir = self.hermes_home / "checkpoints" / "store"
+        store_size = 0
+        if store_dir.exists():
+            for f in store_dir.rglob("*"):
+                if f.is_file():
+                    store_size += f.stat().st_size
+
+        with self._lock, self._connect() as conn:
+            try:
+                row = conn.execute("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM snapshots").fetchone()
+                if row:
+                    total_snaps = int(row[0] or 0)
+                    total_sess = int(row[1] or 0)
+                heal_row = conn.execute("SELECT COUNT(*) FROM snapshots WHERE self_heal_candidate = 1").fetchone()
+                if heal_row:
+                    heal_alerts = int(heal_row[0] or 0)
+            except Exception:
+                pass
+
+        return {
+            "total_snapshots": total_snaps,
+            "total_sessions": total_sess,
+            "self_heal_alerts_count": heal_alerts,
+            "db_size_bytes": db_size,
+            "store_size_bytes": store_size,
+            "total_storage_bytes": db_size + store_size,
+        }

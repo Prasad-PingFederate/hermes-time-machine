@@ -61,6 +61,13 @@ DIFF_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": "Snapshot ID (e.g. 'snap_...') or shadow git commit hash prefix.",
             },
+            "compare_to_id": {
+                "type": "string",
+                "description": (
+                    "Optional snapshot ID to diff against, or 'WORKING_TREE' to inspect uncommitted "
+                    "drift since the snapshot. Omit to diff against the previous turn."
+                ),
+            },
             "working_dir": {
                 "type": "string",
                 "description": "Optional working directory override if passing a raw commit hash.",
@@ -193,7 +200,8 @@ def handle_diff(
         return json.dumps({"ok": False, "error": "snapshot_id is required."})
 
     working_dir = args.get("working_dir")
-    res = ledger.get_diff(snapshot_id=snapshot_id, working_dir=working_dir)
+    compare_to_id = args.get("compare_to_id")
+    res = ledger.get_diff(snapshot_id=snapshot_id, compare_to_id=compare_to_id, working_dir=working_dir)
     return json.dumps(res, indent=2, default=str)
 
 

@@ -200,6 +200,23 @@ const STYLES = `
     color: #fbbf24;
     font-weight: 600;
   }
+  .tm-badge-blue {
+    background: rgba(56, 139, 253, 0.15);
+    border-color: #388bfd;
+    color: #58a6ff;
+    font-weight: 500;
+  }
+  .tm-summary-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    font-size: 11.5px;
+  }
   .tm-filter-bar {
     padding: 6px 14px;
     background: #13181f;
@@ -432,6 +449,8 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     sessionFilter: '',
     filterText: '',
     viewMode: 'unified', // 'unified' | 'split'
+    compareTo: '',       // '' (parent) | 'WORKING_TREE' | snapshot ID
+    storage: null,
   };
 
   function setToast(msg) {
@@ -458,8 +477,12 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       const q = activeSession
         ? `?session_id=${encodeURIComponent(activeSession)}&limit=50`
         : '?limit=50';
-      const data = await apiCall(ctx, `/snapshots${q}`);
+      const [data, statusData] = await Promise.all([
+        apiCall(ctx, `/snapshots${q}`),
+        apiCall(ctx, `/status${activeSession ? `?session_id=${encodeURIComponent(activeSession)}` : ''}`).catch(() => null),
+      ]);
       state.snapshots = data.snapshots || [];
+      if (statusData) state.storage = statusData;
       if (state.snapshots.length === 0 && activeSession && !state.sessionFilter) {
         const allData = await apiCall(ctx, '/snapshots?limit=50');
         state.snapshots = allData.snapshots || [];
@@ -475,22 +498,32 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     }
   }
 
-  async function selectSnapshot(snapshotId) {
+  async function selectSnapshot(snapshotId, compareTo = state.compareTo) {
     if (disposed) return;
     state.selectedId = snapshotId;
+    state.compareTo = compareTo || '';
     state.selectedSnapshot =
       state.snapshots.find((s) => s.id === snapshotId) || null;
     state.diffText = 'Loading diff...';
     state.files = [];
     render();
     try {
-      const detail = await apiCall(
-        ctx,
-        `/snapshots/${encodeURIComponent(snapshotId)}?include_diff=true`
-      );
-      state.selectedSnapshot = detail.snapshot || state.selectedSnapshot;
-      state.diffText = detail.diff || '';
-      state.files = detail.files || [];
+      if (state.compareTo) {
+        const diffData = await apiCall(
+          ctx,
+          `/snapshots/${encodeURIComponent(snapshotId)}/diff?compare_to=${encodeURIComponent(state.compareTo)}`
+        );
+        state.diffText = diffData.diff || '';
+        state.files = diffData.files || [];
+      } else {
+        const detail = await apiCall(
+          ctx,
+          `/snapshots/${encodeURIComponent(snapshotId)}?include_diff=true`
+        );
+        state.selectedSnapshot = detail.snapshot || state.selectedSnapshot;
+        state.diffText = detail.diff || '';
+        state.files = detail.files || [];
+      }
     } catch (err) {
       state.diffText = `Error loading diff: ${err.message}`;
     }
@@ -560,6 +593,21 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       await loadSnapshots(false);
     } catch (err) {
       setToast(`Branch error: ${err.message}`);
+    }
+  }
+
+  async function triggerPrune() {
+    if (typeof window !== 'undefined' && !window.confirm('Prune snapshots older than the last 50? (Baselines and safety backups are always preserved)')) {
+      return;
+    }
+    try {
+      const activeSession = state.sessionFilter || (ctx && ctx.session && ctx.session.id) || '';
+      const q = activeSession ? `?session_id=${encodeURIComponent(activeSession)}&keep_last=50` : '?keep_last=50';
+      const res = await apiCall(ctx, `/snapshots/prune${q}`, { method: 'POST' });
+      setToast(`Pruned ${res.pruned_count || 0} old snapshots (retained ${res.retained_count || 0}).`);
+      await loadSnapshots(false);
+    } catch (err) {
+      setToast(`Prune error: ${err.message}`);
     }
   }
 
@@ -692,7 +740,18 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
               Session: ${escapeHtml(sel.session_id)} · msg #${sel.message_id_watermark ?? '—'}
             </span>
           </div>
-          <div style="display:flex;gap:6px;align-items:center;">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <div style="display:flex;align-items:center;gap:4px;">
+              <label style="font-size:11px;color:#8b949e;">Compare:</label>
+              <select class="tm-input" id="tm-compare-select" style="padding:2px 8px;font-size:11px;height:26px;width:auto;cursor:pointer;">
+                <option value="" ${state.compareTo === '' ? 'selected' : ''}>Previous Step</option>
+                <option value="WORKING_TREE" ${state.compareTo === 'WORKING_TREE' ? 'selected' : ''}>Live Working Tree</option>
+                ${state.snapshots
+                  .filter((s) => s.id !== sel.id)
+                  .map((s) => `<option value="${escapeHtml(s.id)}" ${state.compareTo === s.id ? 'selected' : ''}>Snapshot: ${escapeHtml(s.tool_name)} (${escapeHtml(s.id.slice(-8))})</option>`)
+                  .join('')}
+              </select>
+            </div>
             <button class="tm-btn" id="tm-toggle-view-btn">
               ${state.viewMode === 'split' ? 'View: Split ◫' : 'View: Unified ☰'}
             </button>
@@ -702,6 +761,14 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
           </div>
         </div>
         <div class="tm-diff-container">
+          <div class="tm-summary-bar">
+            <span style="font-weight:600;color:#c9d1d9;">
+              ${(state.files || []).length} files changed &nbsp;•&nbsp; 
+              <span style="color:#3fb950;">+${(state.files || []).reduce((a, b) => a + (b.additions || 0), 0)} additions</span> &nbsp;•&nbsp; 
+              <span style="color:#f85149;">-${(state.files || []).reduce((a, b) => a + (b.deletions || 0), 0)} deletions</span>
+            </span>
+            <span style="color:#8b949e;font-size:11px;">Diff against: <strong>${escapeHtml(state.compareTo ? (state.compareTo === 'WORKING_TREE' ? 'Live Working Tree' : state.compareTo) : 'Previous Step')}</strong></span>
+          </div>
           ${diffAreaHtml}
         </div>
       `
@@ -714,8 +781,10 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
           <div class="tm-title">
             <span>🛡️ Hermes Time Machine</span>
             <span class="tm-badge">${state.snapshots.length} snapshots</span>
+            ${state.storage ? `<span class="tm-badge tm-badge-blue" title="Total snapshot storage">Storage: ${((state.storage.total_storage_bytes || 0) / (1024 * 1024)).toFixed(1)} MB</span>` : ''}
           </div>
           <div style="display:flex;gap:6px;">
+            <button class="tm-btn" id="tm-prune-btn" title="Prune older snapshots keeping last 50">Prune Old</button>
             <button class="tm-btn" id="tm-refresh-btn">Refresh</button>
           </div>
         </div>
@@ -737,6 +806,14 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     // Event listeners
     const refreshBtn = container.querySelector('#tm-refresh-btn');
     if (refreshBtn) refreshBtn.onclick = () => loadSnapshots(false);
+
+    const pruneBtn = container.querySelector('#tm-prune-btn');
+    if (pruneBtn) pruneBtn.onclick = () => triggerPrune();
+
+    const compareSelect = container.querySelector('#tm-compare-select');
+    if (compareSelect && sel) {
+      compareSelect.onchange = (e) => selectSnapshot(sel.id, e.target.value);
+    }
 
     const filterInput = container.querySelector('#tm-filter-input');
     if (filterInput) {
