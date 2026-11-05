@@ -6,16 +6,21 @@ manifest_version: 2
 api_version: 1
 license: MIT
 tags: [desktop, safety, productivity]
+
 provides_tools:
   - time_machine_list_snapshots
   - time_machine_diff
   - time_machine_restore
   - time_machine_branch
+
 provides_hooks:
+  - on_session_start
   - pre_tool_call
   - post_tool_call
-  - on_session_start
+  - transform_tool_result
+
 python_dependencies: []
+
 config_schema:
   auto_enable_checkpoints:
     type: bool

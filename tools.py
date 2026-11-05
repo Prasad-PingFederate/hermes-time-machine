@@ -88,6 +88,16 @@ RESTORE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": "Optional single file path to restore instead of the entire project tree.",
             },
+            "file_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of specific file paths to restore. If provided, ONLY these files are reverted to the snapshot's state while preserving all other edits.",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Explicit confirmation flag required to execute restoration (default true).",
+                "default": True,
+            },
             "restore_files": {
                 "type": "boolean",
                 "description": "Whether to restore filesystem state (default true).",
@@ -198,9 +208,17 @@ def handle_restore(
     if not snapshot_id:
         return json.dumps({"ok": False, "error": "snapshot_id is required."})
 
+    confirm = args.get("confirm", True)
+    if confirm is False:
+        return json.dumps({
+            "ok": False,
+            "error": "Restoration cancelled: 'confirm' must be true to apply changes to disk.",
+        })
+
     restore_files = bool(args.get("restore_files", True))
     rewind_conversation = bool(args.get("rewind_conversation", False))
     file_path = args.get("file_path")
+    file_paths = args.get("file_paths")
     working_dir = args.get("working_dir")
 
     res = ledger.restore_snapshot(
@@ -208,6 +226,7 @@ def handle_restore(
         restore_files=restore_files,
         rewind_conversation=rewind_conversation,
         file_path=file_path,
+        file_paths=file_paths,
         working_dir=working_dir,
     )
     return json.dumps(res, indent=2, default=str)

@@ -50,6 +50,7 @@ class RestoreRequest(BaseModel):
     restore_files: bool = True
     rewind_conversation: bool = False
     file_path: Optional[str] = None
+    file_paths: Optional[List[str]] = None
     working_dir: Optional[str] = None
 
 
@@ -69,11 +70,16 @@ async def get_status(session_id: Optional[str] = Query(default=None)) -> Dict[st
         include_raw_checkpoints=True,
     )
     latest = snapshots[0] if snapshots else None
+    safe_snap = ledger.get_last_safe_snapshot(active_session) if active_session else None
+    has_self_heal = bool(latest and (latest.get("self_heal_candidate") or latest.get("status") == "error"))
     return {
         "ok": True,
         "active_session_id": active_session,
         "snapshot_count": len(snapshots),
         "latest_snapshot": latest,
+        "last_safe_snapshot": safe_snap,
+        "self_heal_available": has_self_heal,
+        "recommended_snapshot_id": (latest or {}).get("recommended_snapshot_id") or (safe_snap or {}).get("id"),
         "hermes_home": str(ledger.hermes_home),
     }
 
@@ -174,6 +180,7 @@ async def get_snapshot_detail(
         "ok": True,
         "snapshot": snap or diff_res.get("snapshot"),
         "diff": diff_res.get("diff", ""),
+        "files": diff_res.get("files", []),
         "checkpoint_hash": (snap or {}).get("checkpoint_hash") or diff_res.get("checkpoint_hash"),
         "working_dir": (snap or {}).get("working_dir") or diff_res.get("working_dir"),
     }
@@ -199,6 +206,7 @@ async def restore_snapshot(snapshot_id: str, req: RestoreRequest) -> Dict[str, A
         restore_files=req.restore_files,
         rewind_conversation=req.rewind_conversation,
         file_path=req.file_path,
+        file_paths=req.file_paths,
         working_dir=req.working_dir,
     )
     if not res.get("ok"):

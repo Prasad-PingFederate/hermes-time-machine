@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
 import logging
 import os
 import sqlite3
@@ -89,6 +90,54 @@ def resolve_working_dir(
     return str(Path.cwd().resolve())
 
 
+
+def parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
+    """Parse git unified diff into structured per-file records with +/- line stats."""
+    if not diff_text or not diff_text.strip():
+        return []
+
+    files = []
+    chunks = re.split(r"(?=diff --git )", diff_text)
+    for chunk in chunks:
+        if not chunk.startswith("diff --git"):
+            continue
+        lines = chunk.splitlines()
+        if not lines:
+            continue
+        first_line = lines[0]
+        m = re.match(r"diff --git a/(.*?) b/(.*)", first_line)
+        path = m.group(2) if m else "unknown"
+
+        status = "modified"
+        if any(l.startswith("new file mode") for l in lines[:5]):
+            status = "added"
+        elif any(l.startswith("deleted file mode") for l in lines[:5]):
+            status = "deleted"
+
+        additions = 0
+        deletions = 0
+        chunk_lines = []
+        in_hunk = False
+        for l in lines:
+            if l.startswith("@@"):
+                in_hunk = True
+            if in_hunk:
+                chunk_lines.append(l)
+                if l.startswith("+") and not l.startswith("+++"):
+                    additions += 1
+                elif l.startswith("-") and not l.startswith("---"):
+                    deletions += 1
+
+        files.append({
+            "path": path,
+            "status": status,
+            "additions": additions,
+            "deletions": deletions,
+            "diff_chunk": "\n".join(chunk_lines) if chunk_lines else chunk,
+        })
+    return files
+
+
 class TimeMachineLedger:
     def __init__(self, db_path: Optional[Path] = None):
         self.hermes_home = resolve_hermes_home()
@@ -131,6 +180,14 @@ class TimeMachineLedger:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_session ON snapshots(session_id, created_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_call_id ON snapshots(tool_call_id)")
+            try:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN self_heal_candidate INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN recommended_snapshot_id TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
     def _get_checkpoint_manager(self):
@@ -277,6 +334,8 @@ class TimeMachineLedger:
         args: Optional[Dict[str, Any]] = None,
         status: str = "ok",
         duration_ms: Optional[float] = None,
+        self_heal_candidate: bool = False,
+        recommended_snapshot_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         if tool_name.startswith("time_machine_"):
             return None
@@ -333,7 +392,9 @@ class TimeMachineLedger:
                     duration_ms = ?,
                     files_changed = ?,
                     insertions = ?,
-                    deletions = ?
+                    deletions = ?,
+                    self_heal_candidate = ?,
+                    recommended_snapshot_id = ?
                 WHERE id = ?
                 """,
                 (
@@ -343,12 +404,28 @@ class TimeMachineLedger:
                     files_changed,
                     insertions,
                     deletions,
+                    1 if self_heal_candidate else 0,
+                    recommended_snapshot_id,
                     snap["id"],
                 ),
             )
             conn.commit()
 
         return self.get_snapshot(snap["id"])
+
+
+    def get_last_safe_snapshot(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM snapshots
+                WHERE session_id = ? AND status = 'ok' AND checkpoint_hash IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (session_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
     def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         if not snapshot_id:
@@ -448,54 +525,61 @@ class TimeMachineLedger:
                 "error": f"Snapshot '{snapshot_id}' does not have an associated checkpoint hash.",
             }
 
+        diff_text = ""
         mgr = self._get_checkpoint_manager()
         if mgr is not None:
             try:
-                diff_text = mgr.diff(wdir, commit_hash)
-                return {
-                    "ok": True,
-                    "snapshot_id": snap["id"] if snap else snapshot_id,
-                    "checkpoint_hash": commit_hash,
-                    "working_dir": wdir,
-                    "diff": diff_text or "(No filesystem differences vs current working tree)",
-                    "snapshot": snap,
-                }
+                diff_text = mgr.diff(wdir, commit_hash) or ""
             except Exception as exc:
                 logger.warning("CheckpointManager.diff failed, falling back to git diff: %s", exc)
 
-        store_dir = self.hermes_home / "checkpoints" / "store"
-        hash16 = self._project_hash16(wdir)
-        env = {
-            **os.environ,
-            "GIT_DIR": str(store_dir),
-            "GIT_WORK_TREE": str(Path(wdir).resolve()),
-            "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+        if not diff_text:
+            store_dir = self.hermes_home / "checkpoints" / "store"
+            hash16 = self._project_hash16(wdir)
+            env = {
+                **os.environ,
+                "GIT_DIR": str(store_dir),
+                "GIT_WORK_TREE": str(Path(wdir).resolve()),
+                "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+            }
+            try:
+                res = subprocess.run(
+                    ["git", "diff", commit_hash],
+                    cwd=wdir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if res.returncode == 0 and res.stdout:
+                    diff_text = res.stdout
+                else:
+                    # Try local git repo if applicable
+                    res_loc = subprocess.run(
+                        ["git", "diff", commit_hash],
+                        cwd=wdir,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    if res_loc.returncode == 0:
+                        diff_text = res_loc.stdout
+            except Exception as exc:
+                logger.debug("git diff fallback error: %s", exc)
+
+        files_structured = parse_unified_diff(diff_text)
+        return {
+            "ok": True,
+            "snapshot_id": snap["id"] if snap else snapshot_id,
+            "checkpoint_hash": commit_hash,
+            "working_dir": wdir,
+            "diff": diff_text or "(No filesystem differences vs current working tree)",
+            "files": files_structured,
+            "total_files": len(files_structured),
+            "total_additions": sum(f["additions"] for f in files_structured),
+            "total_deletions": sum(f["deletions"] for f in files_structured),
+            "snapshot": snap,
         }
-        try:
-            res = subprocess.run(
-                ["git", "diff", commit_hash],
-                cwd=wdir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            return {
-                "ok": res.returncode == 0,
-                "snapshot_id": snap["id"] if snap else snapshot_id,
-                "checkpoint_hash": commit_hash,
-                "working_dir": wdir,
-                "diff": res.stdout or res.stderr or "(No differences)",
-                "snapshot": snap,
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "snapshot_id": snapshot_id,
-                "checkpoint_hash": commit_hash,
-                "working_dir": wdir,
-                "error": str(exc),
-            }
 
     def restore_snapshot(
         self,
@@ -504,6 +588,7 @@ class TimeMachineLedger:
         restore_files: bool = True,
         rewind_conversation: bool = False,
         file_path: Optional[str] = None,
+        file_paths: Optional[List[str]] = None,
         working_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         snap = self.get_snapshot(snapshot_id)
@@ -514,14 +599,22 @@ class TimeMachineLedger:
             else (working_dir or resolve_working_dir(hermes_home=self.hermes_home))
         )
 
+        target_files = []
+        if file_paths:
+            target_files.extend([f.strip() for f in file_paths if f and f.strip()])
+        if file_path and file_path.strip() not in target_files:
+            target_files.append(file_path.strip())
+
         result: Dict[str, Any] = {
             "ok": True,
             "snapshot_id": snap["id"] if snap else snapshot_id,
             "checkpoint_hash": commit_hash,
             "working_dir": wdir,
             "files_restored": False,
+            "restored_files": target_files if target_files else "all",
             "conversation_rewound": False,
             "messages_deactivated": 0,
+            "pre_restore_backup_id": None,
         }
 
         if restore_files:
@@ -531,27 +624,36 @@ class TimeMachineLedger:
                     "ok": False,
                     "error": f"No checkpoint hash available for snapshot '{snapshot_id}'.",
                 }
-            mgr = self._get_checkpoint_manager()
-            if mgr is None:
-                return {
-                    **result,
-                    "ok": False,
-                    "error": "CheckpointManager is unavailable in this environment.",
-                }
 
-            sig_params = set()
+            # 1. "Rollback of a Rollback" Safety Backup: Capture a safety snapshot before modifying workspace
             try:
-                sig_params = set(inspect.signature(mgr.restore).parameters.keys())
-            except Exception:
-                pass
+                safety_snap = self.record_pre_tool(
+                    session_id=snap.get("session_id") if snap else "default",
+                    tool_name="pre_restore_safety_backup",
+                    args={
+                        "target_snapshot_id": snapshot_id,
+                        "target_commit": commit_hash,
+                        "file_paths": target_files or None,
+                    },
+                    working_dir=wdir,
+                )
+                if safety_snap:
+                    result["pre_restore_backup_id"] = safety_snap.get("id")
+            except Exception as exc:
+                logger.warning("Could not capture pre-restore safety snapshot: %s", exc)
 
-            if file_path and "file_path" not in sig_params:
+            mgr = self._get_checkpoint_manager()
+
+            # 2. Surgical File Restoration if target_files specified
+            if target_files:
+                restored_any = False
+                sig_params = set()
                 try:
-                    if hasattr(mgr, "new_turn"):
-                        mgr.new_turn()
-                    mgr.ensure_checkpoint(wdir, reason=f"pre-restore:{file_path}")
+                    if mgr is not None:
+                        sig_params = set(inspect.signature(mgr.restore).parameters.keys())
                 except Exception:
                     pass
+
                 store_dir = self.hermes_home / "checkpoints" / "store"
                 hash16 = self._project_hash16(wdir)
                 env = {
@@ -560,41 +662,100 @@ class TimeMachineLedger:
                     "GIT_WORK_TREE": str(Path(wdir).resolve()),
                     "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
                 }
-                res = subprocess.run(
-                    ["git", "checkout", commit_hash, "--", file_path],
-                    cwd=wdir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if res.returncode != 0:
-                    result["ok"] = False
-                    result["error"] = res.stderr.strip() or f"Failed restoring {file_path}"
-                    return result
-                result["checkpoint_restore_result"] = {"ok": True, "file_path": file_path}
-                result["files_restored"] = True
-            else:
-                if "file_path" in sig_params and file_path is not None:
-                    restore_res = mgr.restore(wdir, commit_hash, file_path=file_path)
-                else:
-                    restore_res = mgr.restore(wdir, commit_hash)
 
-                result["checkpoint_restore_result"] = restore_res
-                if isinstance(restore_res, dict) and not restore_res.get("ok", True):
+                errors = []
+                for tf in target_files:
+                    success = False
+                    if mgr is not None and "file_path" in sig_params:
+                        try:
+                            m_res = mgr.restore(wdir, commit_hash, file_path=tf)
+                            if isinstance(m_res, dict) and m_res.get("ok", True):
+                                success = True
+                            elif m_res is not False:
+                                success = True
+                        except Exception as e:
+                            errors.append(f"{tf}: {e}")
+
+                    if not success:
+                        res = subprocess.run(
+                            ["git", "checkout", commit_hash, "--", tf],
+                            cwd=wdir,
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if res.returncode == 0:
+                            success = True
+                        else:
+                            res_local = subprocess.run(
+                                ["git", "checkout", commit_hash, "--", tf],
+                                cwd=wdir,
+                                capture_output=True,
+                                text=True,
+                                timeout=15,
+                            )
+                            if res_local.returncode == 0:
+                                success = True
+                            else:
+                                errors.append(f"{tf}: {res.stderr or res_local.stderr or 'git checkout failed'}")
+
+                    if success:
+                        restored_any = True
+
+                result["files_restored"] = restored_any
+                if not restored_any and errors:
                     result["ok"] = False
-                    result["error"] = (
-                        restore_res.get("error")
-                        or restore_res.get("reason")
-                        or restore_res.get("message")
-                        or "CheckpointManager.restore returned ok=False"
+                    result["error"] = "; ".join(errors)
+                    return result
+            else:
+                # Full Workspace Restoration
+                if mgr is not None:
+                    restore_res = mgr.restore(wdir, commit_hash)
+                    result["checkpoint_restore_result"] = restore_res
+                    if isinstance(restore_res, dict) and not restore_res.get("ok", True):
+                        result["ok"] = False
+                        result["error"] = (
+                            restore_res.get("error")
+                            or restore_res.get("reason")
+                            or "CheckpointManager.restore returned ok=False"
+                        )
+                        return result
+                    if restore_res is False:
+                        result["ok"] = False
+                        result["error"] = "CheckpointManager.restore returned False"
+                        return result
+                    result["files_restored"] = True
+                else:
+                    store_dir = self.hermes_home / "checkpoints" / "store"
+                    hash16 = self._project_hash16(wdir)
+                    env = {
+                        **os.environ,
+                        "GIT_DIR": str(store_dir),
+                        "GIT_WORK_TREE": str(Path(wdir).resolve()),
+                        "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+                    }
+                    res = subprocess.run(
+                        ["git", "checkout", "-f", commit_hash],
+                        cwd=wdir,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
                     )
-                    return result
-                if restore_res is False:
-                    result["ok"] = False
-                    result["error"] = "CheckpointManager.restore returned False"
-                    return result
-                result["files_restored"] = True
+                    if res.returncode != 0:
+                        res_loc = subprocess.run(
+                            ["git", "checkout", "-f", commit_hash],
+                            cwd=wdir,
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if res_loc.returncode != 0:
+                            result["ok"] = False
+                            result["error"] = res.stderr or res_loc.stderr or "git checkout failed"
+                            return result
+                    result["files_restored"] = True
 
         if rewind_conversation and snap and snap.get("session_id"):
             session_id = snap["session_id"]

@@ -57,99 +57,190 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
+function getBadgeColor(s) {
+  if (s.self_heal_candidate || s.status === 'error') return '#ef4444';
+  if (s.tool_name === 'pre_restore_safety_backup') return '#10b981';
+  if (['write_file', 'patch', 'edit_file', 'create_file'].includes(s.tool_name)) return '#3b82f6';
+  if (['terminal', 'bash', 'execute_code', 'run_command'].includes(s.tool_name)) return '#8b5cf6';
+  if (s.tool_name === 'time_machine_branch' || s.parent_session_id) return '#f59e0b';
+  return '#6b7280';
+}
+
 function renderColorizedDiff(diffText) {
-  if (!diffText) {
+  if (!diffText || !diffText.trim()) {
     return '<div class="tm-empty">No filesystem differences vs current working directory.</div>';
   }
   const lines = String(diffText).split('\n');
-  const htmlLines = lines.map((line) => {
+  const htmlLines = lines.map((line, idx) => {
     const esc = escapeHtml(line);
+    const lineNum = `<span class="tm-diff-num">${idx + 1}</span>`;
     if (line.startsWith('+++') || line.startsWith('---')) {
-      return `<div class="tm-diff-line tm-diff-meta">${esc}</div>`;
+      return `<div class="tm-diff-line tm-diff-meta">${lineNum}${esc}</div>`;
     }
     if (line.startsWith('@@')) {
-      return `<div class="tm-diff-line tm-diff-hunk">${esc}</div>`;
+      return `<div class="tm-diff-line tm-diff-hunk">${lineNum}${esc}</div>`;
     }
     if (line.startsWith('+')) {
-      return `<div class="tm-diff-line tm-diff-add">${esc}</div>`;
+      return `<div class="tm-diff-line tm-diff-add">${lineNum}${esc}</div>`;
     }
     if (line.startsWith('-')) {
-      return `<div class="tm-diff-line tm-diff-del">${esc}</div>`;
+      return `<div class="tm-diff-line tm-diff-del">${lineNum}${esc}</div>`;
     }
-    return `<div class="tm-diff-line">${esc}</div>`;
+    return `<div class="tm-diff-line">${lineNum}${esc}</div>`;
   });
-  return `<div class="tm-diff-container">${htmlLines.join('')}</div>`;
+  return `<div class="tm-diff-content">${htmlLines.join('')}</div>`;
 }
 
-const STUDIO_STYLES = `
+function renderSideBySideDiff(diffText) {
+  if (!diffText || !diffText.trim()) {
+    return '<div class="tm-empty">No filesystem differences to split.</div>';
+  }
+  const lines = String(diffText).split('\n');
+  const rows = [];
+  let leftNum = 1;
+  let rightNum = 1;
+
+  for (const line of lines) {
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff --git') || line.startsWith('index ')) {
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      rows.push(`
+        <tr class="tm-split-hunk">
+          <td colspan="4">${escapeHtml(line)}</td>
+        </tr>
+      `);
+      continue;
+    }
+    if (line.startsWith('-')) {
+      rows.push(`
+        <tr class="tm-split-row">
+          <td class="tm-split-num tm-split-del">${leftNum++}</td>
+          <td class="tm-split-code tm-split-del">${escapeHtml(line.slice(1))}</td>
+          <td class="tm-split-num tm-split-empty"></td>
+          <td class="tm-split-code tm-split-empty"></td>
+        </tr>
+      `);
+    } else if (line.startsWith('+')) {
+      rows.push(`
+        <tr class="tm-split-row">
+          <td class="tm-split-num tm-split-empty"></td>
+          <td class="tm-split-code tm-split-empty"></td>
+          <td class="tm-split-num tm-split-add">${rightNum++}</td>
+          <td class="tm-split-code tm-split-add">${escapeHtml(line.slice(1))}</td>
+        </tr>
+      `);
+    } else {
+      rows.push(`
+        <tr class="tm-split-row">
+          <td class="tm-split-num">${leftNum++}</td>
+          <td class="tm-split-code">${escapeHtml(line.startsWith(' ') ? line.slice(1) : line)}</td>
+          <td class="tm-split-num">${rightNum++}</td>
+          <td class="tm-split-code">${escapeHtml(line.startsWith(' ') ? line.slice(1) : line)}</td>
+        </tr>
+      `);
+    }
+  }
+
+  return `
+    <table class="tm-split-table">
+      <thead>
+        <tr>
+          <th colspan="2" style="width:50%;border-right:1px solid #30363d;">Original State</th>
+          <th colspan="2" style="width:50%;">Current Working Tree</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+const STYLES = `
   .tm-root {
-    font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
-    color: var(--text-primary, #e6edf3);
-    background: var(--bg-primary, #0d1117);
-    height: 100%;
-    width: 100%;
     display: flex;
     flex-direction: column;
+    height: 100%;
+    width: 100%;
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     overflow: hidden;
+    box-sizing: border-box;
   }
   .tm-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 10px 14px;
-    border-bottom: 1px solid var(--border-color, #30363d);
-    background: var(--bg-secondary, #161b22);
+    border-bottom: 1px solid #30363d;
+    background: #161b22;
     gap: 8px;
+    flex-shrink: 0;
   }
   .tm-title {
-    font-size: 13px;
     font-weight: 600;
+    font-size: 13px;
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .tm-actions {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .tm-btn {
+  .tm-badge {
     background: #21262d;
-    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: #8b949e;
+  }
+  .tm-badge-amber {
+    background: rgba(245, 158, 11, 0.15);
+    border-color: #f59e0b;
+    color: #fbbf24;
+    font-weight: 600;
+  }
+  .tm-filter-bar {
+    padding: 6px 14px;
+    background: #13181f;
+    border-bottom: 1px solid #21262d;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .tm-input {
+    flex: 1;
+    background: #0d1117;
     border: 1px solid #30363d;
     border-radius: 6px;
-    padding: 4px 9px;
-    font-size: 11px;
-    cursor: pointer;
-    transition: background 0.15s ease;
+    color: #c9d1d9;
+    padding: 4px 8px;
+    font-size: 11.5px;
+    outline: none;
   }
-  .tm-btn:hover { background: #30363d; }
-  .tm-btn-primary {
-    background: #238636;
-    border-color: rgba(240,246,252,0.1);
-    color: #ffffff;
-  }
-  .tm-btn-primary:hover { background: #2ea043; }
-  .tm-btn-warn {
-    background: #9e6a03;
-    border-color: rgba(240,246,252,0.1);
-    color: #ffffff;
-  }
-  .tm-btn-warn:hover { background: #bb8009; }
-  .tm-btn-branch {
-    background: #1f6feb;
-    border-color: rgba(240,246,252,0.1);
-    color: #ffffff;
-  }
-  .tm-btn-branch:hover { background: #388bfd; }
+  .tm-input:focus { border-color: #58a6ff; }
   .tm-body {
-    display: grid;
-    grid-template-columns: 320px 1fr;
+    display: flex;
     flex: 1;
-    min-height: 0;
+    overflow: hidden;
   }
-  .tm-list {
-    border-right: 1px solid var(--border-color, #30363d);
+  .tm-sidebar {
+    width: 320px;
+    min-width: 260px;
+    max-width: 440px;
+    border-right: 1px solid #30363d;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: #0d1117;
+  }
+  .tm-rail-root .tm-sidebar {
+    width: 100%;
+    max-width: 100%;
+    border-right: none;
+  }
+  .tm-card-list {
+    flex: 1;
     overflow-y: auto;
     padding: 8px;
     display: flex;
@@ -157,44 +248,67 @@ const STUDIO_STYLES = `
     gap: 6px;
   }
   .tm-card {
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 9px 10px;
     background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 8px 10px;
     cursor: pointer;
-    transition: border-color 0.15s ease, background 0.15s ease;
+    transition: all 0.15s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    position: relative;
+    border-left: 3px solid #30363d;
   }
-  .tm-card:hover, .tm-card.active {
-    border-color: #58a6ff;
+  .tm-card:hover {
     background: #1c2128;
+    border-color: #388bfd;
+  }
+  .tm-card.active {
+    background: #1f242c;
+    border-color: #58a6ff;
+    box-shadow: 0 0 0 1px #58a6ff;
   }
   .tm-card-top {
     display: flex;
-    justify-content: space-between;
     align-items: center;
+    justify-content: space-between;
     font-size: 12px;
     font-weight: 600;
-    margin-bottom: 4px;
-  }
-  .tm-badge {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: rgba(88,166,255,0.15);
-    color: #58a6ff;
   }
   .tm-sub {
     font-size: 11px;
     color: #8b949e;
-    word-break: break-all;
-    margin-bottom: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .tm-detail {
+  .tm-btn {
+    background: #21262d;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    transition: background 0.15s;
+  }
+  .tm-btn:hover { background: #30363d; }
+  .tm-btn-primary { background: #238636; border-color: #2ea043; color: #fff; }
+  .tm-btn-primary:hover { background: #2ea043; }
+  .tm-btn-warn { background: #b62324; border-color: #da3633; color: #fff; }
+  .tm-btn-warn:hover { background: #da3633; }
+  .tm-btn-branch { background: #8957e5; border-color: #a371f7; color: #fff; }
+  .tm-btn-branch:hover { background: #a371f7; }
+  .tm-detail-pane {
+    flex: 1;
     display: flex;
     flex-direction: column;
-    min-height: 0;
     overflow: hidden;
+    background: #0d1117;
   }
   .tm-detail-bar {
     padding: 10px 14px;
@@ -204,9 +318,9 @@ const STUDIO_STYLES = `
     align-items: center;
     flex-wrap: wrap;
     gap: 8px;
-    background: #13181f;
+    background: #161b22;
   }
-  .tm-diff-container, .tm-diff-scroll {
+  .tm-diff-container {
     flex: 1;
     overflow: auto;
     padding: 10px 14px;
@@ -214,11 +328,80 @@ const STUDIO_STYLES = `
     font-size: 11.5px;
     line-height: 1.5;
   }
-  .tm-diff-line { white-space: pre-wrap; word-break: break-all; padding: 1px 4px; }
+  .tm-diff-content { display: flex; flex-direction: column; }
+  .tm-diff-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    padding: 1px 4px;
+    display: flex;
+    gap: 8px;
+  }
+  .tm-diff-num {
+    width: 32px;
+    color: #484f58;
+    text-align: right;
+    user-select: none;
+    flex-shrink: 0;
+  }
   .tm-diff-add { background: rgba(46, 160, 67, 0.18); color: #7ee787; }
   .tm-diff-del { background: rgba(248, 81, 73, 0.18); color: #ffa198; }
-  .tm-diff-hunk { color: #79c0ff; background: rgba(56, 139, 253, 0.1); }
+  .tm-diff-hunk { color: #79c0ff; background: rgba(56, 139, 253, 0.1); font-weight: 600; }
   .tm-diff-meta { color: #8b949e; font-weight: 600; }
+  .tm-file-card {
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    margin-bottom: 12px;
+    background: #161b22;
+    overflow: hidden;
+  }
+  .tm-file-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: #21262d;
+    border-bottom: 1px solid #30363d;
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .tm-file-stats {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: #8b949e;
+  }
+  .tm-split-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .tm-split-table th {
+    padding: 4px 8px;
+    background: #21262d;
+    border-bottom: 1px solid #30363d;
+    text-align: left;
+    font-weight: 600;
+  }
+  .tm-split-row:hover { background: #161b22; }
+  .tm-split-num {
+    width: 32px;
+    color: #484f58;
+    text-align: right;
+    padding: 1px 6px;
+    user-select: none;
+    border-right: 1px solid #21262d;
+  }
+  .tm-split-code {
+    padding: 1px 8px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: monospace;
+  }
+  .tm-split-del { background: rgba(248, 81, 73, 0.15); color: #ffa198; }
+  .tm-split-add { background: rgba(46, 160, 67, 0.15); color: #7ee787; }
+  .tm-split-empty { background: rgba(0, 0, 0, 0.2); }
   .tm-toast {
     margin: 8px 14px 0;
     padding: 7px 11px;
@@ -229,7 +412,7 @@ const STUDIO_STYLES = `
     color: #c9d1d9;
   }
   .tm-empty {
-    padding: 20px;
+    padding: 24px;
     text-align: center;
     color: #8b949e;
     font-size: 12px;
@@ -243,9 +426,12 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     selectedId: null,
     selectedSnapshot: null,
     diffText: '',
+    files: [],
     loading: false,
     toast: null,
     sessionFilter: '',
+    filterText: '',
+    viewMode: 'unified', // 'unified' | 'split'
   };
 
   function setToast(msg) {
@@ -295,6 +481,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     state.selectedSnapshot =
       state.snapshots.find((s) => s.id === snapshotId) || null;
     state.diffText = 'Loading diff...';
+    state.files = [];
     render();
     try {
       const detail = await apiCall(
@@ -303,33 +490,21 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       );
       state.selectedSnapshot = detail.snapshot || state.selectedSnapshot;
       state.diffText = detail.diff || '';
+      state.files = detail.files || [];
     } catch (err) {
       state.diffText = `Error loading diff: ${err.message}`;
     }
     render();
   }
 
-  async function takeManualSnapshot() {
-    try {
-      setToast('Creating checkpoint...');
-      await apiCall(ctx, '/snapshots', {
-        method: 'POST',
-        body: JSON.stringify({
-          session_id: (ctx && ctx.session && ctx.session.id) || undefined,
-          reason: 'manual_desktop_snapshot',
-        }),
-      });
-      setToast('Snapshot captured.');
-      await loadSnapshots(true);
-    } catch (err) {
-      setToast(`Snapshot failed: ${err.message}`);
-    }
-  }
+  async function triggerRestore(snapshotId, rewindConversation = false, targetFiles = null) {
+    const what = targetFiles && targetFiles.length > 0
+      ? `surgically restore ${targetFiles.join(', ')}`
+      : rewindConversation
+      ? 'restore ALL workspace files AND rewind chat messages in state.db'
+      : 'restore ALL workspace files to this snapshot state';
 
-  async function triggerRestore(snapshotId, rewindConversation = false) {
-    const label = rewindConversation
-      ? 'Restore working tree files AND rewind conversation messages in state.db?'
-      : 'Restore working tree files to this snapshot? (A safety checkpoint is created automatically first)';
+    const label = `${what.charAt(0).toUpperCase() + what.slice(1)}? (A pre-restore safety snapshot will be created automatically first)`;
     if (typeof window !== 'undefined' && !window.confirm(label)) {
       return;
     }
@@ -342,13 +517,17 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
           body: JSON.stringify({
             restore_files: true,
             rewind_conversation: rewindConversation,
+            file_paths: targetFiles || undefined,
           }),
         }
       );
+      const safetyMsg = res.pre_restore_backup_id ? ` (Safety backup: ${res.pre_restore_backup_id})` : '';
       setToast(
-        rewindConversation
-          ? `Restored files & rewound ${res.messages_deactivated || 0} message(s).`
-          : `Restored files to ${(res.checkpoint_hash || '').slice(0, 8)}.`
+        targetFiles
+          ? `Surgically restored ${targetFiles.join(', ')}.${safetyMsg}`
+          : rewindConversation
+          ? `Restored workspace & rewound ${res.messages_deactivated || 0} messages.${safetyMsg}`
+          : `Restored workspace to ${(res.checkpoint_hash || '').slice(0, 8)}.${safetyMsg}`
       );
       await loadSnapshots(false);
       await selectSnapshot(snapshotId);
@@ -360,7 +539,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   async function triggerBranch(snapshotId) {
     const customTitle =
       typeof window !== 'undefined'
-        ? window.prompt('Optional title for branched session:', '')
+        ? window.prompt('Title for branched session:', 'Branched from Time Machine')
         : '';
     if (customTitle === null) return;
     try {
@@ -387,14 +566,25 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
   function render() {
     if (disposed || !container) return;
     const isRail = mode === 'rail';
+
+    const filteredSnaps = state.snapshots.filter((s) => {
+      if (!state.filterText) return true;
+      const ft = state.filterText.toLowerCase();
+      const nameMatch = (s.tool_name || '').toLowerCase().includes(ft);
+      const argsMatch = (s.tool_args_summary || '').toLowerCase().includes(ft);
+      const wdirMatch = (s.working_dir || '').toLowerCase().includes(ft);
+      return nameMatch || argsMatch || wdirMatch;
+    });
+
     const cardsHtml =
-      state.snapshots.length === 0
+      filteredSnaps.length === 0
         ? `<div class="tm-empty">${
-            state.loading ? 'Loading snapshots...' : 'No snapshots recorded yet.'
+            state.loading ? 'Loading snapshots...' : 'No snapshots matching filter.'
           }</div>`
-        : state.snapshots
+        : filteredSnaps
             .map((s) => {
               const active = s.id === state.selectedId ? 'active' : '';
+              const borderCol = getBadgeColor(s);
               const shortHash = (s.checkpoint_hash || '').slice(0, 8) || 'no-git';
               const stats =
                 s.files_changed || s.insertions || s.deletions
@@ -402,11 +592,17 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
                       s.deletions || 0
                     }</span>`
                   : '';
+              const selfHealBadge = s.self_heal_candidate
+                ? `<span class="tm-badge tm-badge-amber" style="margin-left:4px;">⚠️ Self-Heal</span>`
+                : '';
               return `
-                <div class="tm-card ${active}" data-snap-id="${escapeHtml(s.id)}">
+                <div class="tm-card ${active}" data-snap-id="${escapeHtml(s.id)}" style="border-left-color:${borderCol};">
                   <div class="tm-card-top">
                     <span>${escapeHtml(s.tool_name)}</span>
-                    <span class="tm-badge">${escapeHtml(shortHash)}</span>
+                    <div>
+                      ${selfHealBadge}
+                      <span class="tm-badge">${escapeHtml(shortHash)}</span>
+                    </div>
                   </div>
                   <div class="tm-sub">${escapeHtml(
                     s.tool_args_summary || s.reason || s.working_dir
@@ -422,13 +618,10 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
                       ? `<div style="display:flex;gap:6px;margin-top:8px;">
                           <button class="tm-btn tm-btn-warn" data-action="restore-files" data-id="${escapeHtml(
                             s.id
-                          )}">Restore</button>
-                          <button class="tm-btn tm-btn-warn" data-action="restore-all" data-id="${escapeHtml(
-                            s.id
-                          )}">Rewind All</button>
+                          )}">Revert</button>
                           <button class="tm-btn tm-btn-branch" data-action="branch" data-id="${escapeHtml(
                             s.id
-                          )}">Branch</button>
+                          )}">Fork</button>
                         </div>`
                       : ''
                   }
@@ -438,6 +631,55 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
             .join('');
 
     const sel = state.selectedSnapshot;
+    let diffAreaHtml = '';
+
+    if (sel) {
+      if (state.files && state.files.length > 0) {
+        const fileCards = state.files.map((f) => {
+          const statusBadge =
+            f.status === 'added'
+              ? '<span class="tm-badge" style="background:#238636;color:#fff;">Added</span>'
+              : f.status === 'deleted'
+              ? '<span class="tm-badge" style="background:#da3633;color:#fff;">Deleted</span>'
+              : '<span class="tm-badge" style="background:#1f6feb;color:#fff;">Modified</span>';
+
+          const viewContent =
+            state.viewMode === 'split'
+              ? renderSideBySideDiff(f.diff_chunk)
+              : renderColorizedDiff(f.diff_chunk);
+
+          return `
+            <div class="tm-file-card">
+              <div class="tm-file-header">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  ${statusBadge}
+                  <span>${escapeHtml(f.path)}</span>
+                </div>
+                <div class="tm-file-stats">
+                  <span>+${f.additions || 0} / -${f.deletions || 0}</span>
+                  <button class="tm-btn tm-btn-warn" data-action="revert-file" data-snap="${escapeHtml(sel.id)}" data-file="${escapeHtml(f.path)}">
+                    Revert File Only
+                  </button>
+                </div>
+              </div>
+              <div style="max-height:360px;overflow:auto;">
+                ${viewContent}
+              </div>
+            </div>
+          `;
+        }).join('');
+
+        diffAreaHtml = fileCards;
+      } else {
+        diffAreaHtml =
+          state.viewMode === 'split'
+            ? renderSideBySideDiff(state.diffText)
+            : renderColorizedDiff(state.diffText);
+      }
+    } else {
+      diffAreaHtml = '<div class="tm-empty">Select a snapshot from the timeline to inspect changes.</div>';
+    }
+
     const detailHtml = sel
       ? `
         <div class="tm-detail-bar">
@@ -447,75 +689,77 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
               (sel.checkpoint_hash || '').slice(0, 12)
             )}</span>
             <span style="font-size:11px;color:#8b949e;margin-left:8px;">
-              Session: ${escapeHtml(sel.session_id)} · Watermark msg #${
-          sel.message_id_watermark ?? '—'
-        }
+              Session: ${escapeHtml(sel.session_id)} · msg #${sel.message_id_watermark ?? '—'}
             </span>
           </div>
-          <div class="tm-actions">
-            <button class="tm-btn tm-btn-warn" id="tm-restore-files-btn">Restore Files</button>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <button class="tm-btn" id="tm-toggle-view-btn">
+              ${state.viewMode === 'split' ? 'View: Split ◫' : 'View: Unified ☰'}
+            </button>
+            <button class="tm-btn tm-btn-warn" id="tm-restore-files-btn">Restore Full Workspace</button>
             <button class="tm-btn tm-btn-warn" id="tm-restore-all-btn">Rewind Files + Chat</button>
-            <button class="tm-btn tm-btn-branch" id="tm-branch-btn">Fork Session Here</button>
+            <button class="tm-btn tm-btn-branch" id="tm-branch-btn">Fork Session</button>
           </div>
         </div>
-        <div class="tm-diff-scroll">
-          ${renderColorizedDiff(state.diffText)}
+        <div class="tm-diff-container">
+          ${diffAreaHtml}
         </div>
       `
-      : `<div class="tm-empty">Select a snapshot on the left to inspect its filesystem diff and restore/branch controls.</div>`;
+      : '<div class="tm-empty" style="margin:auto;">Select a snapshot from the timeline to inspect changes.</div>';
 
     container.innerHTML = `
-      <style>${STUDIO_STYLES}</style>
-      <div class="tm-root">
+      <style>${STYLES}</style>
+      <div class="tm-root ${isRail ? 'tm-rail-root' : ''}">
         <div class="tm-header">
           <div class="tm-title">
-            <span>⏱️ Time Machine</span>
-            <span class="tm-badge">${state.snapshots.length}</span>
+            <span>🛡️ Hermes Time Machine</span>
+            <span class="tm-badge">${state.snapshots.length} snapshots</span>
           </div>
-          <div class="tm-actions">
-            <button class="tm-btn tm-btn-primary" id="tm-snap-now-btn">+ Snap Now</button>
-            <button class="tm-btn" id="tm-refresh-btn">↻</button>
+          <div style="display:flex;gap:6px;">
+            <button class="tm-btn" id="tm-refresh-btn">Refresh</button>
           </div>
         </div>
+        <div class="tm-filter-bar">
+          <input class="tm-input" id="tm-filter-input" placeholder="Search by tool or file name..." value="${escapeHtml(state.filterText)}" />
+        </div>
         ${state.toast ? `<div class="tm-toast">${escapeHtml(state.toast)}</div>` : ''}
-        ${
-          isRail
-            ? `<div class="tm-list" style="border-right:none;flex:1;">${cardsHtml}</div>
-               ${
-                 sel
-                   ? `<div style="border-top:1px solid #30363d;max-height:42%;overflow:auto;" class="tm-diff-scroll">
-                        ${renderColorizedDiff(state.diffText)}
-                      </div>`
-                   : ''
-               }`
-            : `<div class="tm-body">
-                 <div class="tm-list">${cardsHtml}</div>
-                 <div class="tm-detail">${detailHtml}</div>
-               </div>`
-        }
+        <div class="tm-body">
+          <div class="tm-sidebar">
+            <div class="tm-card-list">
+              ${cardsHtml}
+            </div>
+          </div>
+          ${!isRail ? `<div class="tm-detail-pane">${detailHtml}</div>` : ''}
+        </div>
       </div>
     `;
 
+    // Event listeners
     const refreshBtn = container.querySelector('#tm-refresh-btn');
     if (refreshBtn) refreshBtn.onclick = () => loadSnapshots(false);
 
-    const snapNowBtn = container.querySelector('#tm-snap-now-btn');
-    if (snapNowBtn) snapNowBtn.onclick = () => takeManualSnapshot();
+    const filterInput = container.querySelector('#tm-filter-input');
+    if (filterInput) {
+      filterInput.oninput = (e) => {
+        state.filterText = e.target.value;
+        render();
+      };
+    }
 
-    container.querySelectorAll('.tm-card').forEach((card) => {
-      card.onclick = (e) => {
-        const actionBtn = e.target.closest('button[data-action]');
-        const snapId = card.getAttribute('data-snap-id');
-        if (actionBtn) {
-          e.stopPropagation();
-          const act = actionBtn.getAttribute('data-action');
-          const id = actionBtn.getAttribute('data-id');
-          if (act === 'restore-files') triggerRestore(id, false);
-          if (act === 'restore-all') triggerRestore(id, true);
-          if (act === 'branch') triggerBranch(id);
-          return;
-        }
-        if (snapId) selectSnapshot(snapId);
+    const toggleViewBtn = container.querySelector('#tm-toggle-view-btn');
+    if (toggleViewBtn) {
+      toggleViewBtn.onclick = () => {
+        state.viewMode = state.viewMode === 'unified' ? 'split' : 'unified';
+        render();
+      };
+    }
+
+    const cards = container.querySelectorAll('.tm-card');
+    cards.forEach((el) => {
+      el.onclick = (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        const id = el.getAttribute('data-snap-id');
+        if (id) selectSnapshot(id);
       };
     });
 
@@ -533,64 +777,94 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     if (branchBtn && sel) {
       branchBtn.onclick = () => triggerBranch(sel.id);
     }
+
+    const revertFileBtns = container.querySelectorAll('button[data-action="revert-file"]');
+    revertFileBtns.forEach((btn) => {
+      btn.onclick = () => {
+        const snapId = btn.getAttribute('data-snap');
+        const filePath = btn.getAttribute('data-file');
+        if (snapId && filePath) {
+          triggerRestore(snapId, false, [filePath]);
+        }
+      };
+    });
+
+    const actionBtns = container.querySelectorAll('button[data-action]');
+    actionBtns.forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const action = btn.getAttribute('data-action');
+        const id = btn.getAttribute('data-id');
+        if (action === 'restore-files') triggerRestore(id, false);
+        else if (action === 'restore-all') triggerRestore(id, true);
+        else if (action === 'branch') triggerBranch(id);
+      };
+    });
   }
 
   loadSnapshots(true);
+
   return () => {
     disposed = true;
+    container.innerHTML = '';
   };
 }
 
-function mountStatusBarShield(container, ctx) {
+function mountStatusBarItem(container, ctx) {
   let disposed = false;
-  let count = 0;
-  let latestTool = 'ready';
+  let interval = null;
 
-  async function poll() {
-    if (disposed) return;
+  async function update() {
+    if (disposed || !container) return;
     try {
-      const status = await apiCall(ctx, '/status');
-      count = status.snapshot_count || 0;
-      latestTool = status.latest_snapshot?.tool_name || 'ready';
-      render();
+      const activeSession = (ctx && ctx.session && ctx.session.id) || '';
+      const data = await apiCall(
+        ctx,
+        `/status${activeSession ? `?session_id=${encodeURIComponent(activeSession)}` : ''}`
+      );
+      const count = data.snapshot_count || 0;
+      const isSelfHeal = Boolean(data.self_heal_available);
+
+      const badgeStyle = isSelfHeal
+        ? 'background:rgba(245,158,11,0.2);color:#fbbf24;border:1px solid #f59e0b;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:4px;cursor:pointer;'
+        : 'background:#21262d;color:#8b949e;border:1px solid #30363d;padding:2px 8px;border-radius:12px;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer;';
+
+      const label = isSelfHeal
+        ? `⚠️ Self-Heal • ${count} snaps`
+        : `🛡️ Safe Mode • ${count} snaps`;
+
+      container.innerHTML = `
+        <div style="display:flex;align-items:center;height:100%;padding:0 8px;">
+          <span style="${badgeStyle}" title="${isSelfHeal ? 'Command failed after code edit - self-healing checkpoint available!' : 'Time Machine active: automatic shadow-git checkpoints enabled.'}">
+            ${escapeHtml(label)}
+          </span>
+        </div>
+      `;
+
+      const chip = container.querySelector('span');
+      if (chip) {
+        chip.onclick = () => {
+          if (typeof ctx.openView === 'function') {
+            ctx.openView('hermes-time-machine-view');
+          } else if (typeof ctx.openRail === 'function') {
+            ctx.openRail('hermes-time-machine-rail');
+          }
+        };
+      }
     } catch (_) {}
   }
 
-  function render() {
-    if (disposed || !container) return;
-    container.innerHTML = `
-      <button
-        style="background:transparent;border:none;color:inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:2px 6px;"
-        title="Hermes Time Machine — Click to open timeline"
-      >
-        <span>🛡️ TM: <strong>${count}</strong></span>
-        <span style="opacity:0.75;">(${escapeHtml(latestTool)})</span>
-      </button>
-    `;
-    const btn = container.querySelector('button');
-    if (btn && ctx) {
-      btn.onclick = () => {
-        if (typeof ctx.openPane === 'function') {
-          ctx.openPane('time-machine-studio');
-        } else if (typeof ctx.openView === 'function') {
-          ctx.openView('time-machine-studio');
-        } else if (typeof ctx.toggleRail === 'function') {
-          ctx.toggleRail('time-machine-rail');
-        }
-      };
-    }
-  }
+  update();
+  interval = setInterval(update, 8000);
 
-  render();
-  poll();
-  const timer = setInterval(poll, 8000);
   return () => {
     disposed = true;
-    clearInterval(timer);
+    if (interval) clearInterval(interval);
+    container.innerHTML = '';
   };
 }
 
-function registerSlot(ctx, spec) {
+function registerCapability(ctx, spec) {
   if (typeof ctx.register === 'function') {
     ctx.register({
       id: spec.id,
@@ -604,7 +878,6 @@ function registerSlot(ctx, spec) {
         if (el && typeof el === 'object' && 'innerHTML' in el) {
           return spec.mount(el, ctx);
         }
-        return null;
       },
     });
     return;
@@ -637,33 +910,28 @@ function registerSlot(ctx, spec) {
 export default {
   id: PLUGIN_ID,
   name: 'Hermes Time Machine',
-  version: '0.2.0',
-
   activate(ctx) {
-    registerSlot(ctx, {
-      id: 'time-machine-shield',
+    registerCapability(ctx, {
+      id: 'hermes-time-machine-status',
       area: 'statusBar.right',
-      label: 'Time Machine',
-      icon: 'shield',
-      priority: 90,
-      mount: mountStatusBarShield,
+      label: 'Time Machine Status',
+      priority: 95,
+      mount: (el, c) => mountStatusBarItem(el, c),
     });
 
-    registerSlot(ctx, {
-      id: 'time-machine-rail',
+    registerCapability(ctx, {
+      id: 'hermes-time-machine-rail',
       area: 'rail.right',
       label: 'Time Machine',
       icon: 'history',
-      priority: 80,
       mount: (el, c) => mountTimeMachineDOM(el, c, 'rail'),
     });
 
-    registerSlot(ctx, {
-      id: 'time-machine-studio',
+    registerCapability(ctx, {
+      id: 'hermes-time-machine-view',
       area: 'pane',
       label: 'Time Machine Studio',
       icon: 'history',
-      priority: 70,
       mount: (el, c) => mountTimeMachineDOM(el, c, 'studio'),
     });
   },

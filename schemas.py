@@ -16,7 +16,7 @@ DIFF_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "snapshot_id": {"type": "integer", "description": "Snapshot ID from the ledger"},
+            "snapshot_id": {"type": "string", "description": "Snapshot ID from the ledger"},
         },
         "required": ["snapshot_id"],
     },
@@ -24,13 +24,19 @@ DIFF_SCHEMA = {
 
 RESTORE_SCHEMA = {
     "name": "time_machine_restore",
-    "description": "Restore workspace files to the state of a given snapshot. Optionally also rewind the conversation.",
+    "description": "Restore workspace files to the state of a given snapshot. Optionally also rewind the conversation or restore only specific files.",
     "parameters": {
         "type": "object",
         "properties": {
-            "snapshot_id": {"type": "integer"},
-            "rewind_chat": {"type": "boolean", "default": False, "description": "Also rewind conversation to this point"},
-            "confirm": {"type": "boolean", "default": False, "description": "Must be true to actually restore"},
+            "snapshot_id": {"type": "string", "description": "Snapshot ID or checkpoint hash to restore"},
+            "file_path": {"type": "string", "description": "Optional single file to restore"},
+            "file_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of specific file paths to restore surgically",
+            },
+            "rewind_conversation": {"type": "boolean", "default": False, "description": "Also rewind conversation to this point"},
+            "confirm": {"type": "boolean", "default": True, "description": "Must be true to apply restore"},
         },
         "required": ["snapshot_id"],
     },
@@ -42,9 +48,11 @@ BRANCH_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "snapshot_id": {"type": "integer"},
-            "new_session_title": {"type": "string", "default": "Branched from Time Machine"},
+            "snapshot_id": {"type": "string"},
+            "branch_title": {"type": "string", "default": "Branched from Time Machine"},
         },
         "required": ["snapshot_id"],
     },
 }
+
+ALL_SCHEMAS = [LIST_SCHEMA, DIFF_SCHEMA, RESTORE_SCHEMA, BRANCH_SCHEMA]
