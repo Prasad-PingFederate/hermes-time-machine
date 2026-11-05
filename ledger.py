@@ -4,6 +4,7 @@ SQLite Ledger + CheckpointManager & SessionDB Bridge for hermes-time-machine.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -18,7 +19,6 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Mutating tools that warrant an automatic pre-tool filesystem checkpoint
 MUTATING_TOOLS = {
     "write_file",
     "patch",
@@ -31,7 +31,6 @@ MUTATING_TOOLS = {
 
 
 def resolve_hermes_home() -> Path:
-    """Resolve active profile's HERMES_HOME using Hermes's canonical resolver."""
     try:
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home())
@@ -47,12 +46,6 @@ def resolve_working_dir(
     session_id: Optional[str] = None,
     hermes_home: Optional[Path] = None,
 ) -> str:
-    """
-    Determine the effective working directory for a tool call.
-    1. Check tool args (workdir, working_dir, cwd, or file path parent)
-    2. Check session row in state.db or TERMINAL_CWD env var
-    3. Fallback to os.getcwd()
-    """
     args = args or {}
     for key in ("workdir", "working_dir", "cwd", "directory"):
         val = args.get(key)
@@ -76,14 +69,14 @@ def resolve_working_dir(
 
     if session_id:
         home = hermes_home or resolve_hermes_home()
-        state_db = home / "state.db"
-        if state_db.exists():
+        tm_db = home / "time_machine.db"
+        if tm_db.exists():
             try:
-                with sqlite3.connect(str(state_db), timeout=2.0) as conn:
-                    cur = conn.execute(
-                        "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
-                    )
-                    row = cur.fetchone()
+                with sqlite3.connect(str(tm_db), timeout=2.0) as conn:
+                    row = conn.execute(
+                        "SELECT working_dir FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
                     if row and row[0] and Path(row[0]).is_dir():
                         return str(Path(row[0]).resolve())
             except Exception:
@@ -97,13 +90,6 @@ def resolve_working_dir(
 
 
 class TimeMachineLedger:
-    """
-    Stores unified snapshots pairing:
-      - session_id, turn_id, tool_call_id, tool_name
-      - state.db message watermark (message_id_watermark, message_count_watermark)
-      - CheckpointManager shadow git commit (checkpoint_hash, post_checkpoint_hash, working_dir)
-    """
-
     def __init__(self, db_path: Optional[Path] = None):
         self.hermes_home = resolve_hermes_home()
         self.db_path = Path(db_path) if db_path else (self.hermes_home / "time_machine.db")
@@ -143,16 +129,11 @@ class TimeMachineLedger:
                 )
                 """
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tm_session ON snapshots(session_id, created_at DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tm_call_id ON snapshots(tool_call_id)"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_session ON snapshots(session_id, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_call_id ON snapshots(tool_call_id)")
             conn.commit()
 
     def _get_checkpoint_manager(self):
-        """Return an active Hermes CheckpointManager instance if available."""
         try:
             from tools.checkpoint_manager import CheckpointManager
             return CheckpointManager(enabled=True)
@@ -161,7 +142,6 @@ class TimeMachineLedger:
             return None
 
     def _get_session_db(self):
-        """Return an active Hermes SessionDB instance if available."""
         try:
             from hermes_state import SessionDB
             return SessionDB(db_path=self.hermes_home / "state.db")
@@ -210,7 +190,6 @@ class TimeMachineLedger:
                     return checkpoints[0].get("hash")
             except Exception as exc:
                 logger.warning("CheckpointManager.ensure_checkpoint failed: %s", exc)
-
         return self._read_shadow_ref_tip(abs_dir)
 
     def _get_message_watermark(self, session_id: str) -> tuple[Optional[int], int]:
@@ -427,38 +406,32 @@ class TimeMachineLedger:
                         for cp in mgr.list_checkpoints(target_dir)[:limit]:
                             cp_hash = cp.get("hash")
                             if cp_hash and cp_hash not in known_hashes:
-                                rows.append(
-                                    {
-                                        "id": f"cp_{cp.get('short_hash', cp_hash[:8])}",
-                                        "session_id": session_id or "shadow-store",
-                                        "turn_id": None,
-                                        "tool_call_id": None,
-                                        "tool_name": "checkpoint",
-                                        "tool_args_summary": cp.get("reason", "auto checkpoint"),
-                                        "working_dir": str(Path(target_dir).expanduser().resolve()),
-                                        "checkpoint_hash": cp_hash,
-                                        "post_checkpoint_hash": cp_hash,
-                                        "reason": cp.get("reason", "checkpoint"),
-                                        "message_id_watermark": None,
-                                        "message_count_watermark": 0,
-                                        "status": "ok",
-                                        "duration_ms": None,
-                                        "files_changed": int(cp.get("files_changed") or 0),
-                                        "insertions": int(cp.get("insertions") or 0),
-                                        "deletions": int(cp.get("deletions") or 0),
-                                        "created_at": time.time(),
-                                    }
-                                )
+                                rows.append({
+                                    "id": f"cp_{cp.get('short_hash', cp_hash[:8])}",
+                                    "session_id": session_id or "shadow-store",
+                                    "turn_id": None,
+                                    "tool_call_id": None,
+                                    "tool_name": "checkpoint",
+                                    "tool_args_summary": cp.get("reason", "auto checkpoint"),
+                                    "working_dir": str(Path(target_dir).expanduser().resolve()),
+                                    "checkpoint_hash": cp_hash,
+                                    "post_checkpoint_hash": cp_hash,
+                                    "reason": cp.get("reason", "checkpoint"),
+                                    "message_id_watermark": None,
+                                    "message_count_watermark": 0,
+                                    "status": "ok",
+                                    "duration_ms": None,
+                                    "files_changed": int(cp.get("files_changed") or 0),
+                                    "insertions": int(cp.get("insertions") or 0),
+                                    "deletions": int(cp.get("deletions") or 0),
+                                    "created_at": time.time(),
+                                })
                     except Exception:
                         pass
 
         return rows[:limit]
 
-    def get_diff(
-        self,
-        snapshot_id: str,
-        working_dir: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    def get_diff(self, snapshot_id: str, working_dir: Optional[str] = None) -> Dict[str, Any]:
         snap = self.get_snapshot(snapshot_id)
         commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
         wdir = (
@@ -565,13 +538,63 @@ class TimeMachineLedger:
                     "ok": False,
                     "error": "CheckpointManager is unavailable in this environment.",
                 }
-            restore_res = mgr.restore(wdir, commit_hash, file_path=file_path)
-            result["checkpoint_restore_result"] = restore_res
-            if isinstance(restore_res, dict) and not restore_res.get("ok", True):
-                result["ok"] = False
-                result["error"] = restore_res.get("error") or restore_res.get("reason")
-                return result
-            result["files_restored"] = True
+
+            sig_params = set()
+            try:
+                sig_params = set(inspect.signature(mgr.restore).parameters.keys())
+            except Exception:
+                pass
+
+            if file_path and "file_path" not in sig_params:
+                try:
+                    if hasattr(mgr, "new_turn"):
+                        mgr.new_turn()
+                    mgr.ensure_checkpoint(wdir, reason=f"pre-restore:{file_path}")
+                except Exception:
+                    pass
+                store_dir = self.hermes_home / "checkpoints" / "store"
+                hash16 = self._project_hash16(wdir)
+                env = {
+                    **os.environ,
+                    "GIT_DIR": str(store_dir),
+                    "GIT_WORK_TREE": str(Path(wdir).resolve()),
+                    "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+                }
+                res = subprocess.run(
+                    ["git", "checkout", commit_hash, "--", file_path],
+                    cwd=wdir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if res.returncode != 0:
+                    result["ok"] = False
+                    result["error"] = res.stderr.strip() or f"Failed restoring {file_path}"
+                    return result
+                result["checkpoint_restore_result"] = {"ok": True, "file_path": file_path}
+                result["files_restored"] = True
+            else:
+                if "file_path" in sig_params and file_path is not None:
+                    restore_res = mgr.restore(wdir, commit_hash, file_path=file_path)
+                else:
+                    restore_res = mgr.restore(wdir, commit_hash)
+
+                result["checkpoint_restore_result"] = restore_res
+                if isinstance(restore_res, dict) and not restore_res.get("ok", True):
+                    result["ok"] = False
+                    result["error"] = (
+                        restore_res.get("error")
+                        or restore_res.get("reason")
+                        or restore_res.get("message")
+                        or "CheckpointManager.restore returned ok=False"
+                    )
+                    return result
+                if restore_res is False:
+                    result["ok"] = False
+                    result["error"] = "CheckpointManager.restore returned False"
+                    return result
+                result["files_restored"] = True
 
         if rewind_conversation and snap and snap.get("session_id"):
             session_id = snap["session_id"]
@@ -594,12 +617,18 @@ class TimeMachineLedger:
         if not state_db_path.exists():
             return 0
 
-        db = self._get_session_db()
-        deactivated = 0
+        before_active = 0
+        first_user_after_id: Optional[int] = None
+
         try:
             with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
-                conn.row_factory = sqlite3.Row
-                first_user_after = conn.execute(
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND COALESCE(active, 1) = 1",
+                    (session_id,),
+                ).fetchone()
+                before_active = int(row[0] or 0) if row else 0
+
+                user_row = conn.execute(
                     """
                     SELECT id FROM messages
                     WHERE session_id = ? AND id > ? AND role = 'user' AND COALESCE(active, 1) = 1
@@ -607,16 +636,26 @@ class TimeMachineLedger:
                     """,
                     (session_id, watermark_id),
                 ).fetchone()
+                if user_row:
+                    first_user_after_id = int(user_row[0])
+        except Exception as exc:
+            logger.error("Failed reading state.db before rewind: %s", exc)
+            return 0
 
-                if first_user_after and db is not None and hasattr(db, "rewind_to_message"):
-                    try:
-                        deactivated += int(
-                            db.rewind_to_message(session_id, int(first_user_after["id"])) or 0
-                        )
-                    except Exception as exc:
-                        logger.debug("SessionDB.rewind_to_message fallback: %s", exc)
+        rewound_via_session_db = False
+        if first_user_after_id is not None:
+            db = self._get_session_db()
+            if db is not None and hasattr(db, "rewind_to_message"):
+                try:
+                    rewound_via_session_db = bool(
+                        db.rewind_to_message(session_id, first_user_after_id)
+                    )
+                except Exception as exc:
+                    logger.debug("SessionDB.rewind_to_message fallback: %s", exc)
 
-                cur = conn.execute(
+        try:
+            with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
+                conn.execute(
                     """
                     UPDATE messages
                     SET active = 0
@@ -624,26 +663,36 @@ class TimeMachineLedger:
                     """,
                     (session_id, watermark_id),
                 )
-                extra = cur.rowcount or 0
-                deactivated += extra
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND COALESCE(active, 1) = 1",
+                    (session_id,),
+                ).fetchone()
+                after_active = int(row[0] or 0) if row else 0
+                deactivated = max(0, before_active - after_active)
 
                 conn.execute(
                     """
                     UPDATE sessions
-                    SET message_count = (
-                        SELECT COUNT(*) FROM messages
-                        WHERE session_id = ? AND COALESCE(active, 1) = 1
-                    ),
-                    rewind_count = COALESCE(rewind_count, 0) + CASE WHEN ? > 0 THEN 1 ELSE 0 END
+                    SET message_count = ?,
+                        rewind_count = COALESCE(rewind_count, 0) + ?
                     WHERE id = ?
                     """,
-                    (session_id, extra, session_id),
+                    (
+                        after_active,
+                        1 if (deactivated > 0 and not rewound_via_session_db) else 0,
+                        session_id,
+                    ),
                 )
                 conn.commit()
+                return deactivated
         except Exception as exc:
-            logger.error("Failed rewinding session %s to watermark %s: %s", session_id, watermark_id, exc)
-
-        return deactivated
+            logger.error(
+                "Failed finalizing rewind for session %s to watermark %s: %s",
+                session_id,
+                watermark_id,
+                exc,
+            )
+            return 0
 
     def branch_from_snapshot(
         self,
