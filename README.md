@@ -5,7 +5,7 @@
 
 [![Hermes Plugin Validate](https://img.shields.io/badge/hermes_plugin_validate-100%25_PASS-success.svg)](#verification--testing)
 [![Tests](https://img.shields.io/badge/pytest-23%2F23_PASS-brightgreen.svg)](#verification--testing)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](plugin.yaml)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](plugin.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Demo Video Script](https://img.shields.io/badge/Demo_Script-75s_Pacing-purple.svg)](DEMO_SCRIPT.md)
 
