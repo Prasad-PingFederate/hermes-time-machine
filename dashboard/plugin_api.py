@@ -1,14 +1,14 @@
 """
 FastAPI backend router for hermes-time-machine.
 Mounted automatically by Hermes Dashboard / Desktop Gateway at:
-  /api/plugins/hermes-time-machine/
+  /api/plugins/time-machine/
 """
 from __future__ import annotations
 
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel

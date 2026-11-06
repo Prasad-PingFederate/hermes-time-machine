@@ -4,15 +4,28 @@ Registers pre_tool_call / post_tool_call / on_session_start / transform_tool_res
 the 4 time_machine_* tools, /rewind slash command, and self-healing system prompt section.
 """
 from __future__ import annotations
+import re
 
 import logging
 from typing import Any, Dict, List, Optional
 
 try:
-    from .ledger import TimeMachineLedger, resolve_working_dir, MUTATING_TOOLS
+    from .ledger import (
+        TimeMachineLedger,
+        resolve_working_dir,
+        MUTATING_TOOLS,
+        FILE_MUTATING_TOOLS,
+        COMMAND_TOOLS,
+    )
     from .tools import register_time_machine_tools
 except (ImportError, ValueError):
-    from ledger import TimeMachineLedger, resolve_working_dir, MUTATING_TOOLS
+    from ledger import (
+        TimeMachineLedger,
+        resolve_working_dir,
+        MUTATING_TOOLS,
+        FILE_MUTATING_TOOLS,
+        COMMAND_TOOLS,
+    )
     from tools import register_time_machine_tools
 
 logger = logging.getLogger(__name__)
@@ -22,6 +35,7 @@ __plugin_name__ = "time-machine"
 
 # Track the last known-good mutating snapshot per session for autonomous self-healing
 _last_safe_snapshot: Dict[str, str] = {}
+_session_working_dirs: Dict[str, str] = {}
 
 
 def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
@@ -31,12 +45,14 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     def on_session_start(
         session_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         try:
             sess = session_id or task_id or "default"
             _last_safe_snapshot[sess] = ""
-            wdir = resolve_working_dir(session_id=sess)
+            wdir = working_dir or kwargs.get("working_dir") or resolve_working_dir(session_id=sess)
+            _session_working_dirs[sess] = wdir
             ledger.record_pre_tool(
                 session_id=sess,
                 tool_name="session_start",
@@ -57,7 +73,8 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     ) -> None:
         try:
             sess = session_id or task_id or "default"
-            wdir = resolve_working_dir(args=args, session_id=sess)
+            args = args or {}
+            wdir = kwargs.get("working_dir") or args.get("working_dir") or _session_working_dirs.get(sess) or resolve_working_dir(args=args, session_id=sess)
             snap = ledger.record_pre_tool(
                 session_id=sess,
                 turn_id=turn_id,
@@ -66,7 +83,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 args=args or {},
                 working_dir=wdir,
             )
-            if snap and tool_name in MUTATING_TOOLS:
+            if snap and tool_name in FILE_MUTATING_TOOLS:
                 _last_safe_snapshot[sess] = snap.get("id") or ""
         except Exception as exc:
             logger.debug("hermes-time-machine pre_tool_call error: %s", exc)
@@ -85,18 +102,34 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     ) -> None:
         try:
             sess = session_id or task_id or "default"
-            is_cmd_tool = tool_name in {"terminal", "bash", "execute_code", "run_command"}
+            is_cmd_tool = tool_name in COMMAND_TOOLS
             res_str = str(result or "")
-            has_error = (
-                status != "ok"
-                or any(err in res_str for err in ("FAILED", "Traceback", "SyntaxError", "Error:", "exit code"))
-            )
+
+            # Authoritative exit_code handling (Bug 4)
+            exit_code = None
+            if isinstance(result, dict):
+                exit_code = result.get("exit_code", result.get("returncode"))
+            elif hasattr(result, "exit_code"):
+                exit_code = getattr(result, "exit_code")
+            elif hasattr(result, "returncode"):
+                exit_code = getattr(result, "returncode")
+
+            if exit_code is not None:
+                has_error = (int(exit_code) != 0) or (status != "ok")
+            else:
+                has_error = (status != "ok")
+                if not has_error and is_cmd_tool:
+                    has_error = bool(
+                        re.search(r"\b(?:FAILED|FAILURES|Traceback \(most recent call last\)|SyntaxError)\b", res_str)
+                    )
 
             self_heal = False
             rec_snap = None
-            if is_cmd_tool and has_error and _last_safe_snapshot.get(sess):
-                self_heal = True
-                rec_snap = _last_safe_snapshot.get(sess)
+            if is_cmd_tool and has_error:
+                wdir = kwargs.get("working_dir") or _session_working_dirs.get(sess)
+                diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
+                rec_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
+                self_heal = bool(rec_snap)
 
             ledger.record_post_tool(
                 session_id=sess,
@@ -121,20 +154,48 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     ) -> Any:
         try:
             sess = session_id or task_id or "default"
-            rec_snap = _last_safe_snapshot.get(sess)
-            if rec_snap and tool_name in {"terminal", "bash", "execute_code", "run_command"}:
-                res_str = str(result or "")
-                if any(err in res_str for err in ("FAILED", "Traceback", "SyntaxError", "Error:", "exit code")):
-                    diag = ledger.diagnose_failure(session_id=sess, error_text=res_str)
-                    culprits = diag.get("culprit_files", [])
-                    culprit_repr = repr(culprits) if culprits else "None"
-                    target_snap = diag.get("recommended_snapshot_id") or rec_snap
-                    conf = diag.get("confidence", "high")
+            is_cmd_tool = tool_name in COMMAND_TOOLS
+            res_str = str(result or "")
 
+            # Authoritative exit_code handling (Bug 4)
+            exit_code = None
+            if isinstance(result, dict):
+                exit_code = result.get("exit_code", result.get("returncode"))
+            elif hasattr(result, "exit_code"):
+                exit_code = getattr(result, "exit_code")
+            elif hasattr(result, "returncode"):
+                exit_code = getattr(result, "returncode")
+
+            if exit_code is not None:
+                has_error = (int(exit_code) != 0)
+            else:
+                has_error = bool(
+                    re.search(r"\b(?:FAILED|FAILURES|Traceback \(most recent call last\)|SyntaxError)\b", res_str)
+                )
+
+            if is_cmd_tool and has_error:
+                wdir = kwargs.get("working_dir") or _session_working_dirs.get(sess)
+                diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
+                culprits = diag.get("culprit_files", [])
+                culprit_repr = repr(culprits) if culprits else "None"
+                target_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
+                if not target_snap:
+                    safe_snap = ledger.get_last_safe_snapshot(sess)
+                    if safe_snap:
+                        target_snap = safe_snap.get("id")
+                if not target_snap:
+                    recent_snaps = ledger.list_snapshots(session_id=sess, limit=5)
+                    if recent_snaps:
+                        target_snap = recent_snaps[0].get("id")
+                conf = diag.get("confidence", "high")
+                preserved = diag.get("preserved_files", [])
+
+                if target_snap:
                     hint = (
                         f"\n\n[🛡️ Time Machine Self-Heal Notice & Recommendation]:\n"
                         f"Command failed after recent file mutations.\n"
                         f"• Identified culprit file(s): {culprits if culprits else 'recently modified workspace files'}\n"
+                        f"• Preserved good file(s): {preserved if preserved else 'none'}\n"
                         f"• Recommended safe checkpoint: '{target_snap}' (Confidence: {conf})\n"
                         f"• Quick 1-call autonomous recovery:\n"
                         f"  `time_machine_recover(auto_apply=true, confirm=true)`\n"

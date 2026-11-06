@@ -4,8 +4,8 @@
 *Built for the Nous Research Hermes Agent Hackathon*
 
 [![Hermes Plugin Validate](https://img.shields.io/badge/hermes_plugin_validate-16%2F16_PASS-success.svg)](#official-hermes-admission-validator)
-[![Tests](https://img.shields.io/badge/pytest-26%2F26_PASS-brightgreen.svg)](#unit--integration-test-suite-pytest)
-[![Unittest](https://img.shields.io/badge/unittest-26%2F26_PASS-brightgreen.svg)](#standard-library-unittest-compatibility)
+[![Tests](https://img.shields.io/badge/pytest-31%2F31_PASS-brightgreen.svg)](#unit--integration-test-suite-pytest)
+[![Unittest](https://img.shields.io/badge/unittest-31%2F31_PASS-brightgreen.svg)](#standard-library-unittest-compatibility)
 [![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](plugin.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Prasad-PingFederate/hermes-time-machine/actions/workflows/ci.yml/badge.svg)](https://github.com/Prasad-PingFederate/hermes-time-machine/actions/workflows/ci.yml)
@@ -51,7 +51,7 @@ While Hermes Agent includes basic `/rollback` support, `hermes-time-machine` ele
 - **Safety Backup on Restore:** Automatically captures a `pre_restore_safety_backup` snapshot before any file rollback, ensuring restore keeps a safety backup.
 - **Surgical Per-File Restore & Newly-Created File Cleanup:** Revert only the specific broken files (`file_paths=['billing.py']`) while preserving untouched features and cleanly unlinking untracked temporary files from disk.
 - **Arbitrary `A ↔ B` & Live Drift Diffing:** Compare any historical snapshot against another or inspect live uncommitted working tree drift (`compare_to_id="WORKING_TREE"`).
-- **Interactive Visual Timeline Scrubber:** Horizontal step scrubber in Hermes Desktop with hover mini-diff previews, parent-child branch badges (`🌿 Forked`), 1-click **"⚡ Restore & Retry"**, and **"📸 Snapshot"**.
+- **Interactive Visual Timeline Scrubber:** Horizontal step scrubber in Hermes Desktop with hover mini-diff previews, parent-child branch badges (`🌿 Forked`), 1-click **"⚡ Restore & Retry"**, and **"Snapshot"**.
 - **Storage Hygiene & Pruning:** Configurable retention (`max_snapshots_per_session: 50`) with protected baselines and safety backups.
 - **Instant Markdown Timeline Export:** Export structured audit logs via `/rewind export` or the Desktop UI.
 - **CLI Slash Command:** Full terminal suite `/rewind [list|diff|restore|recover|search|export|demo]`.
@@ -75,7 +75,7 @@ hermes-time-machine/
 ├── scripts/
 │   └── demo_walkthrough.py # 7-Step live end-to-end smoke test script
 ├── tests/
-│   ├── test_plugin.py   # 26 Unit & integration tests (100% green: unittest + pytest)
+│   ├── test_plugin.py   # 31 Unit & integration tests (100% green: unittest + pytest)
 │   └── desktop_plugin.test.mjs # Automated Node.js smoke & XSS sanitization test
 ├── DEMO_SCRIPT.md       # Official 75s video narration & walkthrough script
 ├── catalog-entry.yaml   # Verified template for Nous Research plugin-catalog
@@ -102,18 +102,18 @@ hermes-time-machine/
 ### 3. Native Hermes Desktop UI (`desktop/plugin.js`)
 - **Status Bar:** Dynamic 3-state badge (`🛡️ Safe Mode • X snaps`, `⚠️ Self-Heal Available • Revert Ready`, `✅ Recovered • Workspace Clean`).
 - **Horizontal Timeline Scrubber:** Interactive node track (`● ─── ● ─── ● ─── ⚠️ ─── 🌿 ─── ✅`) with hover mini-previews.
-- **Studio Diff Inspector:** Side-by-side split & unified diffs with line numbers and 1-click **"Revert File Only"** headers.
-- **Action Buttons:** **"📸 Snapshot"**, **"⚡ Restore & Retry"**, **"📥 Export"**, and **"Prune Old"**. On cards: **"Revert"** and **"Fork"**.
+- **Studio Diff Inspector:** Side-by-side split & unified diffs with line numbers and 1-click **"Revert"** headers.
+- **Action Buttons:** **"Snapshot"**, **"⚡ Restore & Retry"**, **"📥 Export"**, and **"Prune Old"**. On cards: **"Revert"** and **"Fork"**.
 
 ---
 
-## 🔒 Security & Admission Disclosure
+## 🔒 Security & Core Internals Disclosure
 
 In accordance with Hermes Plugin Admission guidelines:
-- **Shadow-Git Access:** `hermes-time-machine` reads and writes shadow commits to Hermes's internal checkpoint repository (`~/.hermes/checkpoints/store/refs/hermes/<hash16>`) via native git plumbing to provide zero-overhead snapshots without cluttering user Git history.
-- **State Database Access:** Reads session records from `~/.hermes/state.db` solely to synchronize session branch points and conversation watermarks during rewind.
+- **Zero Private Core Python Imports (Rule 9 Compliant):** The plugin imports zero internal modules (no `tools.checkpoint_manager` or private symbols).
+- **Native Shadow-Git & State Bridge with Standalone Fallback:** When present, `hermes-time-machine` bridges Hermes's internal checkpoint repository (`~/.hermes/checkpoints/store/refs/hermes/<hash16>`) via native git plumbing and reads `~/.hermes/state.db` solely to sync session branch points and conversation watermarks during rewind. In standalone or clean environments, it automatically falls back to workspace git.
 - **Strict Sandbox Bounds:** All file operations validate that paths resolve strictly within `Path(workspace_dir).resolve()`.
-- **No Network Calls in Plugin Code:** The plugin makes no network calls in its code; all operations are local and offline.
+- **No Network Calls in Plugin Code:** The plugin makes no network calls in its code (`requires_env: []`); all operations are local and offline.
 
 ---
 
@@ -151,7 +151,7 @@ Plugin Doctor: C:\Users\prasad.dammai\Hermes-time-machine
 ```
 
 ### Unit & Integration Test Suite (`pytest` & `unittest`)
-All 26 tests pass 100% cleanly under both standard library `unittest` (zero external dependencies) and `pytest`:
+All 31 tests pass 100% cleanly under both standard library `unittest` (zero external dependencies) and `pytest`:
 ```text
 tests/test_plugin.py::test_api_recover_and_export_endpoints PASSED       [  3%]
 tests/test_plugin.py::test_api_search_endpoint PASSED                    [  7%]
@@ -180,7 +180,13 @@ tests/test_plugin.py::test_time_machine_recover_tool_handler PASSED      [ 92%]
 tests/test_plugin.py::test_time_machine_search_tool_handler PASSED       [ 96%]
 tests/test_plugin.py::test_tool_handlers_and_confirmation PASSED         [100%]
 
-======================== 26 passed in 73.24s (0:01:13) ========================
+tests/test_plugin.py::test_hook_sequence_recover_preserves_good_files_and_restores_broken PASSED
+tests/test_plugin.py::test_security_invalid_commit_aborts_without_deleting_files PASSED
+tests/test_plugin.py::test_command_error_detection_exit_code_authoritative PASSED
+tests/test_plugin.py::test_fastapi_restore_endpoint_pydantic_list_model PASSED
+tests/test_plugin.py::test_validate_verify_command_tightened_allowlist_rejects_exploits PASSED
+
+======================== 31 passed in 54.13s ========================
 ```
 
 ---

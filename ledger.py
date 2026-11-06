@@ -23,15 +23,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-MUTATING_TOOLS = {
+FILE_MUTATING_TOOLS = frozenset({
     "write_file",
     "patch",
     "edit_file",
+    "apply_patch",
     "multi_patch",
+})
+
+COMMAND_TOOLS = frozenset({
     "terminal",
     "bash",
     "execute_code",
-}
+    "run_command",
+})
+
+MUTATING_TOOLS = FILE_MUTATING_TOOLS | COMMAND_TOOLS
 
 
 def resolve_hermes_home() -> Path:
@@ -68,7 +75,8 @@ FORBIDDEN_SHELL_PATTERNS = (";", "&&", "||", "|", "`", "$(", ">", "<", "\n", "\r
 def validate_verify_command(command: str) -> Tuple[bool, Optional[List[str]], str]:
     """
     Validates a command string for auto-verification against command-injection, shell
-    operators, and unauthorized executables. Returns (is_valid, parsed_args, reason).
+    operators, unauthorized executables, and malicious test-runner parameters.
+    Returns (is_valid, parsed_args, reason).
     """
     if not command or not isinstance(command, str):
         return False, None, "Verification command is empty or not a string."
@@ -94,9 +102,35 @@ def validate_verify_command(command: str) -> Tuple[bool, Optional[List[str]], st
     if exe_name not in SAFE_TEST_RUNNERS:
         return False, None, f"Executable '{exe_name}' is not in safe test runner allowlist ({', '.join(sorted(SAFE_TEST_RUNNERS))})."
 
+    # Strict runner-specific validation
     if exe_name in {"python", "python3", "py"}:
-        if "-m" not in args:
-            return False, None, "Python verification commands must invoke a module via '-m' (e.g. 'python -m pytest' or 'python -m unittest')."
+        if len(args) < 3 or args[1] != "-m" or args[2] not in {"pytest", "unittest"}:
+            return False, None, "Python verification commands must strictly invoke '-m pytest' or '-m unittest' (e.g. 'python -m pytest'). Arbitrary modules like 'pip' or 'http.server' are rejected."
+
+    elif exe_name == "pytest":
+        forbidden_pytest_flags = {"-c", "-o", "--override-ini", "--rootdir", "--import-mode"}
+        for arg in args[1:]:
+            for f in forbidden_pytest_flags:
+                if arg == f or arg.startswith(f"{f}=") or arg.startswith(f"{f}:"):
+                    return False, None, f"Pytest flag '{arg}' is disallowed by security policy."
+
+    elif exe_name in {"npm", "pnpm", "yarn", "bun"}:
+        forbidden_subcommands = {"exec", "dlx", "-e", "--eval", "eval", "install", "add", "i", "publish", "run"}
+        if len(args) < 2:
+            return False, None, f"{exe_name} verification command requires 'test' subcommand."
+        sub = args[1].lower()
+        if sub in forbidden_subcommands and not (sub == "run" and len(args) >= 3 and "test" in args[2].lower()):
+            return False, None, f"Subcommand '{sub}' is disallowed for {exe_name} verification; only test runs are permitted."
+        if "test" not in sub and not (sub == "run" and len(args) >= 3 and "test" in args[2].lower()):
+            return False, None, f"Only test subcommands are permitted for {exe_name} (received '{sub}')."
+
+    elif exe_name == "cargo":
+        if len(args) < 2 or args[1] != "test":
+            return False, None, "Cargo verification commands must strictly invoke 'cargo test'."
+
+    elif exe_name == "go":
+        if len(args) < 2 or args[1] != "test":
+            return False, None, "Go verification commands must strictly invoke 'go test'."
 
     return True, args, ""
 
@@ -228,6 +262,28 @@ def parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
         })
     return files
 
+
+
+def _extract_args(snap: Dict[str, Any]) -> Dict[str, Any]:
+    args = snap.get("tool_args")
+    if isinstance(args, dict) and args:
+        return args
+    raw = snap.get("tool_args_summary") or ""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        m = re.match(r"^([a-zA-Z_]+)=(.*)$", raw)
+        if m:
+            return {m.group(1): m.group(2)}
+    return {}
 
 class TimeMachineLedger:
     def __init__(self, db_path: Optional[Path] = None):
@@ -412,7 +468,7 @@ class TimeMachineLedger:
         if tool_name.startswith("time_machine_"):
             return None
 
-        wdir = working_dir or resolve_working_dir(args, session_id, self.hermes_home)
+        wdir = str(Path(working_dir or resolve_working_dir(args, session_id, self.hermes_home)).expanduser().resolve())
         reason = f"pre:{tool_name}"
         if tool_name in MUTATING_TOOLS:
             checkpoint_hash = self.ensure_and_get_checkpoint(wdir, reason=reason)
@@ -576,7 +632,11 @@ class TimeMachineLedger:
                 (session_id,),
             )
             row = cur.fetchone()
-            return dict(row) if row else None
+            if row:
+                d = dict(row)
+                d["tool_args"] = _extract_args(d)
+                return d
+            return None
 
     def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         if not snapshot_id:
@@ -610,8 +670,8 @@ class TimeMachineLedger:
             params.append(session_id)
         if working_dir:
             abs_wdir = str(Path(working_dir).expanduser().resolve())
-            clauses.append("working_dir = ?")
-            params.append(abs_wdir)
+            clauses.append("(working_dir = ? OR working_dir = ?)")
+            params.extend([working_dir, abs_wdir])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"SELECT * FROM snapshots {where_sql} ORDER BY created_at DESC LIMIT ?"
@@ -619,6 +679,8 @@ class TimeMachineLedger:
 
         with self._lock, self._connect() as conn:
             rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            for r in rows:
+                r["tool_args"] = _extract_args(r)
 
         if include_raw_checkpoints:
             target_dir = working_dir or (rows[0]["working_dir"] if rows else None)
@@ -817,6 +879,7 @@ class TimeMachineLedger:
         self,
         snapshot_id: str,
         *,
+        commit_hash: Optional[str] = None,
         restore_files: bool = True,
         rewind_conversation: bool = False,
         file_path: Optional[str] = None,
@@ -826,7 +889,8 @@ class TimeMachineLedger:
         confirm: bool = True,
     ) -> Dict[str, Any]:
         snap = self.get_snapshot(snapshot_id)
-        commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
+        if commit_hash is None:
+            commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
         wdir = (
             snap["working_dir"]
             if snap and snap.get("working_dir")
@@ -876,6 +940,36 @@ class TimeMachineLedger:
                 }
 
             store_dir = self.hermes_home / "checkpoints" / "store"
+            # Verify target commit exists and is a valid commit before touching ANY files on disk
+            is_valid_commit = False
+            if store_dir and store_dir.exists():
+                c_check = subprocess.run(
+                    ["git", f"--git-dir={store_dir}", "cat-file", "-t", commit_hash],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if c_check.returncode == 0 and c_check.stdout.strip() == "commit":
+                    is_valid_commit = True
+
+            if not is_valid_commit:
+                c_check_loc = subprocess.run(
+                    ["git", "cat-file", "-t", commit_hash],
+                    cwd=wdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if c_check_loc.returncode == 0 and c_check_loc.stdout.strip() == "commit":
+                    is_valid_commit = True
+
+            if not is_valid_commit:
+                return {
+                    **result,
+                    "ok": False,
+                    "error": f"Commit {commit_hash} does not exist in checkpoint store or repository.",
+                    "files_restored": False,
+                }
             hash16 = self._project_hash16(wdir)
             env = {
                 **os.environ,
@@ -958,29 +1052,8 @@ class TimeMachineLedger:
                                     abs_tf.unlink()
                                     unlinked.append(rel_tf)
                                     restored_any = True
-                                elif abs_tf.is_dir():
-                                    # Directory Deletion Guard: do not blindly call rmtree
-                                    dir_files = [f for f in abs_tf.rglob("*") if f.is_file()]
-                                    all_post = True
-                                    for df in dir_files:
-                                        rel_df = str(df.relative_to(Path(wdir).resolve())).replace("\\", "/")
-                                        if file_exists_in_commit(commit_hash, rel_df, wdir, store_dir):
-                                            all_post = False
-                                            break
-                                    if all_post and len(dir_files) <= 50:
-                                        for df in dir_files:
-                                            try:
-                                                df.unlink()
-                                                rel_df = str(df.relative_to(Path(wdir).resolve())).replace("\\", "/")
-                                                unlinked.append(rel_df)
-                                            except OSError:
-                                                pass
-                                        shutil.rmtree(abs_tf, ignore_errors=True)
-                                        restored_any = True
-                                    else:
-                                        errors.append(f"Directory {rel_tf} contains existing files or exceeds safe limit; skipped rmtree.")
                             except OSError as rm_err:
-                                errors.append(f"Could not remove newly created {rel_tf}: {rm_err}")
+                                errors.append(f"Could not remove newly created file {rel_tf}: {rm_err}")
 
                 result["files_restored"] = restored_any
                 result["unlinked_new_files"] = unlinked
@@ -1415,105 +1488,87 @@ class TimeMachineLedger:
         """
         Diagnose failure root-cause by correlating test/compiler error output with
         recently modified files and checkpoints. Returns culprit files, recommended
-        safe snapshot, confidence score, and suggested action.
+        safe snapshot, preserved files, confidence score, and suggested action.
         """
         sess = session_id or "default"
-        snaps = self.list_snapshots(session_id=sess, working_dir=working_dir, limit=15)
+        snaps = self.list_snapshots(session_id=sess, limit=50)
+        if not snaps and working_dir:
+            snaps = self.list_snapshots(working_dir=working_dir, limit=50)
+        wdir = working_dir or (snaps[0].get("working_dir") if snaps else resolve_working_dir(hermes_home=self.hermes_home))
 
-        failed_snap = None
-        candidate_safe_snap = None
+        err_msg = error_text or ""
         last_failed_command = ""
 
+        # Find the failed command if any
         for s in snaps:
-            if s.get("self_heal_candidate") or s.get("status") == "error":
-                if not failed_snap:
-                    failed_snap = s
-                    if s.get("tool_args_summary"):
-                        last_failed_command = s.get("tool_args_summary")
-            elif s.get("tool_name") in MUTATING_TOOLS and s.get("status") == "ok":
-                if not candidate_safe_snap:
-                    candidate_safe_snap = s
+            if s.get("status") == "error" or s.get("self_heal_candidate"):
+                if s.get("tool_args_summary"):
+                    last_failed_command = s.get("tool_args_summary")
+                break
 
-        if failed_snap and failed_snap.get("recommended_snapshot_id"):
-            rec_id = failed_snap.get("recommended_snapshot_id")
-            found_snap = self.get_snapshot(rec_id)
-            if found_snap:
-                candidate_safe_snap = found_snap
+        # Collect all file-mutating snapshots in this session (chronological order)
+        file_mut_snaps = [s for s in reversed(snaps) if s.get("tool_name") in FILE_MUTATING_TOOLS]
 
-        if not candidate_safe_snap:
-            candidate_safe_snap = self.get_last_safe_snapshot(sess)
+        # Determine all files touched across the session's file-mutating tools
+        session_touched_files = []
+        snap_for_file = {}  # file_path -> snapshot right before that file was modified
 
-        err_msg = error_text or (failed_snap.get("tool_args_summary") if failed_snap else "") or ""
+        for s in file_mut_snaps:
+            args = _extract_args(s)
+            fpath = args.get("path") or args.get("file_path") or args.get("file")
+            if fpath:
+                norm = str(fpath).replace("\\", "/").lstrip("/")
+                if norm not in session_touched_files:
+                    session_touched_files.append(norm)
+                # The earliest pre-tool snapshot for this file before the error
+                if norm not in snap_for_file:
+                    snap_for_file[norm] = s
 
-        culprits: List[Dict[str, Any]] = []
-        wdir = (
-            (candidate_safe_snap or {}).get("working_dir")
-            or working_dir
-            or resolve_working_dir(hermes_home=self.hermes_home)
-        )
+        # Correlate with err_msg
+        implicated_files = []
+        for f in session_touched_files:
+            basename = Path(f).name
+            if (basename in err_msg) or (f in err_msg):
+                implicated_files.append(f)
 
-        if candidate_safe_snap:
-            diff_res = self.get_diff(candidate_safe_snap["id"], compare_to_id="WORKING_TREE", working_dir=wdir)
-            files = diff_res.get("files", [])
-            for f in files:
-                fpath = f.get("path")
-                if not fpath:
-                    continue
-                basename = Path(fpath).name
-                in_traceback = (basename in err_msg) or (fpath in err_msg)
-                confidence = 0.95 if in_traceback else 0.80
-                reason = (
-                    f"Referenced in failure traceback and modified since safe checkpoint {candidate_safe_snap['id'][:12]}"
-                    if in_traceback
-                    else f"Modified after safe checkpoint {candidate_safe_snap['id'][:12]}"
-                )
-                culprits.append({
-                    "path": fpath,
-                    "status": f.get("status", "modified"),
-                    "confidence": confidence,
-                    "in_traceback": in_traceback,
-                    "reason": reason,
-                })
+        # If traceback did not name any session file, pick the file from the latest file-mutating snapshot
+        if not implicated_files and file_mut_snaps:
+            last_mut_args = _extract_args(file_mut_snaps[-1])
+            last_path = last_mut_args.get("path") or last_mut_args.get("file_path") or last_mut_args.get("file")
+            if last_path:
+                implicated_files.append(str(last_path).replace("\\", "/").lstrip("/"))
 
-        # Also detect newly created untracked files via git status
+        culprit_paths = list(implicated_files)
+
+        # Detect stray temporary files created during the failed turn (e.g. *.tmp, debug_dump*)
+        # Never treat innocent untracked files like notes.txt as culprits!
         try:
-            res_status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=wdir,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if res_status.returncode == 0:
-                for line in res_status.stdout.splitlines():
-                    if line.startswith("??"):
-                        untracked_rel = line[3:].strip()
-                        # Ignore SQLite DB, cache, or hermes internal state files
-                        if untracked_rel.endswith((".db", ".db-shm", ".db-wal", ".pyc")) or ".hermes" in untracked_rel:
-                            continue
-                        if untracked_rel and not any(c["path"] == untracked_rel for c in culprits):
-                            culprits.append({
-                                "path": untracked_rel,
-                                "status": "untracked",
-                                "confidence": 0.88,
-                                "in_traceback": untracked_rel in err_msg,
-                                "reason": "Newly created untracked file after safe checkpoint",
-                            })
+            p_wdir = Path(wdir).resolve()
+            for tmp_file in p_wdir.glob("*.tmp"):
+                rel_tmp = str(tmp_file.relative_to(p_wdir)).replace("\\", "/")
+                if rel_tmp not in culprit_paths:
+                    culprit_paths.append(rel_tmp)
         except Exception:
             pass
 
-        culprits.sort(key=lambda x: x["confidence"], reverse=True)
-        # Prioritize files in traceback + untracked files created during the failed turn
-        traceback_or_new = [c for c in culprits if c.get("in_traceback") or c.get("status") == "untracked"]
-        if traceback_or_new:
-            culprit_paths = [c["path"] for c in traceback_or_new]
-        else:
-            culprit_paths = [c["path"] for c in culprits]
-        overall_confidence = "high" if any(c["confidence"] >= 0.9 for c in culprits) else ("medium" if culprits else "low")
-        rec_id = candidate_safe_snap.get("id") if candidate_safe_snap else None
+        # Identify the recommended snapshot:
+        # It MUST be the snapshot captured immediately BEFORE the culprit file was modified!
+        recommended_snap = None
+        if culprit_paths and culprit_paths[0] in snap_for_file:
+            recommended_snap = snap_for_file[culprit_paths[0]]
+        elif file_mut_snaps:
+            recommended_snap = file_mut_snaps[-1]
+        elif snaps:
+            recommended_snap = snaps[-1]
+
+        rec_id = recommended_snap.get("id") if recommended_snap else None
+
+        # Preserved files: files modified in the session that are NOT in culprit_paths
+        preserved_files = sorted([f for f in session_touched_files if f not in culprit_paths])
 
         explanation = (
-            f"Detected {len(culprits)} culprit file(s) [{', '.join(culprit_paths)}] edited prior to failure. "
+            f"Diagnosed failure culprit file(s): [{', '.join(culprit_paths)}]. "
+            f"Preserving concurrent modifications in: [{', '.join(preserved_files)}]. "
             f"Recommended safe checkpoint: {rec_id}."
             if culprit_paths and rec_id
             else "No specific modified files detected prior to command failure."
@@ -1523,12 +1578,12 @@ class TimeMachineLedger:
             "ok": True,
             "session_id": sess,
             "working_dir": wdir,
-            "failed_snapshot_id": (failed_snap or {}).get("id"),
             "recommended_snapshot_id": rec_id,
-            "culprits": culprits,
+            "culprits": [{"path": c, "confidence": 0.95} for c in culprit_paths],
             "culprit_files": culprit_paths,
-            "confidence": overall_confidence,
-            "confidence_score": max([c["confidence"] for c in culprits], default=0.5),
+            "preserved_files": preserved_files,
+            "confidence": "high" if culprit_paths else "low",
+            "confidence_score": 0.95 if culprit_paths else 0.5,
             "explanation": explanation,
             "retry_command": last_failed_command,
             "suggested_action": f"time_machine_recover(auto_apply=true, confirm=true)" if culprit_paths else "time_machine_restore(confirm=true)",

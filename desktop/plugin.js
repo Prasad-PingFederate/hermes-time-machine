@@ -1064,6 +1064,16 @@ function mountStatusBarItem(container, ctx) {
   let disposed = false;
   let interval = null;
 
+  if (container) {
+    container.innerHTML = `
+      <div style="display:flex;align-items:center;height:100%;padding:0 8px;">
+        <span style="background:#21262d;color:#8b949e;border:1px solid #30363d;padding:2px 8px;border-radius:12px;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+          🛡️ Safe Mode
+        </span>
+      </div>
+    `;
+  }
+
   async function update() {
     if (disposed || !container) return;
     try {
@@ -1086,32 +1096,7 @@ function mountStatusBarItem(container, ctx) {
         label = `✅ Recovered • Workspace Clean`;
       }
 
-  
-    const scrubberNodes = state.snapshots.map((s, idx) => {
-      const active = s.id === state.selectedId ? 'active' : '';
-      const col = getBadgeColor(s);
-      const shortId = (s.checkpoint_hash || '').slice(0, 7) || s.id.slice(-6);
-      const isLast = idx === state.snapshots.length - 1;
-      return `
-        <div class="tm-scrub-node ${active}" data-snap-id="${escapeHtml(s.id)}" style="background:${col};border-color:${col};" title="${escapeHtml(s.tool_name)}">
-          <div class="tm-scrub-tooltip">
-            <strong>${escapeHtml(s.tool_name)}</strong> (${escapeHtml(shortId)})<br/>
-            ${escapeHtml(formatTime(s.created_at))}<br/>
-            +${s.insertions || 0} / -${s.deletions || 0}
-          </div>
-        </div>
-        ${!isLast ? '<div class="tm-scrub-line"></div>' : ''}
-      `;
-    }).join('');
-
-    const scrubberHtml = state.snapshots.length > 0
-      ? `<div class="tm-scrubber-container">
-           <span style="font-size:11px;color:#8b949e;flex-shrink:0;">Timeline:</span>
-           <div class="tm-scrubber-track">${scrubberNodes}</div>
-         </div>`
-      : '';
-
-    container.innerHTML = `
+      container.innerHTML = `
         <div style="display:flex;align-items:center;height:100%;padding:0 8px;">
           <span style="${badgeStyle}" title="${isSelfHeal ? 'Command failed after code edit - self-healing checkpoint available!' : 'Time Machine active: automatic shadow-git checkpoints enabled.'}">
             ${escapeHtml(label)}
@@ -1129,7 +1114,11 @@ function mountStatusBarItem(container, ctx) {
           }
         };
       }
-    } catch (_) {}
+    } catch (err) {
+      if (typeof console !== 'undefined' && console.debug) {
+        console.debug('Time Machine statusBar update:', err.message);
+      }
+    }
   }
 
   update();

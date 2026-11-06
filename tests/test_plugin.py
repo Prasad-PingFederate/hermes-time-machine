@@ -786,5 +786,267 @@ new file mode 100644
         self.assertTrue(stray_file.exists())
 
 
+    def test_hook_sequence_recover_preserves_good_files_and_restores_broken(self):
+        """
+        Bug 1 & Bug 3 Regression Test:
+        Simulate real hook sequence on_session_start -> pre_tool_call -> post_tool_call.
+        Proves:
+        1. Modifying tax.py (good) then billing.py (bad) then running terminal (test fails)
+           identifies billing.py as culprit and preserves tax.py!
+        2. Innocent untracked notes.txt is NEVER deleted!
+        3. Stray debug_dump.tmp created during broken turn IS unlinked!
+        4. billing.py is restored and tests pass!
+        """
+        import __init__ as tm_plugin
+        wdir = self.git_repo["dir"]
+        c1 = self.git_repo["c1"]
+
+        # Setup files in working dir
+        billing_py = wdir / "billing.py"
+        tax_py = wdir / "tax.py"
+        test_py = wdir / "test_billing.py"
+        notes_txt = wdir / "notes.txt"
+        dump_tmp = wdir / "debug_dump.tmp"
+
+        billing_py.write_text("def calculate_total(subtotal, tax): return subtotal * (1 + tax)\n", encoding="utf-8")
+        tax_py.write_text("def get_tax_rate(): return 0.08\n", encoding="utf-8")
+        test_py.write_text(
+            "import unittest\n"
+            "from billing import calculate_total\n"
+            "from tax import get_tax_rate\n"
+            "class TestB(unittest.TestCase):\n"
+            "    def test_ok(self): self.assertEqual(calculate_total(100, get_tax_rate()), 108)\n"
+            "if __name__ == '__main__': unittest.main()\n",
+            encoding="utf-8",
+        )
+        notes_txt.write_text("My important project notes that must never be deleted!\n", encoding="utf-8")
+
+        # Initial commit in repo
+        subprocess.run(["git", "add", "billing.py", "tax.py", "test_billing.py"], cwd=str(wdir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial baseline"], cwd=str(wdir), check=True, capture_output=True)
+
+        class MockCtx:
+            def register_tool(self, *a, **k): pass
+            def register_hook(self, *a, **k): pass
+            def register_slash_command(self, *a, **k): pass
+
+        mock_ctx = MockCtx()
+        registered_hooks = {}
+
+        def reg_hook_mock(event, fn):
+            registered_hooks[event] = fn
+
+        mock_ctx.register_hook = reg_hook_mock
+        tm_plugin.register(mock_ctx, ledger=self.ledger)
+
+        sess = "s_hook_real_order"
+        registered_hooks["on_session_start"](session_id=sess, working_dir=str(wdir))
+
+        # Turn 1: Good feature edit to tax.py
+        registered_hooks["pre_tool_call"](
+            tool_name="edit_file",
+            args={"path": "tax.py"},
+            session_id=sess,
+            turn_id="t1",
+        )
+        tax_py.write_text("def get_tax_rate(): return 0.08\ndef get_tax_name(): return 'VAT'\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tax.py"], cwd=str(wdir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "good tax edit"], cwd=str(wdir), check=True, capture_output=True)
+        registered_hooks["post_tool_call"](
+            tool_name="edit_file",
+            args={"path": "tax.py"},
+            session_id=sess,
+            turn_id="t1",
+            status="ok",
+        )
+
+        # Turn 2: Bad edit to billing.py + stray temp file created
+        registered_hooks["pre_tool_call"](
+            tool_name="edit_file",
+            args={"path": "billing.py"},
+            session_id=sess,
+            turn_id="t2",
+        )
+        billing_py.write_text("def calculate_total(subtotal, tax):\n    raise RuntimeError('boom')\n", encoding="utf-8")
+        dump_tmp.write_text("DEBUG DUMP CRASH LOG\n", encoding="utf-8")
+        subprocess.run(["git", "add", "billing.py"], cwd=str(wdir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "broken billing edit"], cwd=str(wdir), check=True, capture_output=True)
+        registered_hooks["post_tool_call"](
+            tool_name="edit_file",
+            args={"path": "billing.py"},
+            session_id=sess,
+            turn_id="t2",
+            status="ok",
+        )
+
+        # Turn 3: Run test command via terminal -> fails
+        registered_hooks["pre_tool_call"](
+            tool_name="terminal",
+            args={"command": f'"{sys.executable}" -m unittest test_billing.py'},
+            session_id=sess,
+            turn_id="t3",
+        )
+        t_res = subprocess.run([sys.executable, "-m", "unittest", "test_billing.py"], cwd=str(wdir), capture_output=True, text=True)
+        self.assertNotEqual(t_res.returncode, 0)
+        self.assertIn("billing.py", t_res.stderr)
+        self.assertIn("RuntimeError: boom", t_res.stderr)
+
+        registered_hooks["post_tool_call"](
+            tool_name="terminal",
+            args={"command": f'"{sys.executable}" -m unittest test_billing.py'},
+            result={"exit_code": t_res.returncode, "stdout": t_res.stdout, "stderr": t_res.stderr},
+            session_id=sess,
+            turn_id="t3",
+            status="error",
+        )
+
+        # Check transform_tool_result hint
+        hint = registered_hooks["transform_tool_result"](
+            tool_name="terminal",
+            result=t_res.stderr,
+            session_id=sess,
+        )
+        self.assertIn("billing.py", hint)
+        self.assertIn("tax.py", hint)
+
+        # Diagnosis check
+        diag = self.ledger.diagnose_failure(session_id=sess, error_text=t_res.stderr, working_dir=str(wdir))
+        self.assertIn("billing.py", diag["culprit_files"])
+        self.assertIn("tax.py", diag["preserved_files"])
+        self.assertNotIn("notes.txt", diag["culprit_files"])
+
+        # Execute recovery
+        rec_res = self.ledger.recover(
+            session_id=sess,
+            error_summary=t_res.stderr,
+            auto_apply=True,
+            confirm=True,
+            working_dir=str(wdir),
+            verify_command=f'"{sys.executable}" -m unittest test_billing.py',
+            auto_verify=True,
+        )
+        self.assertTrue(rec_res["ok"])
+        self.assertTrue(rec_res["auto_applied"])
+        self.assertIn("tax.py", rec_res.get("preserved_files", []))
+
+        # Assert disk states
+        # 1. billing.py no longer has RuntimeError('boom')
+        self.assertNotIn("RuntimeError('boom')", billing_py.read_text(encoding="utf-8"))
+        # 2. tax.py STILL has get_tax_name (good edit preserved!)
+        self.assertIn("get_tax_name", tax_py.read_text(encoding="utf-8"))
+        # 3. notes.txt was NOT deleted!
+        self.assertTrue(notes_txt.exists())
+        self.assertEqual(notes_txt.read_text(encoding="utf-8"), "My important project notes that must never be deleted!\n")
+        # 4. Stray debug_dump.tmp was unlinked!
+        self.assertFalse(dump_tmp.exists())
+        # 5. Verification passed
+        self.assertTrue(rec_res["verification"]["passed"])
+
+    def test_security_invalid_commit_aborts_without_deleting_files(self):
+        """Bug 2: Invalid commit hash aborts with error and does NOT delete any workspace files."""
+        wdir = self.git_repo["dir"]
+        f1 = self.git_repo["f1"]
+        original_content = f1.read_text(encoding="utf-8")
+
+        res = self.ledger.restore_snapshot(
+            snapshot_id="nonexistent_snap",
+            file_paths=["file_a.py"],
+            working_dir=str(wdir),
+            commit_hash="deadbeef1234567890abcdef1234567890abcdef",
+            confirm=True,
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("does not exist", res["error"])
+        # File must NOT have been deleted
+        self.assertTrue(f1.exists())
+        self.assertEqual(f1.read_text(encoding="utf-8"), original_content)
+
+    def test_command_error_detection_exit_code_authoritative(self):
+        """Bug 4: Commands with exit_code == 0 are ok even if stdout contains 'Error:' or 'exit code'."""
+        import __init__ as tm_plugin
+        class MockCtx:
+            def register_hook(self, *a, **k): pass
+            def register_tool(self, *a, **k): pass
+            def register_slash_command(self, *a, **k): pass
+
+        mock_ctx = MockCtx()
+        hooks = {}
+        mock_ctx.register_hook = lambda event, fn: hooks.update({event: fn})
+        tm_plugin.register(mock_ctx, ledger=self.ledger)
+
+        sess = "s_exit_code_auth"
+        hooks["on_session_start"](session_id=sess)
+
+        # Successful command that printed error handling logs
+        res_dict = {
+            "exit_code": 0,
+            "stdout": "Testing error handling: Error: handled successfully, exit code 0 verified.",
+        }
+        hooks["pre_tool_call"](
+            tool_name="terminal",
+            args={"command": "echo test"},
+            session_id=sess,
+            turn_id="t_success",
+        )
+        hooks["post_tool_call"](
+            tool_name="terminal",
+            result=res_dict,
+            session_id=sess,
+            turn_id="t_success",
+            status="ok",
+        )
+
+        snaps = self.ledger.list_snapshots(session_id=sess)
+        self.assertTrue(len(snaps) > 0)
+        latest = snaps[0]
+        self.assertEqual(latest.get("status"), "ok")
+        self.assertFalse(bool(latest.get("self_heal_candidate")))
+
+    def test_fastapi_restore_endpoint_pydantic_list_model(self):
+        """Bug 6: POST /snapshots/{id}/restore parses List[str] in Pydantic without NameError."""
+        try:
+            from fastapi.testclient import TestClient
+            from dashboard.plugin_api import router
+            from fastapi import FastAPI
+            app = FastAPI()
+            app.include_router(router)
+            client = TestClient(app)
+
+            snap = self.ledger.record_pre_tool(
+                session_id="s_api_model",
+                tool_name="edit_file",
+                args={"path": "billing.py"},
+                working_dir=str(self.git_repo["dir"]),
+            )
+            with self.ledger._connect() as conn:
+                conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (self.git_repo["c1"], snap["id"]))
+
+            response = client.post(
+                f"/snapshots/{snap['id']}/restore",
+                json={"restore_files": True, "file_paths": ["billing.py"], "confirm": False},
+            )
+            # Response should succeed or preview, not raise NameError 500
+            self.assertIn(response.status_code, (200, 400))
+            data = response.json()
+            self.assertTrue(isinstance(data, dict))
+        except ImportError:
+            self.skipTest("fastapi/testclient not installed in current environment")
+
+    def test_validate_verify_command_tightened_allowlist_rejects_exploits(self):
+        """Bug 7: Verify all 6 exploit strings from adversarial audit are strictly rejected."""
+        from ledger import validate_verify_command
+        exploits = [
+            "python -m pip install requests",
+            "python3 -m http.server 8080",
+            "npm exec -- yes",
+            "yarn exec rm",
+            "bun -e 'console.log(1)'",
+            "pytest -c /etc/passwd",
+        ]
+        for exp in exploits:
+            valid, args, reason = validate_verify_command(exp)
+            self.assertFalse(valid, f"Security vulnerability: {exp!r} was NOT blocked! Reason: {reason}")
+
+
 if __name__ == "__main__":
     unittest.main()

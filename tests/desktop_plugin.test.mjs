@@ -65,3 +65,43 @@ test('desktop/plugin.js exports metadata and activates with ctx', async () => {
 
   if (typeof unmount === 'function') unmount();
 });
+
+test('statusBar chip renders visible badge and self-heal notice without 0-byte failure', async () => {
+  const registered = [];
+  const stubCtx = {
+    register: (item) => registered.push(item),
+    rest: async () => ({
+      snapshot_count: 5,
+      self_heal_available: true,
+      latest_snapshot: { id: 'snap-1', tool_name: 'terminal' },
+    }),
+  };
+
+  plugin.activate(stubCtx);
+  const statusItem = registered.find((r) => r.id === 'time-machine-status');
+  assert.ok(statusItem && typeof statusItem.mount === 'function');
+
+  const container = {
+    _html: '',
+    get innerHTML() {
+      return this._html;
+    },
+    set innerHTML(val) {
+      this._html = val;
+    },
+    querySelector: () => ({ onclick: null }),
+    querySelectorAll: () => [],
+  };
+
+  const unmount = statusItem.mount(container);
+  assert.ok(container.innerHTML.length > 0, 'Status bar chip was 0 bytes initially');
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(container.innerHTML.length > 0, 'Status bar chip was 0 bytes after update');
+  assert.ok(
+    container.innerHTML.includes('Self-Heal Available'),
+    'Self-heal badge text missing from status bar'
+  );
+
+  if (typeof unmount === 'function') unmount();
+});

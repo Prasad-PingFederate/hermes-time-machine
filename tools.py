@@ -81,7 +81,7 @@ RESTORE_SCHEMA: Dict[str, Any] = {
     "name": "time_machine_restore",
     "description": (
         "Restore the working directory files to a Time Machine snapshot using Hermes's "
-        "CheckpointManager (automatically taking a safety backup checkpoint first), and "
+        "TimeMachineLedger via standard git plumbing (automatically taking a safety backup checkpoint first), and "
         "optionally rewind the conversation history in state.db to that turn."
     ),
     "parameters": {
