@@ -278,7 +278,7 @@ def test_self_healing_transform_hint(temp_dir):
         result=fail_output,
         session_id="s_hint",
     )
-    assert "[🛡️ Time Machine Self-Heal Notice]" in transformed
+    assert "[🛡️ Time Machine Self-Heal Notice" in transformed
     assert "time_machine_restore" in transformed
 
 
@@ -444,3 +444,148 @@ def test_slash_command_rewind_demo(test_ledger):
     tm_plugin.register(stub, ledger=test_ledger)
     out_demo = stub.command_handler("demo")
     assert "🎉 Time Machine E2E Live Demo Passed 100%!" in out_demo
+
+
+# ─── 12. Autonomous Self-Healing Recovery & Diagnosis ────────────────────────
+
+def test_diagnose_failure_and_culprit_detection(git_repo, test_ledger):
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+    f1 = git_repo["f1"]
+
+    # Baseline safe snapshot
+    snap_safe = test_ledger.record_pre_tool(
+        session_id="s_diag",
+        tool_name="write_file",
+        args={"path": "file_a.py"},
+        working_dir=str(wdir),
+    )
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap_safe["id"]))
+    test_ledger.record_post_tool(session_id="s_diag", tool_name="write_file", status="ok")
+
+    # Agent edits file_a.py breaking something
+    f1.write_text("broken syntax error", encoding="utf-8")
+
+    # Command fails with traceback mentioning file_a.py
+    test_ledger.record_pre_tool(
+        session_id="s_diag",
+        tool_name="terminal",
+        args={"command": "pytest"},
+        working_dir=str(wdir),
+    )
+    traceback_err = "File 'file_a.py', line 1, in <module>\nSyntaxError: invalid syntax"
+    test_ledger.record_post_tool(
+        session_id="s_diag",
+        tool_name="terminal",
+        status="error",
+        self_heal_candidate=True,
+        recommended_snapshot_id=snap_safe["id"],
+    )
+
+    diag = test_ledger.diagnose_failure(session_id="s_diag", error_text=traceback_err, working_dir=str(wdir))
+    assert diag["ok"] is True
+    assert "file_a.py" in diag["culprit_files"]
+    assert diag["confidence"] == "high"
+    assert diag["recommended_snapshot_id"] == snap_safe["id"]
+
+
+def test_time_machine_recover_auto_apply(git_repo, test_ledger):
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+    f1 = git_repo["f1"]
+    f2 = git_repo["f2"]
+
+    # Safe snapshot at c1
+    snap = test_ledger.record_pre_tool(session_id="s_rec", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
+    test_ledger.record_post_tool(session_id="s_rec", tool_name="edit_file", status="ok")
+
+    # Broken edit to file_a.py and good edit to file_b.py
+    f1.write_text("BROKEN", encoding="utf-8")
+    f2.write_text("GOOD PRESERVED", encoding="utf-8")
+
+    # Command fails
+    test_ledger.record_pre_tool(session_id="s_rec", tool_name="terminal", args={"command": "pytest"}, working_dir=str(wdir))
+    test_ledger.record_post_tool(
+        session_id="s_rec",
+        tool_name="terminal",
+        status="error",
+        self_heal_candidate=True,
+        recommended_snapshot_id=snap["id"],
+    )
+
+    # 1. auto_apply=False returns plan only
+    plan = test_ledger.recover(session_id="s_rec", error_summary="file_a.py failed", auto_apply=False)
+    assert plan["ok"] is True
+    assert plan["auto_applied"] is False
+
+    # 2. auto_apply=True without confirm is rejected
+    res_no_conf = test_ledger.recover(session_id="s_rec", error_summary="file_a.py failed", auto_apply=True, confirm=False)
+    assert res_no_conf["ok"] is False
+
+    # 3. auto_apply=True with confirm=True executes surgical recovery
+    res_rec = test_ledger.recover(session_id="s_rec", error_summary="file_a.py failed", auto_apply=True, confirm=True, working_dir=str(wdir))
+    assert res_rec["ok"] is True
+    assert res_rec["auto_applied"] is True
+    assert "file_a.py" in res_rec["restored_files"]
+    assert res_rec["pre_restore_backup_id"] is not None
+
+    # file_a.py reverted, file_b.py preserved
+    assert f1.read_text(encoding="utf-8") == "print('version 1 A')"
+    assert f2.read_text(encoding="utf-8") == "GOOD PRESERVED"
+
+
+def test_time_machine_recover_tool_handler(git_repo, test_ledger):
+    from tools import handle_recover
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+
+    snap = test_ledger.record_pre_tool(session_id="s_tool_rec", tool_name="write_file", args={}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
+
+    res_json = handle_recover(
+        {"session_id": "s_tool_rec", "error_summary": "file_a.py error", "auto_apply": False},
+        ledger=test_ledger,
+    )
+    res = json.loads(res_json)
+    assert res["ok"] is True
+    assert "diagnosis" in res
+
+
+def test_api_recover_and_export_endpoints(test_ledger, temp_dir):
+    test_ledger.record_pre_tool(session_id="s_api", tool_name="patch", args={}, working_dir=str(temp_dir))
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    # Test export timeline markdown
+    res_exp = client.get("/snapshots/export?session_id=s_api")
+    assert res_exp.status_code == 200
+    assert "Time Machine Timeline Report" in res_exp.json()["markdown"]
+
+    # Test recover endpoint
+    res_rec = client.post("/snapshots/recover", json={"session_id": "s_api", "auto_apply": False})
+    assert res_rec.status_code == 200
+    assert res_rec.json()["ok"] is True
+
+
+def test_slash_command_recover_and_export(test_ledger, temp_dir):
+    test_ledger.record_pre_tool(session_id="s_slash", tool_name="write_file", args={"path": "a.py"}, working_dir=str(temp_dir))
+
+    class CtxStub:
+        def __init__(self):
+            self.command_handler = None
+        def register_hook(self, *a, **kw): pass
+        def register_tool(self, *a, **kw): pass
+        def register_command(self, name, handler, **kw): self.command_handler = handler
+        def register_system_prompt_section(self, *a, **kw): pass
+
+    stub = CtxStub()
+    tm_plugin.register(stub, ledger=test_ledger)
+
+    out_export = stub.command_handler("export", session_id="s_slash")
+    assert "Hermes Time Machine Timeline Report" in out_export

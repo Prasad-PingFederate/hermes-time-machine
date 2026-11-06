@@ -1,6 +1,6 @@
 name: hermes-time-machine
 version: "0.3.0"
-description: "Unified Time Machine for Hermes Agent: pairs shadow-git filesystem checkpoints with state.db conversation turns for atomic rewind, diff, and session branching."
+description: "Unified Time Machine for Hermes Agent: pairs shadow-git filesystem checkpoints with state.db conversation turns for atomic rewind, diff, session branching, and autonomous self-healing recovery."
 author: "Prasad-PingFederate"
 manifest_version: 2
 api_version: 1
@@ -12,6 +12,7 @@ provides_tools:
   - time_machine_diff
   - time_machine_restore
   - time_machine_branch
+  - time_machine_recover
 
 provides_hooks:
   - on_session_start
@@ -22,6 +23,10 @@ provides_hooks:
 python_dependencies: []
 
 config_schema:
+  safe_mode:
+    type: bool
+    default: true
+    description: "Aggressive checkpointing and proactive self-healing recovery recommendations"
   auto_enable_checkpoints:
     type: bool
     default: true

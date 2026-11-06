@@ -63,4 +63,40 @@ BRANCH_SCHEMA = {
     },
 }
 
-ALL_SCHEMAS = [LIST_SCHEMA, DIFF_SCHEMA, RESTORE_SCHEMA, BRANCH_SCHEMA]
+RECOVER_SCHEMA = {
+    "name": "time_machine_recover",
+    "description": (
+        "Autonomous self-healing diagnostic and recovery tool. Analyzes recent failed tool results "
+        "or test tracebacks, identifies culprit files edited before the failure, and optionally "
+        "surgically restores them in one step."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "error_summary": {
+                "type": "string",
+                "description": "Optional error message, traceback, or test failure output to diagnose. If omitted, uses the last recorded command failure in the session.",
+            },
+            "auto_apply": {
+                "type": "boolean",
+                "description": "If true, immediately applies surgical restoration of identified culprit files to the pre-error state.",
+                "default": False,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Confirmation guard required when auto_apply is true (default true).",
+                "default": True,
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional session ID filter. Defaults to active session.",
+            },
+            "working_dir": {
+                "type": "string",
+                "description": "Optional working directory override.",
+            },
+        },
+    },
+}
+
+ALL_SCHEMAS = [LIST_SCHEMA, DIFF_SCHEMA, RESTORE_SCHEMA, BRANCH_SCHEMA, RECOVER_SCHEMA]

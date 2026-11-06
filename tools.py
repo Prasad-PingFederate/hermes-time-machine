@@ -159,6 +159,43 @@ BRANCH_SCHEMA: Dict[str, Any] = {
 }
 
 
+RECOVER_SCHEMA: Dict[str, Any] = {
+    "name": "time_machine_recover",
+    "description": (
+        "Autonomous self-healing diagnostic and recovery tool. Analyzes recent failed tool results "
+        "or test tracebacks, identifies culprit files edited before the failure, and optionally "
+        "surgically restores them in one step."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "error_summary": {
+                "type": "string",
+                "description": "Optional error message, traceback, or test failure output to diagnose. If omitted, uses the last recorded command failure in the session.",
+            },
+            "auto_apply": {
+                "type": "boolean",
+                "description": "If true, immediately applies surgical restoration of identified culprit files to the pre-error state.",
+                "default": False,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Confirmation guard required when auto_apply is true (default true).",
+                "default": True,
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional session ID filter. Defaults to active session.",
+            },
+            "working_dir": {
+                "type": "string",
+                "description": "Optional working directory override.",
+            },
+        },
+    },
+}
+
+
 def handle_list_snapshots(
     args: Dict[str, Any],
     *,
@@ -264,6 +301,30 @@ def handle_branch(
     return json.dumps(res, indent=2, default=str)
 
 
+
+def handle_recover(
+    args: Dict[str, Any],
+    *,
+    ledger: Optional[TimeMachineLedger] = None,
+    **kwargs: Any,
+) -> str:
+    ledger = ledger or TimeMachineLedger()
+    session_id = args.get("session_id") or kwargs.get("session_id")
+    error_summary = args.get("error_summary")
+    auto_apply = bool(args.get("auto_apply", False))
+    confirm = bool(args.get("confirm", True))
+    working_dir = args.get("working_dir")
+
+    res = ledger.recover(
+        session_id=session_id,
+        error_summary=error_summary,
+        auto_apply=auto_apply,
+        confirm=confirm,
+        working_dir=working_dir,
+    )
+    return json.dumps(res, indent=2, default=str)
+
+
 def register_time_machine_tools(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     """Register all 4 Time Machine tools with Hermes PluginContext."""
     ledger = ledger or TimeMachineLedger()
@@ -288,6 +349,11 @@ def register_time_machine_tools(ctx, ledger: Optional[TimeMachineLedger] = None)
             "time_machine_branch",
             BRANCH_SCHEMA,
             partial(handle_branch, ledger=ledger),
+        ),
+        (
+            "time_machine_recover",
+            RECOVER_SCHEMA,
+            partial(handle_recover, ledger=ledger),
         ),
     ]
 

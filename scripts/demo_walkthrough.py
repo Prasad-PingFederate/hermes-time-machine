@@ -252,14 +252,17 @@ def run_demo(
         log(f"  {YELLOW}⚠{RESET} Pytest failed as expected! Time Machine recommended rollback to {snap2['id']}")
 
         # ==========================================
-        # STEP 5: Surgical Revert & Cleanup
+        # STEP 5: Autonomous Recovery (time_machine_recover)
         # ==========================================
-        log(f"\n{BOLD}[Step 5/6] Performing Surgical Restore (billing.py + debug_dump.tmp)...{RESET}")
-        restore_res = demo_ledger.restore_snapshot(
-            snapshot_id=snap2["id"],
-            file_paths=["billing.py", "debug_dump.tmp"],
+        log(f"\n{BOLD}[Step 5/6] Executing Autonomous Recovery (time_machine_recover)...{RESET}")
+        recover_res = demo_ledger.recover(
+            session_id="demo_session",
+            error_summary="Critical Failure: Invalid Tax Calculation in billing.py",
+            auto_apply=True,
+            confirm=True,
             working_dir=wdir,
         )
+        restore_res = recover_res
 
         billing_content = billing_py.read_text(encoding="utf-8")
         tax_content = tax_py.read_text(encoding="utf-8")

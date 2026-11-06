@@ -217,6 +217,77 @@ const STYLES = `
     margin-bottom: 10px;
     font-size: 11.5px;
   }
+  
+  .tm-scrubber-container {
+    padding: 8px 14px;
+    background: #0d1117;
+    border-bottom: 1px solid #21262d;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+  }
+  .tm-scrubber-track {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: max-content;
+    padding: 4px 2px;
+  }
+  .tm-scrub-node {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid #30363d;
+    background: #21262d;
+    cursor: pointer;
+    transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+    position: relative;
+    flex-shrink: 0;
+  }
+  .tm-scrub-node:hover {
+    transform: scale(1.4);
+  }
+  .tm-scrub-node.active {
+    border-color: #58a6ff;
+    box-shadow: 0 0 8px rgba(88, 166, 255, 0.7);
+  }
+  .tm-scrub-line {
+    height: 2px;
+    width: 16px;
+    background: #30363d;
+    flex-shrink: 0;
+  }
+  .tm-scrub-tooltip {
+    position: absolute;
+    bottom: 22px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #161b22;
+    border: 1px solid #30363d;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    white-space: nowrap;
+    display: none;
+    z-index: 100;
+    pointer-events: none;
+    color: #c9d1d9;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  .tm-scrub-node:hover .tm-scrub-tooltip {
+    display: block;
+  }
+  .tm-btn-retry {
+    background: rgba(245, 158, 11, 0.2);
+    border: 1px solid #f59e0b;
+    color: #fbbf24;
+    font-weight: 600;
+  }
+  .tm-btn-retry:hover {
+    background: rgba(245, 158, 11, 0.35);
+  }
+
   .tm-filter-bar {
     padding: 6px 14px;
     background: #13181f;
@@ -596,6 +667,55 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     }
   }
 
+
+  async function triggerSnapshotNow() {
+    try {
+      const activeSession = state.sessionFilter || (ctx && ctx.session && ctx.session.id) || 'manual';
+      const res = await apiCall(ctx, '/snapshots', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: activeSession, reason: 'Manual User Checkpoint' }),
+      });
+      setToast(`📸 Snapshot created: ${res.snapshot?.id || 'ok'}`);
+      await loadSnapshots(false);
+    } catch (err) {
+      setToast(`Snapshot error: ${err.message}`);
+    }
+  }
+
+  async function triggerRestoreAndRetry(snapshotId) {
+    if (typeof window !== 'undefined' && !window.confirm(`Restore to ${snapshotId} and retry the failed command?`)) {
+      return;
+    }
+    try {
+      const res = await apiCall(ctx, `/snapshots/${encodeURIComponent(snapshotId)}/retry`, {
+        method: 'POST',
+        body: JSON.stringify({ restore_files: true }),
+      });
+      const cmd = res.retry_command || 'pytest';
+      setToast(`✅ Restored to ${(res.checkpoint_hash || '').slice(0, 8)}! Suggested command: ${cmd}`);
+      await loadSnapshots(false);
+      await selectSnapshot(snapshotId);
+    } catch (err) {
+      setToast(`Restore & retry error: ${err.message}`);
+    }
+  }
+
+  async function triggerExportMarkdown() {
+    try {
+      const activeSession = state.sessionFilter || (ctx && ctx.session && ctx.session.id) || '';
+      const q = activeSession ? `?session_id=${encodeURIComponent(activeSession)}` : '';
+      const res = await apiCall(ctx, `/snapshots/export${q}`);
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(res.markdown || '');
+        setToast('📥 Timeline markdown copied to clipboard!');
+      } else {
+        setToast('📥 Timeline markdown generated successfully.');
+      }
+    } catch (err) {
+      setToast(`Export error: ${err.message}`);
+    }
+  }
+
   async function triggerPrune() {
     if (typeof window !== 'undefined' && !window.confirm('Prune snapshots older than the last 50? (Baselines and safety backups are always preserved)')) {
       return;
@@ -755,6 +875,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
             <button class="tm-btn" id="tm-toggle-view-btn">
               ${state.viewMode === 'split' ? 'View: Split ◫' : 'View: Unified ☰'}
             </button>
+            <button class="tm-btn tm-btn-retry" id="tm-retry-btn" title="Revert to this snapshot and retry command">⚡ Restore & Retry</button>
             <button class="tm-btn tm-btn-warn" id="tm-restore-files-btn">Restore Full Workspace</button>
             <button class="tm-btn tm-btn-warn" id="tm-restore-all-btn">Rewind Files + Chat</button>
             <button class="tm-btn tm-btn-branch" id="tm-branch-btn">Fork Session</button>
@@ -774,6 +895,31 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       `
       : '<div class="tm-empty" style="margin:auto;">Select a snapshot from the timeline to inspect changes.</div>';
 
+
+    const scrubberNodes = state.snapshots.map((s, idx) => {
+      const active = s.id === state.selectedId ? 'active' : '';
+      const col = getBadgeColor(s);
+      const shortId = (s.checkpoint_hash || '').slice(0, 7) || s.id.slice(-6);
+      const isLast = idx === state.snapshots.length - 1;
+      return `
+        <div class="tm-scrub-node ${active}" data-snap-id="${escapeHtml(s.id)}" style="background:${col};border-color:${col};" title="${escapeHtml(s.tool_name)}">
+          <div class="tm-scrub-tooltip">
+            <strong>${escapeHtml(s.tool_name)}</strong> (${escapeHtml(shortId)})<br/>
+            ${escapeHtml(formatTime(s.created_at))}<br/>
+            +${s.insertions || 0} / -${s.deletions || 0}
+          </div>
+        </div>
+        ${!isLast ? '<div class="tm-scrub-line"></div>' : ''}
+      `;
+    }).join('');
+
+    const scrubberHtml = state.snapshots.length > 0
+      ? `<div class="tm-scrubber-container">
+           <span style="font-size:11px;color:#8b949e;flex-shrink:0;">Timeline:</span>
+           <div class="tm-scrubber-track">${scrubberNodes}</div>
+         </div>`
+      : '';
+
     container.innerHTML = `
       <style>${STYLES}</style>
       <div class="tm-root ${isRail ? 'tm-rail-root' : ''}">
@@ -783,11 +929,14 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
             <span class="tm-badge">${state.snapshots.length} snapshots</span>
             ${state.storage ? `<span class="tm-badge tm-badge-blue" title="Total snapshot storage">Storage: ${((state.storage.total_storage_bytes || 0) / (1024 * 1024)).toFixed(1)} MB</span>` : ''}
           </div>
-          <div style="display:flex;gap:6px;">
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="tm-btn tm-btn-primary" id="tm-snap-now-btn" title="Capture immediate filesystem checkpoint">📸 Snapshot</button>
+            <button class="tm-btn" id="tm-export-btn" title="Export timeline history as Markdown report">📥 Export</button>
             <button class="tm-btn" id="tm-prune-btn" title="Prune older snapshots keeping last 50">Prune Old</button>
             <button class="tm-btn" id="tm-refresh-btn">Refresh</button>
           </div>
         </div>
+        ${scrubberHtml}
         <div class="tm-filter-bar">
           <input class="tm-input" id="tm-filter-input" placeholder="Search by tool or file name..." value="${escapeHtml(state.filterText)}" />
         </div>
@@ -806,6 +955,23 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
     // Event listeners
     const refreshBtn = container.querySelector('#tm-refresh-btn');
     if (refreshBtn) refreshBtn.onclick = () => loadSnapshots(false);
+
+    const snapNowBtn = container.querySelector('#tm-snap-now-btn');
+    if (snapNowBtn) snapNowBtn.onclick = () => triggerSnapshotNow();
+
+    const exportBtn = container.querySelector('#tm-export-btn');
+    if (exportBtn) exportBtn.onclick = () => triggerExportMarkdown();
+
+    const retryBtn = container.querySelector('#tm-retry-btn');
+    if (retryBtn && sel) retryBtn.onclick = () => triggerRestoreAndRetry(sel.id);
+
+    const scrubNodes = container.querySelectorAll('.tm-scrub-node');
+    scrubNodes.forEach((node) => {
+      node.onclick = () => {
+        const id = node.getAttribute('data-snap-id');
+        if (id) selectSnapshot(id);
+      };
+    });
 
     const pruneBtn = container.querySelector('#tm-prune-btn');
     if (pruneBtn) pruneBtn.onclick = () => triggerPrune();
@@ -906,11 +1072,39 @@ function mountStatusBarItem(container, ctx) {
         ? 'background:rgba(245,158,11,0.2);color:#fbbf24;border:1px solid #f59e0b;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:4px;cursor:pointer;'
         : 'background:#21262d;color:#8b949e;border:1px solid #30363d;padding:2px 8px;border-radius:12px;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer;';
 
-      const label = isSelfHeal
-        ? `⚠️ Self-Heal • ${count} snaps`
-        : `🛡️ Safe Mode • ${count} snaps`;
+      let label = `🛡️ Safe Mode • ${count} snaps`;
+      if (isSelfHeal) {
+        label = `⚠️ Self-Heal Available • Revert Ready`;
+      } else if (data.latest_snapshot && data.latest_snapshot.tool_name === 'pre_restore_safety_backup') {
+        label = `✅ Recovered • Workspace Clean`;
+      }
 
-      container.innerHTML = `
+  
+    const scrubberNodes = state.snapshots.map((s, idx) => {
+      const active = s.id === state.selectedId ? 'active' : '';
+      const col = getBadgeColor(s);
+      const shortId = (s.checkpoint_hash || '').slice(0, 7) || s.id.slice(-6);
+      const isLast = idx === state.snapshots.length - 1;
+      return `
+        <div class="tm-scrub-node ${active}" data-snap-id="${escapeHtml(s.id)}" style="background:${col};border-color:${col};" title="${escapeHtml(s.tool_name)}">
+          <div class="tm-scrub-tooltip">
+            <strong>${escapeHtml(s.tool_name)}</strong> (${escapeHtml(shortId)})<br/>
+            ${escapeHtml(formatTime(s.created_at))}<br/>
+            +${s.insertions || 0} / -${s.deletions || 0}
+          </div>
+        </div>
+        ${!isLast ? '<div class="tm-scrub-line"></div>' : ''}
+      `;
+    }).join('');
+
+    const scrubberHtml = state.snapshots.length > 0
+      ? `<div class="tm-scrubber-container">
+           <span style="font-size:11px;color:#8b949e;flex-shrink:0;">Timeline:</span>
+           <div class="tm-scrubber-track">${scrubberNodes}</div>
+         </div>`
+      : '';
+
+    container.innerHTML = `
         <div style="display:flex;align-items:center;height:100%;padding:0 8px;">
           <span style="${badgeStyle}" title="${isSelfHeal ? 'Command failed after code edit - self-healing checkpoint available!' : 'Time Machine active: automatic shadow-git checkpoints enabled.'}">
             ${escapeHtml(label)}

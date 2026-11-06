@@ -122,12 +122,21 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             if rec_snap and tool_name in {"terminal", "bash", "execute_code", "run_command"}:
                 res_str = str(result or "")
                 if any(err in res_str for err in ("FAILED", "Traceback", "SyntaxError", "Error:", "exit code")):
+                    diag = ledger.diagnose_failure(session_id=sess, error_text=res_str)
+                    culprits = diag.get("culprit_files", [])
+                    culprit_repr = repr(culprits) if culprits else "None"
+                    target_snap = diag.get("recommended_snapshot_id") or rec_snap
+                    conf = diag.get("confidence", "high")
+
                     hint = (
-                        f"\n\n[🛡️ Time Machine Self-Heal Notice]: Command failed after recent edits. "
-                        f"Safety snapshot '{rec_snap}' was saved prior to the edit. Run "
-                        f"`time_machine_diff(snapshot_id='{rec_snap}')` or "
-                        f"`time_machine_restore(snapshot_id='{rec_snap}', confirm=true)` "
-                        f"(or specify file_paths=[...]) to surgically revert."
+                        f"\n\n[🛡️ Time Machine Self-Heal Notice & Recommendation]:\n"
+                        f"Command failed after recent file mutations.\n"
+                        f"• Identified culprit file(s): {culprits if culprits else 'recently modified workspace files'}\n"
+                        f"• Recommended safe checkpoint: '{target_snap}' (Confidence: {conf})\n"
+                        f"• Quick 1-call autonomous recovery:\n"
+                        f"  `time_machine_recover(auto_apply=true, confirm=true)`\n"
+                        f"• Or surgical restore:\n"
+                        f"  `time_machine_restore(snapshot_id='{target_snap}', file_paths={culprit_repr}, confirm=true)`"
                     )
                     return res_str + hint
         except Exception as exc:
@@ -153,7 +162,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 fc = str(s.get("files_changed", 0))
                 diff_stat = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
                 lines.append(f"{sid:<28} {tool:<14} {st:<8} {fc:<6} {diff_stat}")
-            lines.append("\nCommands: /rewind diff <id> [compare_to] | /rewind restore <id> [--files f1,f2] | /rewind demo")
+            lines.append("\nCommands: /rewind diff <id> [compare_to] | /rewind restore <id> [--files f1,f2] | /rewind recover | /rewind export | /rewind demo")
             return "\n".join(lines)
 
         elif subcmd == "demo":
@@ -218,7 +227,23 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             safety = f" (Safety backup saved: {res.get('pre_restore_backup_id')})" if res.get('pre_restore_backup_id') else ""
             return f"✅ Successfully restored {restored_what} to {target_id}!{safety}"
 
-        return "Usage: /rewind [list|diff <id> [compare_to]|restore <id> [--files f1,f2]|demo]"
+        elif subcmd == "recover":
+            rec_res = ledger.recover(session_id=session_id, auto_apply=True, confirm=True)
+            if not rec_res.get("ok"):
+                return f"❌ Recovery failed: {rec_res.get('error')}"
+            diag = rec_res.get("diagnosis", {})
+            return (
+                f"🛡️ Autonomous Self-Healing Executed!\n"
+                f"• Culprits Reverted: {rec_res.get('restored_files')}\n"
+                f"• Safe Target Checkpoint: {diag.get('recommended_snapshot_id')}\n"
+                f"• Pre-Restore Safety Backup: {rec_res.get('pre_restore_backup_id')}\n"
+                f"• Ready to retry command: {rec_res.get('retry_command') or 'pytest'}"
+            )
+
+        elif subcmd == "export":
+            return ledger.export_timeline_markdown(session_id=session_id)
+
+        return "Usage: /rewind [list|diff <id> [compare_to]|restore <id> [--files f1,f2]|recover|export|demo]"
 
     # Register hooks
     ctx.register_hook("on_session_start", on_session_start)
@@ -235,7 +260,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             name="rewind",
             handler=handle_rewind_command,
             description="Hermes Time Machine: inspect timeline, diff, or restore snapshots",
-            args_hint="[list|diff|restore|demo]",
+            args_hint="[list|diff|restore|recover|export|demo]",
         )
 
     # Register system prompt section for autonomous self-healing
@@ -246,9 +271,10 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 (
                     "## Time Machine Self-Healing & Safety Active\n"
                     "Hermes Time Machine automatically checkpoints the filesystem before file mutations.\n"
-                    "If code edits cause test or build failures, use these tools to inspect and revert:\n"
+                    "If code edits cause test, syntax, or build failures, use these tools to diagnose and recover:\n"
+                    "- `time_machine_recover`: autonomous self-healing tool! Call `time_machine_recover(auto_apply=true, confirm=true)` to diagnose culprits and surgically revert broken files in 1 step.\n"
                     "- `time_machine_list_snapshots`: inspect captured checkpoints in the current session.\n"
-                    "- `time_machine_diff`: view the exact diff of any snapshot.\n"
+                    "- `time_machine_diff`: view exact unified and structured diff of any snapshot or live working tree drift.\n"
                     "- `time_machine_restore`: surgically restore files (`file_paths=['path/to/file']`) or the whole workspace (`confirm=true`).\n"
                     "- `time_machine_branch`: fork a new clean exploration session without losing context."
                 ),

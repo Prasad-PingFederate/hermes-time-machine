@@ -60,6 +60,14 @@ class BranchRequest(BaseModel):
     working_dir: Optional[str] = None
 
 
+
+class RecoverRequest(BaseModel):
+    error_summary: Optional[str] = None
+    auto_apply: bool = False
+    confirm: bool = True
+    session_id: Optional[str] = None
+    working_dir: Optional[str] = None
+
 @router.get("/status")
 async def get_status(session_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     ledger = _get_ledger()
@@ -166,6 +174,28 @@ async def create_manual_snapshot(req: ManualSnapshotRequest) -> Dict[str, Any]:
     return {"ok": True, "snapshot": snap}
 
 
+@router.post("/snapshots/recover")
+async def recover_snapshots(req: RecoverRequest) -> Dict[str, Any]:
+    ledger = _get_ledger()
+    res = ledger.recover(
+        session_id=req.session_id or _get_latest_session_id(),
+        error_summary=req.error_summary,
+        auto_apply=req.auto_apply,
+        confirm=req.confirm,
+        working_dir=req.working_dir,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Recovery failed"))
+    return res
+
+
+@router.get("/snapshots/export")
+async def export_timeline(session_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    ledger = _get_ledger()
+    md = ledger.export_timeline_markdown(session_id=session_id)
+    return {"ok": True, "markdown": md}
+
+
 @router.get("/snapshots/{snapshot_id}")
 async def get_snapshot_detail(
     snapshot_id: str,
@@ -242,3 +272,26 @@ async def branch_snapshot(snapshot_id: str, req: BranchRequest) -> Dict[str, Any
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Branch failed"))
     return res
+
+
+
+
+
+@router.post("/snapshots/{snapshot_id}/retry")
+async def restore_and_retry(snapshot_id: str, req: RestoreRequest) -> Dict[str, Any]:
+    ledger = _get_ledger()
+    res = ledger.restore_snapshot(
+        snapshot_id=snapshot_id,
+        restore_files=req.restore_files,
+        rewind_conversation=req.rewind_conversation,
+        file_path=req.file_path,
+        file_paths=req.file_paths,
+        working_dir=req.working_dir,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Restore failed"))
+    diag = ledger.diagnose_failure(working_dir=req.working_dir)
+    return {
+        **res,
+        "retry_command": diag.get("retry_command") or "pytest",
+    }

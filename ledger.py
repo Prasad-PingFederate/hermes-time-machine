@@ -1263,3 +1263,232 @@ class TimeMachineLedger:
             "store_size_bytes": store_size,
             "total_storage_bytes": db_size + store_size,
         }
+
+    def diagnose_failure(
+        self,
+        session_id: Optional[str] = None,
+        error_text: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Diagnose failure root-cause by correlating test/compiler error output with
+        recently modified files and checkpoints. Returns culprit files, recommended
+        safe snapshot, confidence score, and suggested action.
+        """
+        sess = session_id or "default"
+        snaps = self.list_snapshots(session_id=sess, working_dir=working_dir, limit=15)
+
+        failed_snap = None
+        candidate_safe_snap = None
+        last_failed_command = ""
+
+        for s in snaps:
+            if s.get("self_heal_candidate") or s.get("status") == "error":
+                if not failed_snap:
+                    failed_snap = s
+                    if s.get("tool_args_summary"):
+                        last_failed_command = s.get("tool_args_summary")
+            elif s.get("tool_name") in MUTATING_TOOLS and s.get("status") == "ok":
+                if not candidate_safe_snap:
+                    candidate_safe_snap = s
+
+        if failed_snap and failed_snap.get("recommended_snapshot_id"):
+            rec_id = failed_snap.get("recommended_snapshot_id")
+            found_snap = self.get_snapshot(rec_id)
+            if found_snap:
+                candidate_safe_snap = found_snap
+
+        if not candidate_safe_snap:
+            candidate_safe_snap = self.get_last_safe_snapshot(sess)
+
+        err_msg = error_text or (failed_snap.get("tool_args_summary") if failed_snap else "") or ""
+
+        culprits: List[Dict[str, Any]] = []
+        wdir = (
+            (candidate_safe_snap or {}).get("working_dir")
+            or working_dir
+            or resolve_working_dir(hermes_home=self.hermes_home)
+        )
+
+        if candidate_safe_snap:
+            diff_res = self.get_diff(candidate_safe_snap["id"], compare_to_id="WORKING_TREE", working_dir=wdir)
+            files = diff_res.get("files", [])
+            for f in files:
+                fpath = f.get("path")
+                if not fpath:
+                    continue
+                basename = Path(fpath).name
+                in_traceback = (basename in err_msg) or (fpath in err_msg)
+                confidence = 0.95 if in_traceback else 0.80
+                reason = (
+                    f"Referenced in failure traceback and modified since safe checkpoint {candidate_safe_snap['id'][:12]}"
+                    if in_traceback
+                    else f"Modified after safe checkpoint {candidate_safe_snap['id'][:12]}"
+                )
+                culprits.append({
+                    "path": fpath,
+                    "status": f.get("status", "modified"),
+                    "confidence": confidence,
+                    "in_traceback": in_traceback,
+                    "reason": reason,
+                })
+
+        # Also detect newly created untracked files via git status
+        try:
+            res_status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=wdir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res_status.returncode == 0:
+                for line in res_status.stdout.splitlines():
+                    if line.startswith("??"):
+                        untracked_rel = line[3:].strip()
+                        if untracked_rel and not any(c["path"] == untracked_rel for c in culprits):
+                            culprits.append({
+                                "path": untracked_rel,
+                                "status": "untracked",
+                                "confidence": 0.88,
+                                "in_traceback": untracked_rel in err_msg,
+                                "reason": "Newly created untracked file after safe checkpoint",
+                            })
+        except Exception:
+            pass
+
+        culprits.sort(key=lambda x: x["confidence"], reverse=True)
+        # Prioritize files in traceback + untracked files created during the failed turn
+        traceback_or_new = [c for c in culprits if c.get("in_traceback") or c.get("status") == "untracked"]
+        if traceback_or_new:
+            culprit_paths = [c["path"] for c in traceback_or_new]
+        else:
+            culprit_paths = [c["path"] for c in culprits]
+        overall_confidence = "high" if any(c["confidence"] >= 0.9 for c in culprits) else ("medium" if culprits else "low")
+        rec_id = candidate_safe_snap.get("id") if candidate_safe_snap else None
+
+        explanation = (
+            f"Detected {len(culprits)} culprit file(s) [{', '.join(culprit_paths)}] edited prior to failure. "
+            f"Recommended safe checkpoint: {rec_id}."
+            if culprit_paths and rec_id
+            else "No specific modified files detected prior to command failure."
+        )
+
+        return {
+            "ok": True,
+            "session_id": sess,
+            "working_dir": wdir,
+            "failed_snapshot_id": (failed_snap or {}).get("id"),
+            "recommended_snapshot_id": rec_id,
+            "culprits": culprits,
+            "culprit_files": culprit_paths,
+            "confidence": overall_confidence,
+            "confidence_score": max([c["confidence"] for c in culprits], default=0.5),
+            "explanation": explanation,
+            "retry_command": last_failed_command,
+            "suggested_action": f"time_machine_recover(auto_apply=true, confirm=true)" if culprit_paths else "time_machine_restore(confirm=true)",
+        }
+
+    def recover(
+        self,
+        session_id: Optional[str] = None,
+        error_summary: Optional[str] = None,
+        auto_apply: bool = False,
+        confirm: bool = True,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Autonomous self-healing recovery: diagnoses root-cause culprits and optionally
+        auto-applies surgical rollback to the safe checkpoint with pre-restore safety backup.
+        """
+        diag = self.diagnose_failure(
+            session_id=session_id,
+            error_text=error_summary,
+            working_dir=working_dir,
+        )
+
+        result = {
+            "ok": True,
+            "diagnosis": diag,
+            "auto_applied": False,
+            "restored_files": [],
+            "pre_restore_backup_id": None,
+            "retry_command": diag.get("retry_command"),
+        }
+
+        if not auto_apply:
+            result["message"] = (
+                f"Diagnostic complete. {diag['explanation']} "
+                f"Call with auto_apply=true and confirm=true to automatically revert."
+            )
+            return result
+
+        if not confirm:
+            return {
+                **result,
+                "ok": False,
+                "error": "Confirmation guard required: set confirm=true to execute autonomous recovery.",
+            }
+
+        rec_id = diag.get("recommended_snapshot_id")
+        if not rec_id:
+            return {
+                **result,
+                "ok": False,
+                "error": "Cannot auto-recover: no valid safe snapshot identified.",
+            }
+
+        culprit_files = diag.get("culprit_files")
+        restore_res = self.restore_snapshot(
+            snapshot_id=rec_id,
+            file_paths=culprit_files if culprit_files else None,
+            working_dir=diag.get("working_dir") or working_dir,
+            restore_files=True,
+            rewind_conversation=False,
+        )
+
+        if not restore_res.get("ok"):
+            return {
+                **result,
+                "ok": False,
+                "error": f"Recovery restoration failed: {restore_res.get('error')}",
+                "restore_details": restore_res,
+            }
+
+        result["auto_applied"] = True
+        result["restored_files"] = restore_res.get("restored_files")
+        result["unlinked_new_files"] = restore_res.get("unlinked_new_files")
+        result["pre_restore_backup_id"] = restore_res.get("pre_restore_backup_id")
+        result["message"] = (
+            f"Successfully auto-recovered! Reverted {restore_res.get('restored_files')} "
+            f"to safe snapshot {rec_id}. Safety snapshot {restore_res.get('pre_restore_backup_id')} captured."
+        )
+        return result
+
+    def export_timeline_markdown(self, session_id: Optional[str] = None) -> str:
+        """Export session Time Machine history as structured Markdown report."""
+        sess = session_id or "default"
+        snaps = self.list_snapshots(session_id=session_id, limit=200)
+        stats = self.get_storage_stats()
+
+        lines = [
+            "# ⏱️ Hermes Time Machine Timeline Report",
+            f"**Session:** `{sess}` | **Exported At:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}`",
+            f"**Total Snapshots:** {len(snaps)} | **Store Size:** {round(stats.get('total_storage_bytes', 0) / 1024, 1)} KB\n",
+            "## Snapshots History\n",
+            "| Step | Timestamp | Tool | Checkpoint | Status | Changes | Details |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+
+        for idx, s in enumerate(reversed(snaps), 1):
+            ts = datetime.fromtimestamp(s['created_at']).strftime('%H:%M:%S') if s.get('created_at') else '-'
+            tool = s.get('tool_name', 'unknown')
+            sha = (s.get('checkpoint_hash') or '')[:8] or 'no-git'
+            st = '✅ ok' if s.get('status') == 'ok' else '❌ error'
+            if s.get('self_heal_candidate'):
+                st = '⚠️ heal-candidate'
+            changes = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
+            summary = (s.get('tool_args_summary') or s.get('reason') or '').replace('\n', ' ')[:50]
+            lines.append(f"| {idx} | {ts} | `{tool}` | `{sha}` | {st} | {changes} | {summary} |")
+
+        return "\n".join(lines)
