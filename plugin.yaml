@@ -1,5 +1,5 @@
 name: hermes-time-machine
-version: "0.3.0"
+version: "0.4.0"
 description: "Visual timeline scrubber, surgical file rollback, session branching, and autonomous self-healing for Hermes Agent & Desktop."
 author: "Prasad-PingFederate"
 manifest_version: 2
