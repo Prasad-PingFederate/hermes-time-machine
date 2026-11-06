@@ -67,8 +67,8 @@ RECOVER_SCHEMA = {
     "name": "time_machine_recover",
     "description": (
         "Autonomous self-healing diagnostic and recovery tool. Analyzes recent failed tool results "
-        "or test tracebacks, identifies culprit files edited before the failure, and optionally "
-        "surgically restores them in one step."
+        "or test tracebacks, identifies culprit files edited before the failure, optionally "
+        "surgically restores them, and automatically re-verifies test suites in one step."
     ),
     "parameters": {
         "type": "object",
@@ -87,6 +87,15 @@ RECOVER_SCHEMA = {
                 "description": "Confirmation guard required when auto_apply is true (default true).",
                 "default": True,
             },
+            "verify_command": {
+                "type": "string",
+                "description": "Optional test or build command to run after restoration to verify the fix (e.g. 'pytest -q'). Defaults to the last failed command.",
+            },
+            "auto_verify": {
+                "type": "boolean",
+                "description": "Whether to automatically execute verify_command after restore to confirm green tests (default true).",
+                "default": True,
+            },
             "session_id": {
                 "type": "string",
                 "description": "Optional session ID filter. Defaults to active session.",
@@ -99,4 +108,35 @@ RECOVER_SCHEMA = {
     },
 }
 
-ALL_SCHEMAS = [LIST_SCHEMA, DIFF_SCHEMA, RESTORE_SCHEMA, BRANCH_SCHEMA, RECOVER_SCHEMA]
+SEARCH_SCHEMA = {
+    "name": "time_machine_search",
+    "description": (
+        "Search across historical snapshot diffs and file edits to find which turn "
+        "introduced, modified, or removed a specific symbol, line of code, or file."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Code string, function name, symbol, or error message to search for in historical diffs.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional session ID filter. Defaults to current session.",
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Optional file path filter to narrow search to a specific file.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum matching snapshots to return (default 10).",
+                "default": 10,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+ALL_SCHEMAS = [LIST_SCHEMA, DIFF_SCHEMA, RESTORE_SCHEMA, BRANCH_SCHEMA, RECOVER_SCHEMA, SEARCH_SCHEMA]

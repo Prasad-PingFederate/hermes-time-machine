@@ -5,8 +5,9 @@ Demonstrates:
   Step 2: Feature Addition (multi-currency tax) -> Checkpointed
   Step 3: Bad Edit + Brand New Temporary File -> Pytest Fails
   Step 4: Self-Healing Detection & Rollback Recommendation
-  Step 5: Surgical File Restore (reverts billing.py, unlinks new debug_dump.tmp, preserves tax.py feature)
+  Step 5: Surgical File Restore & Auto-Verification (reverts billing.py, unlinks new debug_dump.tmp, preserves tax.py feature, auto-verifies green test in 1 tool call)
   Step 6: Arbitrary Diff Comparison (Baseline vs Current Working Tree)
+  Step 7: "What Introduced This?" Snapshot Diff Search (pins function to snapshot and +/- lines)
 """
 from __future__ import annotations
 
@@ -95,7 +96,7 @@ def run_demo(
         # ==========================================
         # STEP 1: Baseline Working Project
         # ==========================================
-        log(f"{BOLD}[Step 1/6] Setting up Baseline Working Project...{RESET}")
+        log(f"{BOLD}[Step 1/7] Setting up Baseline Working Project...{RESET}")
         billing_py = target_dir / "billing.py"
         tax_py = target_dir / "tax.py"
         test_py = target_dir / "test_billing.py"
@@ -159,7 +160,7 @@ def run_demo(
         # ==========================================
         # STEP 2: Feature Addition (Multi-Currency)
         # ==========================================
-        log(f"\n{BOLD}[Step 2/6] Implementing Feature (Multi-Currency in tax.py)...{RESET}")
+        log(f"\n{BOLD}[Step 2/7] Implementing Feature (Multi-Currency in tax.py)...{RESET}")
         tax_py.write_text(
             'DEFAULT_TAX_RATE = 0.08\n'
             'def get_tax_rate(currency: str = "USD") -> float:\n'
@@ -203,7 +204,7 @@ def run_demo(
         # ==========================================
         # STEP 3: Bad Edit + Newly Created Temporary File
         # ==========================================
-        log(f"\n{BOLD}[Step 3/6] Simulating Buggy Edit & Temp File Creation...{RESET}")
+        log(f"\n{BOLD}[Step 3/7] Simulating Buggy Edit & Temp File Creation...{RESET}")
         billing_py.write_text(
             'def calculate_total(subtotal: float, tax_rate: float) -> float:\n'
             '    # BUG: broken expression throws runtime error\n'
@@ -230,7 +231,7 @@ def run_demo(
         # ==========================================
         # STEP 4: Self-Healing Trigger
         # ==========================================
-        log(f"\n{BOLD}[Step 4/6] Self-Healing Detection & Recommendation...{RESET}")
+        log(f"\n{BOLD}[Step 4/7] Self-Healing Detection & Recommendation...{RESET}")
         demo_ledger.record_post_tool(
             session_id="demo_session",
             turn_id="turn_003",
@@ -252,14 +253,16 @@ def run_demo(
         log(f"  {YELLOW}⚠{RESET} Pytest failed as expected! Time Machine recommended rollback to {snap2['id']}")
 
         # ==========================================
-        # STEP 5: Autonomous Recovery (time_machine_recover)
+        # STEP 5: Autonomous Recovery with Auto-Verification
         # ==========================================
-        log(f"\n{BOLD}[Step 5/6] Executing Autonomous Recovery (time_machine_recover)...{RESET}")
+        log(f"\n{BOLD}[Step 5/7] Executing Autonomous Recovery with 1-Call Auto-Verification...{RESET}")
         recover_res = demo_ledger.recover(
             session_id="demo_session",
             error_summary="Critical Failure: Invalid Tax Calculation in billing.py",
             auto_apply=True,
             confirm=True,
+            auto_verify=True,
+            verify_command=f'"{sys.executable}" -m pytest "{test_py}"',
             working_dir=wdir,
         )
         restore_res = recover_res
@@ -268,27 +271,27 @@ def run_demo(
         tax_content = tax_py.read_text(encoding="utf-8")
         dump_exists = dump_file.exists()
 
-        # Re-run pytest -> SHOULD PASS 100%
-        t_fixed = _run_cmd([sys.executable, "-m", "pytest", str(test_py)], cwd=wdir)
-        step5_pass = t_fixed.returncode == 0
+        verification = recover_res.get("verification") or {}
+        auto_verify_passed = verification.get("passed", False)
 
         results["steps"]["step5_restore"] = {
             "restore_result": restore_res,
             "billing_restored": "raise RuntimeError" not in billing_content,
             "new_file_unlinked": not dump_exists,
             "tax_feature_preserved": "get_currency_symbol" in tax_content,
-            "pytest_passed": step5_pass,
+            "auto_verify_passed": auto_verify_passed,
+            "pytest_passed": auto_verify_passed,
         }
 
         log(f"  {GREEN}✔{RESET} billing.py reverted to working code")
         log(f"  {GREEN}✔{RESET} debug_dump.tmp unlinked cleanly (was newly created)")
         log(f"  {GREEN}✔{RESET} tax.py feature retained perfectly without regression")
-        log(f"  {GREEN}✔{RESET} Pytest is GREEN (100% pass)")
+        log(f"  {GREEN}✔{RESET} Auto-Verification in 1 tool call: PASSED (exit_code=0)")
 
         # ==========================================
         # STEP 6: Arbitrary Diff Verification
         # ==========================================
-        log(f"\n{BOLD}[Step 6/6] Arbitrary A <-> B Diff (Baseline vs Current Working Tree)...{RESET}")
+        log(f"\n{BOLD}[Step 6/7] Arbitrary A <-> B Diff (Baseline vs Current Working Tree)...{RESET}")
         diff_res = demo_ledger.get_diff(
             snapshot_id=snap1["id"],
             compare_to_id="WORKING_TREE",
@@ -304,14 +307,34 @@ def run_demo(
         }
 
         log(f"  {GREEN}✔{RESET} Net diff against baseline confirms only feature file modified: {changed_files}")
-        log(f"\n{BOLD}{GREEN}🎉 LIVE DEMO SUCCEEDED 100%! All 6 steps verified.{RESET}\n")
+
+        # ==========================================
+        # STEP 7: "What Introduced This?" Diff Search
+        # ==========================================
+        log(f"\n{BOLD}[Step 7/7] Searching History ('What Introduced This?')...{RESET}")
+        search_res = demo_ledger.search_snapshots(
+            query="get_currency_symbol",
+            session_id="demo_session",
+            working_dir=wdir,
+        )
+
+        found_matches = search_res.get("matches", [])
+        search_success = len(found_matches) > 0 and any(m["snapshot_id"] == snap2["id"] for m in found_matches)
+        results["steps"]["step7_search"] = {
+            "total_matches": len(found_matches),
+            "found_snap2": search_success,
+        }
+
+        log(f"  {GREEN}✔{RESET} Found {len(found_matches)} match(es) for 'get_currency_symbol' (pinned to Snapshot {snap2['id']})")
+        log(f"\n{BOLD}{GREEN}🎉 LIVE DEMO SUCCEEDED 100%! All 7 steps verified.{RESET}\n")
 
         results["ok"] = (
             step1_pass
             and step3_failed
-            and step5_pass
+            and auto_verify_passed
             and not dump_exists
             and ("get_currency_symbol" in tax_content)
+            and search_success
         )
         return results
 

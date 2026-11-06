@@ -65,6 +65,8 @@ class RecoverRequest(BaseModel):
     error_summary: Optional[str] = None
     auto_apply: bool = False
     confirm: bool = True
+    verify_command: Optional[str] = None
+    auto_verify: bool = True
     session_id: Optional[str] = None
     working_dir: Optional[str] = None
 
@@ -183,10 +185,28 @@ async def recover_snapshots(req: RecoverRequest) -> Dict[str, Any]:
         auto_apply=req.auto_apply,
         confirm=req.confirm,
         working_dir=req.working_dir,
+        verify_command=req.verify_command,
+        auto_verify=req.auto_verify,
     )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Recovery failed"))
     return res
+
+
+@router.get("/snapshots/search")
+async def search_snapshots_endpoint(
+    q: str = Query(..., min_length=1),
+    session_id: Optional[str] = Query(default=None),
+    file_path: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> Dict[str, Any]:
+    ledger = _get_ledger()
+    return ledger.search_snapshots(
+        query=q,
+        session_id=session_id,
+        file_path=file_path,
+        limit=limit,
+    )
 
 
 @router.get("/snapshots/export")

@@ -426,6 +426,14 @@ class TimeMachineLedger:
                 except Exception:
                     pass
 
+        if status != "ok" or self_heal_candidate:
+            cmd = (args or {}).get("command") or (args or {}).get("cmd") or snap.get("tool_args_summary") or ""
+            if cmd and tool_name in {"terminal", "bash", "execute_code", "run_command"}:
+                if not hasattr(self, "_last_failed_commands"):
+                    self._last_failed_commands = {}
+                clean_cmd = str(cmd).replace("command=", "").strip()
+                self._last_failed_commands[session_id or "default"] = clean_cmd
+
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -1346,6 +1354,9 @@ class TimeMachineLedger:
                 for line in res_status.stdout.splitlines():
                     if line.startswith("??"):
                         untracked_rel = line[3:].strip()
+                        # Ignore SQLite DB, cache, or hermes internal state files
+                        if untracked_rel.endswith((".db", ".db-shm", ".db-wal", ".pyc")) or ".hermes" in untracked_rel:
+                            continue
                         if untracked_rel and not any(c["path"] == untracked_rel for c in culprits):
                             culprits.append({
                                 "path": untracked_rel,
@@ -1396,10 +1407,13 @@ class TimeMachineLedger:
         auto_apply: bool = False,
         confirm: bool = True,
         working_dir: Optional[str] = None,
+        verify_command: Optional[str] = None,
+        auto_verify: bool = True,
     ) -> Dict[str, Any]:
         """
-        Autonomous self-healing recovery: diagnoses root-cause culprits and optionally
-        auto-applies surgical rollback to the safe checkpoint with pre-restore safety backup.
+        Autonomous self-healing recovery: diagnoses root-cause culprits, optionally
+        auto-applies surgical rollback with safety backup, and automatically re-verifies
+        test suites in a single atomic tool call.
         """
         diag = self.diagnose_failure(
             session_id=session_id,
@@ -1414,6 +1428,7 @@ class TimeMachineLedger:
             "restored_files": [],
             "pre_restore_backup_id": None,
             "retry_command": diag.get("retry_command"),
+            "verification": None,
         }
 
         if not auto_apply:
@@ -1459,9 +1474,61 @@ class TimeMachineLedger:
         result["restored_files"] = restore_res.get("restored_files")
         result["unlinked_new_files"] = restore_res.get("unlinked_new_files")
         result["pre_restore_backup_id"] = restore_res.get("pre_restore_backup_id")
+
+        # Auto-Verification
+        verification_info = None
+        wdir_target = diag.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
+        cmd_candidate = (
+            verify_command
+            or diag.get("retry_command")
+            or getattr(self, "_last_failed_commands", {}).get(session_id or "default")
+        )
+        if cmd_candidate and cmd_candidate.startswith("command="):
+            cmd_candidate = cmd_candidate.split("=", 1)[1].strip()
+
+        if auto_verify and cmd_candidate:
+            try:
+                v_res = subprocess.run(
+                    cmd_candidate,
+                    shell=True,
+                    cwd=wdir_target,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                passed = (v_res.returncode == 0)
+                out_snippet = (v_res.stdout.strip() or v_res.stderr.strip())
+                lines = out_snippet.splitlines()
+                summary = "\n".join(lines[-5:]) if len(lines) > 5 else out_snippet[:300]
+                verification_info = {
+                    "command": cmd_candidate,
+                    "exit_code": v_res.returncode,
+                    "passed": passed,
+                    "output_summary": summary,
+                }
+            except subprocess.TimeoutExpired:
+                verification_info = {
+                    "command": cmd_candidate,
+                    "exit_code": -1,
+                    "passed": False,
+                    "output_summary": "Verification command timed out after 15s.",
+                }
+            except Exception as v_err:
+                verification_info = {
+                    "command": cmd_candidate,
+                    "exit_code": -1,
+                    "passed": False,
+                    "output_summary": f"Verification error: {v_err}",
+                }
+
+        result["verification"] = verification_info
+        v_msg = ""
+        if verification_info:
+            v_msg = f" Verification '{verification_info['command']}' {'PASSED ✔' if verification_info['passed'] else 'FAILED ❌'}."
+
         result["message"] = (
             f"Successfully auto-recovered! Reverted {restore_res.get('restored_files')} "
-            f"to safe snapshot {rec_id}. Safety snapshot {restore_res.get('pre_restore_backup_id')} captured."
+            f"to safe snapshot {rec_id}. Safety snapshot {restore_res.get('pre_restore_backup_id')} captured.{v_msg}"
         )
         return result
 
@@ -1492,3 +1559,76 @@ class TimeMachineLedger:
             lines.append(f"| {idx} | {ts} | `{tool}` | `{sha}` | {st} | {changes} | {summary} |")
 
         return "\n".join(lines)
+
+    def search_snapshots(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        file_path: Optional[str] = None,
+        limit: int = 20,
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Search historical snapshot diffs, modified files, and tool arguments to find
+        which turn introduced, modified, or removed a specific symbol, line of code, or file.
+        """
+        q = (query or "").strip()
+        if not q:
+            return {"ok": False, "error": "Query string is required."}
+
+        snaps = self.list_snapshots(session_id=session_id, limit=100, include_raw_checkpoints=False)
+        matches: List[Dict[str, Any]] = []
+        q_lower = q.lower()
+
+        for s in snaps:
+            snap_id = s["id"]
+            wdir = s.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
+            diff_res = self.get_diff(snap_id, working_dir=wdir)
+            files_structured = diff_res.get("files", [])
+
+            matching_lines: List[Dict[str, Any]] = []
+            matched_files: List[str] = []
+
+            for f in files_structured:
+                fpath = f.get("path") or ""
+                if file_path and file_path not in fpath:
+                    continue
+
+                chunk = f.get("diff_chunk") or ""
+                for line in chunk.splitlines():
+                    if (line.startswith("+") or line.startswith("-")) and not line.startswith("+++") and not line.startswith("---"):
+                        if q_lower in line.lower():
+                            if fpath not in matched_files:
+                                matched_files.append(fpath)
+                            matching_lines.append({
+                                "file": fpath,
+                                "type": "addition" if line.startswith("+") else "deletion",
+                                "line": line[:160],
+                            })
+
+            args_summary = s.get("tool_args_summary") or s.get("reason") or ""
+            args_matched = q_lower in args_summary.lower()
+
+            if matching_lines or args_matched:
+                matches.append({
+                    "snapshot_id": snap_id,
+                    "turn_id": s.get("turn_id"),
+                    "created_at": s.get("created_at"),
+                    "tool_name": s.get("tool_name"),
+                    "checkpoint_hash": s.get("checkpoint_hash"),
+                    "matched_files": matched_files,
+                    "matching_lines": matching_lines[:10],
+                    "total_match_lines": len(matching_lines),
+                    "tool_args_summary": args_summary,
+                })
+                if len(matches) >= limit:
+                    break
+
+        return {
+            "ok": True,
+            "query": q,
+            "session_id": session_id,
+            "file_path": file_path,
+            "total_matches": len(matches),
+            "matches": matches,
+        }

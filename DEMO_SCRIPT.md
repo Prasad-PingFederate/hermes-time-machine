@@ -1,96 +1,92 @@
-# 🎬 Hermes Time Machine — Official <90s Demo Video Script
+# 🎬 Hermes Time Machine — Official 75s Demo Video Script (Winning Pacing)
 
 **Title:** Hermes Time Machine: Autonomous Self-Healing & Visual Time Travel for Hermes Agent  
-**Duration:** 88 Seconds  
+**Duration:** 75 Seconds (Target: < 90 Seconds)  
 **Hackathon:** Nous Research Hermes Agent Hackathon  
 **Target Audience:** Hackathon Judges, Autonomous Agent Developers, AI Safety Engineers  
 
 ---
 
-## ⏱️ Video Timeline & Screen Flow
+## ⏱️ High-Velocity 75-Second Pacing Chart
 
 ```
-+---------------------------------------------------------------------------------------------------+
-| 0:00 - 0:15 | Introduction: The Broken Code Dilemma & Safe Mode Status Bar                        |
-| 0:15 - 0:35 | The Incident: Agent Makes a Buggy Edit + Leaves a Stray Temp File                   |
-| 0:35 - 0:55 | Autonomous Self-Healing: Culprit Detection & 1-Call Surgical Recovery               |
-| 0:55 - 1:15 | Studio Deep-Dive: Interactive Timeline Scrubber & Side-by-Side Diff                  |
-| 1:15 - 1:30 | The Verdict: Zero Data Loss, Green Tests, and True Zero-Risk Autonomy                |
-+---------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------+
+| 0:00 - 0:08   | The Cold Open Hook: Instant Test Failure & Flashing ⚠️ Self-Heal Status Badge      |
+| 0:08 - 0:30   | The "Surgical vs. Blind Rollback" Judge Moment: 1-Call Autonomous Recovery        |
+| 0:30 - 0:55   | Interactive Scrubber & "Rollback of a Rollback" Safety Backup                     |
+| 0:55 - 1:15   | Session Branching (🌿 Forked) & "What Introduced This?" Diff Search               |
++---------------+-----------------------------------------------------------------------------------+
 ```
 
 ---
 
-### Segment 1: Introduction & Baseline (0:00 – 0:15)
-- **Visual:** Hermes Agent CLI and Electron Desktop open side-by-side. The status bar in the bottom right displays `🛡️ Safe Mode • 4 snaps`. A Python payment service (`billing.py`, `tax.py`) is passing all unit tests.
+### Act 1: The Cold Open Hook (0:00 – 0:08)
+- **Visual:** Open directly on Hermes Desktop with the Time Machine Right-Rail open. Hermes is working on a payment service. It edits `tax.py` (good multi-currency feature) and `billing.py` (broken runtime bug), leaving an untracked `debug_dump.tmp` file. Pytest runs -> **RED TEST FAILURE**.
+- **Visual Alert:** In the bottom-right status bar, the badge instantly flashes:  
+  `⚠️ Self-Heal Available • Snapshot snap_feature recommended`.
 - **Voiceover:**  
-  *"Every developer knows the dread of an autonomous agent editing three files, breaking the build, and getting lost in hallucinations trying to fix it. Meet Hermes Time Machine — the first zero-risk, shadow-git time travel and self-healing engine built specifically for Hermes Agent."*
-- **Action:** Open terminal and run `pytest`. Tests pass 100%. Show Time Machine status bar badge.
+  *"Every agent user has experienced this: an agent adds a feature in tax.py, accidentally breaks billing.py, and leaves stray files behind. Normally, you're stuck in hallucination loops. But watch what happens with Hermes Time Machine."*
 
 ---
 
-### Segment 2: The Failure & Culprit Flagging (0:15 – 0:35)
-- **Visual:** Hermes implements multi-currency EUR tax in `tax.py`, but introduces a fatal `RuntimeError` in `billing.py` and creates a stray `debug_dump.tmp` file. Pytest runs and fails catastrophically.
-- **Voiceover:**  
-  *"Here, the agent successfully added a currency feature in tax.py, but broke billing.py and left an untracked temporary file. Pytest immediately fails."*
-- **Action:** Terminal displays test failure output. Instantly, Time Machine's `transform_tool_result` middleware intercepts the error and injects an actionable notice directly into the context window:
+### Act 2: The "Surgical vs. Blind Rollback" Judge Moment (0:08 – 0:30)
+- **Visual:** Time Machine's `transform_tool_result` middleware intercepts the error and injects the actionable self-heal notice:
   ```markdown
   [🛡️ Time Machine Self-Heal Notice & Recommendation]:
-  Command failed after recent file mutations.
-  • Identified culprit file(s): ['billing.py', 'debug_dump.tmp']
-  • Recommended safe checkpoint: 'snap_feature' (Confidence: high)
-  • Quick 1-call autonomous recovery:
-    time_machine_recover(auto_apply=true, confirm=true)
+  Command 'pytest -q' failed after file mutations.
+  • Culprit files identified: ['billing.py', 'debug_dump.tmp']
+  • Preserved files: ['tax.py']
+  • Recommended safe snapshot: 'snap_feature' (Confidence: high)
+  • 1-Call Recovery: time_machine_recover(auto_apply=true, confirm=true, auto_verify=true)
   ```
-
----
-
-### Segment 3: Autonomous Recovery (0:35 – 0:55)
-- **Visual:** Hermes reads the recommendation and executes `time_machine_recover(auto_apply=true, confirm=true)`. 
+- **The Contrast:**  
+  Point out on screen: *A blind `git reset --hard` would obliterate our new tax feature!*
+- **Action:**  
+  Hermes executes `time_machine_recover(auto_apply=true, confirm=true, auto_verify=true)`.
+  In **ONE single tool call**:
+  1. Correlates the error traceback to `billing.py`.
+  2. Captures an automatic Pre-Restore Safety Checkpoint (`snap_pre_restore_backup`).
+  3. Surgically reverts `billing.py`.
+  4. Safely unlinks newly created `debug_dump.tmp` without git pathspec errors.
+  5. **Keeps the good `tax.py` multi-currency feature 100% intact**.
+  6. Auto-verifies by re-running `pytest` inside the same call: **`verification: {passed: true, exit_code: 0}`**!
 - **Voiceover:**  
-  *"Instead of blindly trying random edits, Hermes invokes Time Machine's autonomous recovery tool. Time Machine correlates the traceback, pinpoints billing.py and the stray file, takes an automatic Pre-Restore Safety Checkpoint, and surgically reverts only the broken pieces — while keeping the new tax feature completely intact!"*
-- **Action:** 
-  1. `billing.py` reverts to working code.
-  2. `debug_dump.tmp` is unlinked from disk without git pathspec errors.
-  3. `tax.py` keeps EUR multi-currency code.
-  4. Pytest re-runs: **100% GREEN**.
+  *"In a single tool call, Time Machine surgically reverts only the broken file, unlinks the stray debug dump, preserves our brand-new tax code, and auto-verifies that tests are green — zero LLM round-trips wasted."*
 
 ---
 
-### Segment 4: Desktop Timeline Scrubber & Diff View (0:55 – 1:15)
-- **Visual:** Switch focus to Hermes Desktop Studio View (`desktop/plugin.js`). Show the new horizontal timeline scrubber at the top: `● ─── ● ─── ● ─── ⚠️ ─── ✅`.
+### Act 3: Interactive Scrubber & "Rollback of a Rollback" (0:30 – 0:55)
+- **Visual:** Switch to Hermes Desktop Studio View (`desktop/plugin.js`). Click along the horizontal timeline scrubber:
+  `● ─── ● ─── ● ─── ⚠️ ─── 🌿 ─── ✅`
+- **Actions:**
+  1. Hover on nodes for instant mini-diff and file previews.
+  2. Toggle between **Side-by-Side Split Diff** and **Unified Diff**.
+  3. Inspect **"Compare to Live Working Tree"** to see net changes against baseline.
+  4. Highlight the `pre_restore_safety_backup` snapshot in the ledger: **even rollbacks can be rolled back!** True zero data loss.
 - **Voiceover:**  
-  *"For human-in-the-loop oversight, the Desktop interface features an interactive horizontal scrubber. Hover over any step for a mini-diff preview. Toggle between side-by-side split and unified diffs. Want to revert a single file or export a full debugging log? It's all just one click."*
-- **Action:** 
-  1. Hover over a node in the scrubber showing file tooltip.
-  2. Click **"Compare Against: Live Working Tree"** dropdown.
-  3. Click **"📸 Snapshot"** to capture an immediate manual checkpoint.
-  4. Click **"📥 Export"** to generate instant Markdown timeline.
+  *"For human oversight, our Desktop Studio offers an interactive horizontal scrubber, side-by-side split diffs, and live working tree comparison. And because every restore captures a safety checkpoint first, even a rollback is reversible."*
 
 ---
 
-### Segment 5: The Winning Edge (1:15 – 1:30)
-- **Visual:** Split screen showing the 18/18 Pytest suite passing and `hermes_cli.plugin_validate` with 16/16 checks green.
+### Act 4: Session Branching & Diff Search (0:55 – 1:15)
+- **Visual:** Demonstrate the two killer developer tools:
+  1. **Session Branching (`/rewind branch experiment-v2`):** Shows the new branch tree with the `🌿 Forked` pill in the UI.
+  2. **Diff Search (`/rewind search get_currency_symbol`):** Instantly pinpoints the exact snapshot, turn, tool name, and `+` / `-` diff lines where that function was first introduced.
 - **Voiceover:**  
-  *"Time Machine pairs shadow-git commits with Hermes state.db turn watermarks. It gives agents the ultimate superpower: the fearlessness to innovate, knowing every rollback is itself reversible. That is Hermes Time Machine."*
-- **Action:** Show final summary slide with GitHub link: `https://github.com/Prasad-PingFederate/hermes-time-machine`.
+  *"Need to explore a risky refactor? Fork your session with one click. Wondering when a bug crept in? Search snapshot history to pinpoint the exact turn and diff line that introduced it."*
+- **Final Shot (1:15):**  
+  Show the test and validator suite: **23/23 Pytest passing • 16/16 Hermes Validator checks green**.  
+  *"Zero hallucination loops. Zero data loss. 100% autonomous recovery. That's Hermes Time Machine."*
 
 ---
 
-## 💡 Recording Tips & Commands
-1. Run the live demo script directly to capture terminal footage:
-   ```bash
-   python scripts/demo_walkthrough.py
-   ```
-2. Or demonstrate the CLI slash command:
-   ```bash
-   /rewind demo
-   /rewind list
-   /rewind diff snap_xxx WORKING_TREE
-   /rewind export
-   ```
-3. Run the full test validation:
-   ```bash
-   pytest tests/ -v
-   python -m hermes_cli.plugin_validate .
-   ```
+## 💻 1-Command Live Demonstration
+To run the automated, color-coded walkthrough in your terminal:
+```bash
+python scripts/demo_walkthrough.py
+```
+To run full admission validation:
+```bash
+pytest tests/ -v
+python -c "from hermes_cli.plugin_validate import validate_plugin_dir; from pathlib import Path; print(validate_plugin_dir(Path('.')))"
+```

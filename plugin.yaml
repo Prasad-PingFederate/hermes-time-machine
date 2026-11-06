@@ -1,11 +1,11 @@
 name: hermes-time-machine
 version: "0.3.0"
-description: "Unified Time Machine for Hermes Agent: pairs shadow-git filesystem checkpoints with state.db conversation turns for atomic rewind, diff, session branching, and autonomous self-healing recovery."
+description: "Visual timeline scrubber, surgical file rollback, session branching, and autonomous self-healing for Hermes Agent & Desktop."
 author: "Prasad-PingFederate"
 manifest_version: 2
 api_version: 1
 license: MIT
-tags: [desktop, safety, productivity]
+tags: [desktop, safety, checkpoints, rollback, debugging, developer-tools]
 
 provides_tools:
   - time_machine_list_snapshots
@@ -13,6 +13,7 @@ provides_tools:
   - time_machine_restore
   - time_machine_branch
   - time_machine_recover
+  - time_machine_search
 
 provides_hooks:
   - on_session_start

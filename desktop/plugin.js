@@ -741,7 +741,9 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
       const nameMatch = (s.tool_name || '').toLowerCase().includes(ft);
       const argsMatch = (s.tool_args_summary || '').toLowerCase().includes(ft);
       const wdirMatch = (s.working_dir || '').toLowerCase().includes(ft);
-      return nameMatch || argsMatch || wdirMatch;
+      const diffMatch = (s.unified_diff || '').toLowerCase().includes(ft);
+      const filesMatch = (s.affected_files || '').toLowerCase().includes(ft);
+      return nameMatch || argsMatch || wdirMatch || diffMatch || filesMatch;
     });
 
     const cardsHtml =
@@ -763,11 +765,16 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
               const selfHealBadge = s.self_heal_candidate
                 ? `<span class="tm-badge tm-badge-amber" style="margin-left:4px;">⚠️ Self-Heal</span>`
                 : '';
+              const isBranch = Boolean(s.parent_session_id || s.tool_name === 'time_machine_branch' || (s.reason && s.reason.includes('branch')));
+              const branchBadge = isBranch
+                ? `<span class="tm-badge" style="margin-left:4px;background:rgba(139,92,246,0.15);border-color:#8b5cf6;color:#c4b5fd;">🌿 Forked</span>`
+                : '';
               return `
                 <div class="tm-card ${active}" data-snap-id="${escapeHtml(s.id)}" style="border-left-color:${borderCol};">
                   <div class="tm-card-top">
                     <span>${escapeHtml(s.tool_name)}</span>
                     <div>
+                      ${branchBadge}
                       ${selfHealBadge}
                       <span class="tm-badge">${escapeHtml(shortHash)}</span>
                     </div>
@@ -938,7 +945,7 @@ function mountTimeMachineDOM(container, ctx, mode = 'studio') {
         </div>
         ${scrubberHtml}
         <div class="tm-filter-bar">
-          <input class="tm-input" id="tm-filter-input" placeholder="Search by tool or file name..." value="${escapeHtml(state.filterText)}" />
+          <input class="tm-input" id="tm-filter-input" placeholder="Search code symbols, diffs, tools, or files..." value="${escapeHtml(state.filterText)}" />
         </div>
         ${state.toast ? `<div class="tm-toast">${escapeHtml(state.toast)}</div>` : ''}
         <div class="tm-body">

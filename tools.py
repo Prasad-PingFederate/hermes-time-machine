@@ -163,8 +163,8 @@ RECOVER_SCHEMA: Dict[str, Any] = {
     "name": "time_machine_recover",
     "description": (
         "Autonomous self-healing diagnostic and recovery tool. Analyzes recent failed tool results "
-        "or test tracebacks, identifies culprit files edited before the failure, and optionally "
-        "surgically restores them in one step."
+        "or test tracebacks, identifies culprit files edited before the failure, optionally "
+        "surgically restores them, and automatically re-verifies test suites in one step."
     ),
     "parameters": {
         "type": "object",
@@ -183,6 +183,15 @@ RECOVER_SCHEMA: Dict[str, Any] = {
                 "description": "Confirmation guard required when auto_apply is true (default true).",
                 "default": True,
             },
+            "verify_command": {
+                "type": "string",
+                "description": "Optional test or build command to run after restoration to verify the fix (e.g. 'pytest -q'). Defaults to the last failed command.",
+            },
+            "auto_verify": {
+                "type": "boolean",
+                "description": "Whether to automatically execute verify_command after restore to confirm green tests (default true).",
+                "default": True,
+            },
             "session_id": {
                 "type": "string",
                 "description": "Optional session ID filter. Defaults to active session.",
@@ -192,6 +201,37 @@ RECOVER_SCHEMA: Dict[str, Any] = {
                 "description": "Optional working directory override.",
             },
         },
+    },
+}
+
+SEARCH_SCHEMA: Dict[str, Any] = {
+    "name": "time_machine_search",
+    "description": (
+        "Search across historical snapshot diffs and file edits to find which turn "
+        "introduced, modified, or removed a specific symbol, line of code, or file."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Code string, function name, symbol, or error message to search for in historical diffs.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional session ID filter. Defaults to current session.",
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Optional file path filter to narrow search to a specific file.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum matching snapshots to return (default 10).",
+                "default": 10,
+            },
+        },
+        "required": ["query"],
     },
 }
 
@@ -314,6 +354,8 @@ def handle_recover(
     auto_apply = bool(args.get("auto_apply", False))
     confirm = bool(args.get("confirm", True))
     working_dir = args.get("working_dir")
+    verify_command = args.get("verify_command")
+    auto_verify = bool(args.get("auto_verify", True))
 
     res = ledger.recover(
         session_id=session_id,
@@ -321,6 +363,32 @@ def handle_recover(
         auto_apply=auto_apply,
         confirm=confirm,
         working_dir=working_dir,
+        verify_command=verify_command,
+        auto_verify=auto_verify,
+    )
+    return json.dumps(res, indent=2, default=str)
+
+
+def handle_search(
+    args: Dict[str, Any],
+    *,
+    ledger: Optional[TimeMachineLedger] = None,
+    **kwargs: Any,
+) -> str:
+    ledger = ledger or TimeMachineLedger()
+    query = (args.get("query") or "").strip()
+    if not query:
+        return json.dumps({"ok": False, "error": "query parameter is required."})
+
+    session_id = args.get("session_id") or kwargs.get("session_id")
+    file_path = args.get("file_path")
+    limit = int(args.get("limit") or 10)
+
+    res = ledger.search_snapshots(
+        query=query,
+        session_id=session_id,
+        file_path=file_path,
+        limit=limit,
     )
     return json.dumps(res, indent=2, default=str)
 
@@ -354,6 +422,11 @@ def register_time_machine_tools(ctx, ledger: Optional[TimeMachineLedger] = None)
             "time_machine_recover",
             RECOVER_SCHEMA,
             partial(handle_recover, ledger=ledger),
+        ),
+        (
+            "time_machine_search",
+            SEARCH_SCHEMA,
+            partial(handle_search, ledger=ledger),
         ),
     ]
 

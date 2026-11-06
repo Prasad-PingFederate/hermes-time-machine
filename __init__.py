@@ -162,7 +162,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 fc = str(s.get("files_changed", 0))
                 diff_stat = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
                 lines.append(f"{sid:<28} {tool:<14} {st:<8} {fc:<6} {diff_stat}")
-            lines.append("\nCommands: /rewind diff <id> [compare_to] | /rewind restore <id> [--files f1,f2] | /rewind recover | /rewind export | /rewind demo")
+            lines.append("\nCommands: /rewind diff <id> [compare_to] | /rewind restore <id> [--files f1,f2] | /rewind recover | /rewind search <query> | /rewind export | /rewind demo")
             return "\n".join(lines)
 
         elif subcmd == "demo":
@@ -240,10 +240,31 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 f"• Ready to retry command: {rec_res.get('retry_command') or 'pytest'}"
             )
 
+        elif subcmd in ("search", "find"):
+            if len(parts) < 2:
+                return "Usage: /rewind search <query> [file_path]"
+            query = parts[1]
+            f_filter = parts[2] if len(parts) > 2 else None
+            s_res = ledger.search_snapshots(query=query, session_id=session_id, file_path=f_filter)
+            if not s_res.get("ok"):
+                return f"Search error: {s_res.get('error')}"
+            matches = s_res.get("matches", [])
+            if not matches:
+                return f"🔍 No snapshots found introducing or modifying '{query}'."
+            lines = [f"🔍 Search results for '{query}' ({len(matches)} matches):"]
+            for m in matches:
+                sid = m.get("snapshot_id", "")
+                tool = m.get("tool_name", "")
+                m_lines = m.get("matching_lines", [])
+                lines.append(f"• {sid} ({tool}): {len(m_lines)} diff lines matched")
+                for ml in m_lines[:3]:
+                    lines.append(f"    {ml.get('file', '')}: {ml.get('line', '').strip()[:80]}")
+            return "\n".join(lines)
+
         elif subcmd == "export":
             return ledger.export_timeline_markdown(session_id=session_id)
 
-        return "Usage: /rewind [list|diff <id> [compare_to]|restore <id> [--files f1,f2]|recover|export|demo]"
+        return "Usage: /rewind [list|diff <id> [compare_to]|restore <id> [--files f1,f2]|recover|search <query>|export|demo]"
 
     # Register hooks
     ctx.register_hook("on_session_start", on_session_start)
@@ -260,7 +281,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             name="rewind",
             handler=handle_rewind_command,
             description="Hermes Time Machine: inspect timeline, diff, or restore snapshots",
-            args_hint="[list|diff|restore|recover|export|demo]",
+            args_hint="[list|diff|restore|recover|search|export|demo]",
         )
 
     # Register system prompt section for autonomous self-healing
@@ -272,7 +293,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                     "## Time Machine Self-Healing & Safety Active\n"
                     "Hermes Time Machine automatically checkpoints the filesystem before file mutations.\n"
                     "If code edits cause test, syntax, or build failures, use these tools to diagnose and recover:\n"
-                    "- `time_machine_recover`: autonomous self-healing tool! Call `time_machine_recover(auto_apply=true, confirm=true)` to diagnose culprits and surgically revert broken files in 1 step.\n"
+                    "- `time_machine_recover`: autonomous self-healing tool! Call `time_machine_recover(auto_apply=true, confirm=true, auto_verify=true)` to diagnose culprits, surgically revert broken files, and verify green tests in 1 call.\n- `time_machine_search`: search historical snapshot diffs to find which turn introduced, modified, or deleted a symbol or error string.\n"
                     "- `time_machine_list_snapshots`: inspect captured checkpoints in the current session.\n"
                     "- `time_machine_diff`: view exact unified and structured diff of any snapshot or live working tree drift.\n"
                     "- `time_machine_restore`: surgically restore files (`file_paths=['path/to/file']`) or the whole workspace (`confirm=true`).\n"

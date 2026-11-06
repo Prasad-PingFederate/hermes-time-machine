@@ -1,0 +1,25 @@
+name: time-machine
+repo: https://github.com/Prasad-PingFederate/hermes-time-machine
+sha: PENDING_COMMIT_SHA
+description: >-
+  Visual timeline scrubber, surgical file rollback, session branching, and autonomous self-healing for Hermes Agent & Desktop. Intercepts failed tool executions, diagnoses root culprits, unlinks stray files, and restores passing builds with 1-call auto-verification.
+maintainer: Prasad-PingFederate
+tier: community
+category: developer-tools
+docs_url: https://github.com/Prasad-PingFederate/hermes-time-machine#readme
+version: "2.0.0"
+platforms: []
+capabilities:
+  provides_tools:
+    - time_machine_list_snapshots
+    - time_machine_diff
+    - time_machine_restore
+    - time_machine_branch
+    - time_machine_recover
+    - time_machine_search
+  provides_hooks:
+    - pre_tool_call
+    - post_tool_call
+  provides_middleware:
+    - transform_tool_result
+  requires_env: []

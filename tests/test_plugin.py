@@ -589,3 +589,147 @@ def test_slash_command_recover_and_export(test_ledger, temp_dir):
 
     out_export = stub.command_handler("export", session_id="s_slash")
     assert "Hermes Time Machine Timeline Report" in out_export
+
+
+def test_search_snapshots_diff_content(git_repo, test_ledger):
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+    f1 = git_repo["f1"]
+    f2 = git_repo["f2"]
+
+    # Commit 1 snapshot
+    s1 = test_ledger.record_pre_tool(session_id="s_search", tool_name="write_file", args={"path": "file_a.py"}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, s1["id"]))
+
+    # Commit 2: change file_a and add something to file_b
+    f1.write_text("print('version 2 ALPHA')", encoding="utf-8")
+    f2.write_text("print('version 2 BETA UNIQUE_MARKER')", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(wdir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "second commit"], cwd=str(wdir), check=True, capture_output=True)
+    c2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(wdir), check=True, capture_output=True, text=True).stdout.strip()
+
+    s2 = test_ledger.record_pre_tool(session_id="s_search", tool_name="edit_file", args={"path": "file_b.py"}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c2, s2["id"]))
+
+    # 1. Search for unique symbol in diff
+    res = test_ledger.search_snapshots(query="UNIQUE_MARKER", session_id="s_search", working_dir=str(wdir))
+    assert res["ok"] is True
+    assert res["total_matches"] >= 1
+    match0 = res["matches"][0]
+    assert match0["snapshot_id"] == s2["id"]
+    assert "file_b.py" in match0["matched_files"]
+
+    # 2. Search scoped to file_path
+    res_scoped = test_ledger.search_snapshots(query="version", file_path="file_a.py", session_id="s_search", working_dir=str(wdir))
+    assert res_scoped["ok"] is True
+    for m in res_scoped["matches"]:
+        for f in m["matched_files"]:
+            assert "file_a.py" in f
+
+    # 3. Empty query error
+    res_empty = test_ledger.search_snapshots(query="")
+    assert res_empty["ok"] is False
+
+
+def test_time_machine_search_tool_handler(git_repo, test_ledger):
+    from tools import handle_search
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+
+    s1 = test_ledger.record_pre_tool(session_id="s_tool_search", tool_name="write_file", args={"path": "file_a.py"}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, s1["id"]))
+
+    res_json = handle_search({"query": "version 1", "session_id": "s_tool_search"}, ledger=test_ledger)
+    res = json.loads(res_json)
+    assert res["ok"] is True
+    assert "total_matches" in res
+
+
+def test_recover_auto_verify(git_repo, test_ledger):
+    wdir = git_repo["dir"]
+    c1 = git_repo["c1"]
+    f1 = git_repo["f1"]
+
+    snap = test_ledger.record_pre_tool(session_id="s_rec_verify", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
+    with test_ledger._connect() as conn:
+        conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
+    test_ledger.record_post_tool(session_id="s_rec_verify", tool_name="edit_file", status="ok")
+
+    # Corrupt file_a
+    f1.write_text("CORRUPTED SYNTAX ERROR {{{", encoding="utf-8")
+
+    # Terminal failure recorded
+    test_ledger.record_pre_tool(session_id="s_rec_verify", tool_name="terminal", args={"command": "python -c \"import sys; sys.exit(1)\""}, working_dir=str(wdir))
+    test_ledger.record_post_tool(
+        session_id="s_rec_verify",
+        tool_name="terminal",
+        status="error",
+        self_heal_candidate=True,
+        recommended_snapshot_id=snap["id"],
+    )
+
+    # Recovery with passing verify_command
+    res = test_ledger.recover(
+        session_id="s_rec_verify",
+        error_summary="syntax error in file_a.py",
+        auto_apply=True,
+        confirm=True,
+        auto_verify=True,
+        verify_command=f'"{sys.executable}" -c "import sys; sys.exit(0)"',
+        working_dir=str(wdir),
+    )
+    assert res["ok"] is True
+    assert res["auto_applied"] is True
+    assert res["verification"]["passed"] is True
+    assert res["verification"]["exit_code"] == 0
+
+    # Recovery with failing verify_command
+    res_fail = test_ledger.recover(
+        session_id="s_rec_verify",
+        error_summary="syntax error in file_a.py",
+        auto_apply=True,
+        confirm=True,
+        auto_verify=True,
+        verify_command=f'"{sys.executable}" -c "import sys; sys.exit(2)"',
+        working_dir=str(wdir),
+    )
+    assert res_fail["ok"] is True
+    assert res_fail["verification"]["passed"] is False
+    assert res_fail["verification"]["exit_code"] == 2
+
+
+def test_api_search_endpoint(test_ledger, temp_dir):
+    test_ledger.record_pre_tool(session_id="s_api_search", tool_name="edit_file", args={"path": "main.py"}, working_dir=str(temp_dir))
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    # Query with match or empty result
+    res = client.get("/snapshots/search?q=main&session_id=s_api_search")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is True
+    assert data["query"] == "main"
+    assert "matches" in data
+
+
+def test_slash_command_search(test_ledger, temp_dir):
+    test_ledger.record_pre_tool(session_id="s_slash_search", tool_name="write_file", args={"path": "calc.py"}, working_dir=str(temp_dir))
+
+    class CtxStub:
+        def __init__(self):
+            self.command_handler = None
+        def register_hook(self, *a, **kw): pass
+        def register_tool(self, *a, **kw): pass
+        def register_command(self, name, handler, **kw): self.command_handler = handler
+        def register_system_prompt_section(self, *a, **kw): pass
+
+    stub = CtxStub()
+    tm_plugin.register(stub, ledger=test_ledger)
+
+    out = stub.command_handler("search calc", session_id="s_slash_search")
+    assert "search results for" in out.lower()
