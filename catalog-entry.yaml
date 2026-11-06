@@ -1,6 +1,6 @@
 name: hermes-time-machine
 repo: https://github.com/Prasad-PingFederate/hermes-time-machine
-sha: 79171c7c79eff23974c4bffa000eea4593c1a580
+sha: 3c42a1e2c29c9bf6ed70040132a822e882ca124c
 description: >-
   Visual timeline scrubber, surgical file rollback, session branching, and autonomous self-healing for Hermes Agent & Desktop. Intercepts failed tool executions, diagnoses root culprits, unlinks stray files, and restores passing builds with 1-call auto-verification.
 maintainer: Prasad-PingFederate
