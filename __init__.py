@@ -17,6 +17,9 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger(__name__)
 
+__version__ = "0.3.0"
+__plugin_name__ = "time-machine"
+
 # Track the last known-good mutating snapshot per session for autonomous self-healing
 _last_safe_snapshot: Dict[str, str] = {}
 

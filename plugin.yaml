@@ -1,4 +1,4 @@
-name: hermes-time-machine
+name: time-machine
 version: "0.3.0"
 requires_hermes: ">=0.21.0"
 description: "Visual timeline scrubber, surgical file rollback, session branching, and autonomous self-healing for Hermes Agent & Desktop."

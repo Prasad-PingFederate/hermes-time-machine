@@ -3,7 +3,7 @@
  * Targets @hermes/plugin-sdk ctx.register({ area: 'statusBar.right' | 'rail.right' | 'pane' })
  */
 
-const PLUGIN_ID = 'hermes-time-machine';
+const PLUGIN_ID = 'time-machine';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 
 async function apiCall(ctx, path, options = {}) {
@@ -1123,9 +1123,9 @@ function mountStatusBarItem(container, ctx) {
       if (chip) {
         chip.onclick = () => {
           if (typeof ctx.openView === 'function') {
-            ctx.openView('hermes-time-machine-view');
+            ctx.openView('time-machine-view');
           } else if (typeof ctx.openRail === 'function') {
-            ctx.openRail('hermes-time-machine-rail');
+            ctx.openRail('time-machine-rail');
           }
         };
       }
@@ -1190,7 +1190,7 @@ export default {
   name: 'Hermes Time Machine',
   activate(ctx) {
     registerCapability(ctx, {
-      id: 'hermes-time-machine-status',
+      id: 'time-machine-status',
       area: 'statusBar.right',
       label: 'Time Machine Status',
       priority: 95,
@@ -1198,7 +1198,7 @@ export default {
     });
 
     registerCapability(ctx, {
-      id: 'hermes-time-machine-rail',
+      id: 'time-machine-rail',
       area: 'rail.right',
       label: 'Time Machine',
       icon: 'history',
@@ -1206,7 +1206,7 @@ export default {
     });
 
     registerCapability(ctx, {
-      id: 'hermes-time-machine-view',
+      id: 'time-machine-view',
       area: 'pane',
       label: 'Time Machine Studio',
       icon: 'history',

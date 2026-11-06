@@ -293,12 +293,10 @@ def handle_restore(
     if not snapshot_id:
         return json.dumps({"ok": False, "error": "snapshot_id is required."})
 
-    confirm = args.get("confirm", True)
-    if confirm is False:
-        return json.dumps({
-            "ok": False,
-            "error": "Restoration cancelled: 'confirm' must be true to apply changes to disk.",
-        })
+    confirm = bool(args.get("confirm", True))
+    dry_run = bool(args.get("dry_run", False))
+    if not confirm:
+        dry_run = True
 
     restore_files = bool(args.get("restore_files", True))
     rewind_conversation = bool(args.get("rewind_conversation", False))
@@ -313,6 +311,8 @@ def handle_restore(
         file_path=file_path,
         file_paths=file_paths,
         working_dir=working_dir,
+        dry_run=dry_run,
+        confirm=confirm,
     )
     return json.dumps(res, indent=2, default=str)
 
@@ -357,6 +357,10 @@ def handle_recover(
     verify_command = args.get("verify_command")
     auto_verify = bool(args.get("auto_verify", True))
 
+    dry_run = bool(args.get("dry_run", False))
+    if not confirm:
+        dry_run = True
+
     res = ledger.recover(
         session_id=session_id,
         error_summary=error_summary,
@@ -365,6 +369,7 @@ def handle_recover(
         working_dir=working_dir,
         verify_command=verify_command,
         auto_verify=auto_verify,
+        dry_run=dry_run,
     )
     return json.dumps(res, indent=2, default=str)
 

@@ -10,6 +10,7 @@ import json
 import re
 import logging
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -18,7 +19,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,52 @@ def validate_safe_path(working_dir: str, rel_path: str) -> Path:
     if target != root and root not in target.parents:
         raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}")
     return target
+
+
+SAFE_TEST_RUNNERS = frozenset({
+    "pytest", "python", "python3", "py", "unittest",
+    "npm", "pnpm", "yarn", "bun",
+    "cargo", "go",
+    "ruff", "flake8", "mypy", "vitest", "jest",
+})
+
+FORBIDDEN_SHELL_PATTERNS = (";", "&&", "||", "|", "`", "$(", ">", "<", "\n", "\r")
+
+
+def validate_verify_command(command: str) -> Tuple[bool, Optional[List[str]], str]:
+    """
+    Validates a command string for auto-verification against command-injection, shell
+    operators, and unauthorized executables. Returns (is_valid, parsed_args, reason).
+    """
+    if not command or not isinstance(command, str):
+        return False, None, "Verification command is empty or not a string."
+
+    for pattern in FORBIDDEN_SHELL_PATTERNS:
+        if pattern in command:
+            return False, None, f"Verification command contains forbidden shell operator: {pattern!r}"
+
+    try:
+        args = shlex.split(command, posix=(os.name != "nt"))
+        args = [a.strip('\'"') for a in args if a.strip('\'"')]
+    except Exception as e:
+        return False, None, f"Failed parsing command arguments: {e}"
+
+    if not args:
+        return False, None, "Parsed command arguments list is empty."
+
+    raw_exe = args[0]
+    exe_name = Path(raw_exe).name.lower()
+    if exe_name.endswith(".exe"):
+        exe_name = exe_name[:-4]
+
+    if exe_name not in SAFE_TEST_RUNNERS:
+        return False, None, f"Executable '{exe_name}' is not in safe test runner allowlist ({', '.join(sorted(SAFE_TEST_RUNNERS))})."
+
+    if exe_name in {"python", "python3", "py"}:
+        if "-m" not in args:
+            return False, None, "Python verification commands must invoke a module via '-m' (e.g. 'python -m pytest' or 'python -m unittest')."
+
+    return True, args, ""
 
 
 def file_exists_in_commit(
@@ -245,14 +292,6 @@ class TimeMachineLedger:
                 pass
             conn.commit()
 
-    def _get_checkpoint_manager(self):
-        try:
-            from tools.checkpoint_manager import CheckpointManager
-            return CheckpointManager(enabled=True)
-        except Exception as exc:
-            logger.debug("CheckpointManager import failed: %s", exc)
-            return None
-
     def _get_session_db(self):
         try:
             from hermes_state import SessionDB
@@ -291,18 +330,53 @@ class TimeMachineLedger:
 
     def ensure_and_get_checkpoint(self, working_dir: str, reason: str) -> Optional[str]:
         abs_dir = str(Path(working_dir).expanduser().resolve())
-        mgr = self._get_checkpoint_manager()
-        if mgr is not None:
+        store_dir = self.hermes_home / "checkpoints" / "store"
+        if store_dir.exists():
+            hash16 = self._project_hash16(abs_dir)
+            idx = store_dir / "indexes" / hash16
+            idx.parent.mkdir(parents=True, exist_ok=True)
+            env = {
+                **os.environ,
+                "GIT_DIR": str(store_dir),
+                "GIT_WORK_TREE": abs_dir,
+                "GIT_INDEX_FILE": str(idx),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
             try:
-                if hasattr(mgr, "new_turn"):
-                    mgr.new_turn()
-                mgr.ensure_checkpoint(abs_dir, reason=reason)
-                checkpoints = mgr.list_checkpoints(abs_dir)
-                if checkpoints:
-                    return checkpoints[0].get("hash")
+                subprocess.run(["git", "add", "-A"], cwd=abs_dir, env=env, capture_output=True, timeout=10)
+                tree_res = subprocess.run(["git", "write-tree"], cwd=abs_dir, env=env, capture_output=True, text=True, timeout=5)
+                if tree_res.returncode == 0 and tree_res.stdout.strip():
+                    tree_sha = tree_res.stdout.strip()
+                    parent_sha = self._read_shadow_ref_tip(abs_dir)
+                    cmd = ["git", "commit-tree", tree_sha, "-m", reason or "checkpoint"]
+                    if parent_sha:
+                        cmd.extend(["-p", parent_sha])
+                    commit_res = subprocess.run(cmd, cwd=abs_dir, env=env, capture_output=True, text=True, timeout=5)
+                    if commit_res.returncode == 0 and commit_res.stdout.strip():
+                        new_sha = commit_res.stdout.strip()
+                        subprocess.run(
+                            ["git", "update-ref", f"refs/hermes/{hash16}", new_sha],
+                            cwd=abs_dir,
+                            env=env,
+                            capture_output=True,
+                            timeout=5,
+                        )
+                        return new_sha
             except Exception as exc:
-                logger.warning("CheckpointManager.ensure_checkpoint failed: %s", exc)
-        return self._read_shadow_ref_tip(abs_dir)
+                logger.debug("Shadow git checkpoint failed: %s", exc)
+
+        tip = self._read_shadow_ref_tip(abs_dir)
+        if tip:
+            return tip
+        try:
+            loc_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=abs_dir, capture_output=True, text=True, timeout=3)
+            if loc_res.returncode == 0 and loc_res.stdout.strip():
+                return loc_res.stdout.strip()
+        except Exception:
+            pass
+        return None
 
     def _get_message_watermark(self, session_id: str) -> tuple[Optional[int], int]:
         state_db = self.hermes_home / "state.db"
@@ -426,15 +500,29 @@ class TimeMachineLedger:
 
         if tool_name in MUTATING_TOOLS and status == "ok":
             post_hash = self.ensure_and_get_checkpoint(wdir, reason=f"post:{tool_name}") or post_hash
-            mgr = self._get_checkpoint_manager()
-            if mgr is not None:
+            if post_hash and snap.get("checkpoint_hash"):
+                base_h = snap["checkpoint_hash"]
+                store_dir = self.hermes_home / "checkpoints" / "store"
                 try:
-                    checkpoints = mgr.list_checkpoints(wdir)
-                    if checkpoints:
-                        latest = checkpoints[0]
-                        files_changed = int(latest.get("files_changed") or 0)
-                        insertions = int(latest.get("insertions") or 0)
-                        deletions = int(latest.get("deletions") or 0)
+                    env = {"GIT_DIR": str(store_dir), **os.environ} if store_dir.exists() else None
+                    stat_res = subprocess.run(
+                        ["git", "diff", "--shortstat", base_h, post_hash],
+                        cwd=wdir,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if stat_res.returncode == 0 and stat_res.stdout.strip():
+                        m_f = re.search(r"(\d+)\s+file", stat_res.stdout)
+                        m_i = re.search(r"(\d+)\s+insertion", stat_res.stdout)
+                        m_d = re.search(r"(\d+)\s+deletion", stat_res.stdout)
+                        if m_f:
+                            files_changed = int(m_f.group(1))
+                        if m_i:
+                            insertions = int(m_i.group(1))
+                        if m_d:
+                            deletions = int(m_d.group(1))
                 except Exception:
                     pass
 
@@ -540,32 +628,42 @@ class TimeMachineLedger:
                 } | {
                     r.get("post_checkpoint_hash") for r in rows if r.get("post_checkpoint_hash")
                 }
-                mgr = self._get_checkpoint_manager()
-                if mgr is not None:
+                store_dir = self.hermes_home / "checkpoints" / "store"
+                hash16 = self._project_hash16(target_dir)
+                if store_dir.exists():
                     try:
-                        for cp in mgr.list_checkpoints(target_dir)[:limit]:
-                            cp_hash = cp.get("hash")
-                            if cp_hash and cp_hash not in known_hashes:
-                                rows.append({
-                                    "id": f"cp_{cp.get('short_hash', cp_hash[:8])}",
-                                    "session_id": session_id or "shadow-store",
-                                    "turn_id": None,
-                                    "tool_call_id": None,
-                                    "tool_name": "checkpoint",
-                                    "tool_args_summary": cp.get("reason", "auto checkpoint"),
-                                    "working_dir": str(Path(target_dir).expanduser().resolve()),
-                                    "checkpoint_hash": cp_hash,
-                                    "post_checkpoint_hash": cp_hash,
-                                    "reason": cp.get("reason", "checkpoint"),
-                                    "message_id_watermark": None,
-                                    "message_count_watermark": 0,
-                                    "status": "ok",
-                                    "duration_ms": None,
-                                    "files_changed": int(cp.get("files_changed") or 0),
-                                    "insertions": int(cp.get("insertions") or 0),
-                                    "deletions": int(cp.get("deletions") or 0),
-                                    "created_at": time.time(),
-                                })
+                        log_res = subprocess.run(
+                            ["git", f"--git-dir={store_dir}", "log", f"-n{limit}", "--format=%H|%h|%s|%ct", f"refs/hermes/{hash16}"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if log_res.returncode == 0:
+                            for line in log_res.stdout.splitlines():
+                                parts = line.strip().split("|")
+                                if len(parts) >= 4:
+                                    cp_h, cp_sh, cp_reason, cp_ts = parts[0], parts[1], parts[2], float(parts[3])
+                                    if cp_h not in known_hashes:
+                                        rows.append({
+                                            "id": f"cp_{cp_sh}",
+                                            "session_id": session_id or "shadow-store",
+                                            "turn_id": None,
+                                            "tool_call_id": None,
+                                            "tool_name": "checkpoint",
+                                            "tool_args_summary": cp_reason or "checkpoint",
+                                            "working_dir": str(Path(target_dir).expanduser().resolve()),
+                                            "checkpoint_hash": cp_h,
+                                            "post_checkpoint_hash": cp_h,
+                                            "reason": cp_reason or "checkpoint",
+                                            "message_id_watermark": None,
+                                            "message_count_watermark": 0,
+                                            "status": "ok",
+                                            "duration_ms": None,
+                                            "files_changed": 0,
+                                            "insertions": 0,
+                                            "deletions": 0,
+                                            "created_at": cp_ts,
+                                        })
                     except Exception:
                         pass
 
@@ -669,33 +767,25 @@ class TimeMachineLedger:
             except Exception as exc:
                 logger.debug("arbitrary diff error: %s", exc)
 
-        # Case 3: Single commit delta (target_hash~1 .. target_hash or CheckpointManager.diff)
+        # Case 3: Single commit delta (target_hash~1 .. target_hash via git show)
         if not diff_text and mode != "working_tree":
-            mgr = self._get_checkpoint_manager()
-            if mgr is not None:
-                try:
-                    diff_text = mgr.diff(wdir, target_hash) or ""
-                except Exception:
-                    pass
-
-            if not diff_text:
-                try:
-                    res = subprocess.run(
-                        ["git", "show", target_hash, "--format="],
-                        cwd=wdir,
-                        env=env if store_dir.exists() else None,
-                        capture_output=True,
-                        text=True,
-                        timeout=15,
-                    )
-                    if res.returncode == 0:
-                        diff_text = res.stdout
-                    else:
-                        res_loc = subprocess.run(["git", "show", target_hash, "--format="], cwd=wdir, capture_output=True, text=True, timeout=15)
-                        if res_loc.returncode == 0:
-                            diff_text = res_loc.stdout
-                except Exception as exc:
-                    logger.debug("git show fallback error: %s", exc)
+            try:
+                res = subprocess.run(
+                    ["git", "show", target_hash, "--format="],
+                    cwd=wdir,
+                    env=env if store_dir.exists() else None,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if res.returncode == 0:
+                    diff_text = res.stdout
+                else:
+                    res_loc = subprocess.run(["git", "show", target_hash, "--format="], cwd=wdir, capture_output=True, text=True, timeout=15)
+                    if res_loc.returncode == 0:
+                        diff_text = res_loc.stdout
+            except Exception as exc:
+                logger.debug("git show fallback error: %s", exc)
 
         files_structured = parse_unified_diff(diff_text)
         tot_adds = sum(f["additions"] for f in files_structured)
@@ -732,6 +822,8 @@ class TimeMachineLedger:
         file_path: Optional[str] = None,
         file_paths: Optional[List[str]] = None,
         working_dir: Optional[str] = None,
+        dry_run: bool = False,
+        confirm: bool = True,
     ) -> Dict[str, Any]:
         snap = self.get_snapshot(snapshot_id)
         commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
@@ -783,6 +875,38 @@ class TimeMachineLedger:
                     "error": f"No checkpoint hash available for snapshot '{snapshot_id}'.",
                 }
 
+            store_dir = self.hermes_home / "checkpoints" / "store"
+            hash16 = self._project_hash16(wdir)
+            env = {
+                **os.environ,
+                "GIT_DIR": str(store_dir),
+                "GIT_WORK_TREE": str(Path(wdir).resolve()),
+                "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
+            }
+
+            # First-Class Dry-Run Preview Mode: Return planned changes without modifying disk
+            if dry_run or not confirm:
+                planned_restored = []
+                planned_unlinked = []
+                if validated_targets:
+                    for rel_tf, abs_tf in validated_targets:
+                        if file_exists_in_commit(commit_hash, rel_tf, wdir, store_dir):
+                            planned_restored.append(rel_tf)
+                        elif abs_tf.exists():
+                            planned_unlinked.append(rel_tf)
+                else:
+                    planned_restored = ["all"]
+
+                return {
+                    **result,
+                    "ok": True,
+                    "dry_run": True,
+                    "files_restored": False,
+                    "planned_restored_files": planned_restored,
+                    "planned_deleted_stray_files": planned_unlinked,
+                    "message": "Dry-run preview complete. No files were modified on disk. Set confirm=true to apply changes.",
+                }
+
             # 1. "Rollback of a Rollback" Safety Backup: Capture pre-restore safety snapshot
             try:
                 safety_snap = self.record_pre_tool(
@@ -799,15 +923,6 @@ class TimeMachineLedger:
                     result["pre_restore_backup_id"] = safety_snap.get("id")
             except Exception as exc:
                 logger.warning("Could not capture pre-restore safety snapshot: %s", exc)
-
-            store_dir = self.hermes_home / "checkpoints" / "store"
-            hash16 = self._project_hash16(wdir)
-            env = {
-                **os.environ,
-                "GIT_DIR": str(store_dir),
-                "GIT_WORK_TREE": str(Path(wdir).resolve()),
-                "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
-            }
 
             # 2. Surgical File Restoration (Handles newly created files without git pathspec failure)
             if validated_targets:
@@ -836,15 +951,34 @@ class TimeMachineLedger:
                             else:
                                 errors.append(f"{rel_tf}: {res.stderr or res_loc.stderr or 'checkout failed'}")
                     else:
-                        # Newly created file that did not exist in commit_hash: unlink from disk!
+                        # Newly created file that did not exist in commit_hash: unlink safely
                         if abs_tf.exists():
                             try:
-                                if abs_tf.is_file():
+                                if abs_tf.is_file() or abs_tf.is_symlink():
                                     abs_tf.unlink()
+                                    unlinked.append(rel_tf)
+                                    restored_any = True
                                 elif abs_tf.is_dir():
-                                    shutil.rmtree(abs_tf, ignore_errors=True)
-                                unlinked.append(rel_tf)
-                                restored_any = True
+                                    # Directory Deletion Guard: do not blindly call rmtree
+                                    dir_files = [f for f in abs_tf.rglob("*") if f.is_file()]
+                                    all_post = True
+                                    for df in dir_files:
+                                        rel_df = str(df.relative_to(Path(wdir).resolve())).replace("\\", "/")
+                                        if file_exists_in_commit(commit_hash, rel_df, wdir, store_dir):
+                                            all_post = False
+                                            break
+                                    if all_post and len(dir_files) <= 50:
+                                        for df in dir_files:
+                                            try:
+                                                df.unlink()
+                                                rel_df = str(df.relative_to(Path(wdir).resolve())).replace("\\", "/")
+                                                unlinked.append(rel_df)
+                                            except OSError:
+                                                pass
+                                        shutil.rmtree(abs_tf, ignore_errors=True)
+                                        restored_any = True
+                                    else:
+                                        errors.append(f"Directory {rel_tf} contains existing files or exceeds safe limit; skipped rmtree.")
                             except OSError as rm_err:
                                 errors.append(f"Could not remove newly created {rel_tf}: {rm_err}")
 
@@ -856,40 +990,31 @@ class TimeMachineLedger:
                     return result
 
             else:
-                # Full Workspace Restoration
-                mgr = self._get_checkpoint_manager()
-                if mgr is not None:
-                    restore_res = mgr.restore(wdir, commit_hash)
-                    result["checkpoint_restore_result"] = restore_res
-                    if isinstance(restore_res, dict) and not restore_res.get("ok", True):
-                        result["ok"] = False
-                        result["error"] = (
-                            restore_res.get("error")
-                            or restore_res.get("reason")
-                            or "CheckpointManager.restore returned ok=False"
-                        )
-                        return result
-                    if restore_res is False:
-                        result["ok"] = False
-                        result["error"] = "CheckpointManager.restore returned False"
-                        return result
+                # Full Workspace Restoration via git checkout -f
+                res = subprocess.run(
+                    ["git", "checkout", "-f", commit_hash],
+                    cwd=wdir,
+                    env=env if store_dir.exists() else None,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if res.returncode == 0:
                     result["files_restored"] = True
                 else:
-                    res = subprocess.run(
+                    res_loc = subprocess.run(
                         ["git", "checkout", "-f", commit_hash],
                         cwd=wdir,
-                        env=env if store_dir.exists() else None,
                         capture_output=True,
                         text=True,
-                        timeout=15,
+                        timeout=30,
                     )
-                    if res.returncode != 0:
-                        res_loc = subprocess.run(["git", "checkout", "-f", commit_hash], cwd=wdir, capture_output=True, text=True, timeout=15)
-                        if res_loc.returncode != 0:
-                            result["ok"] = False
-                            result["error"] = res.stderr or res_loc.stderr or "git checkout failed"
-                            return result
-                    result["files_restored"] = True
+                    if res_loc.returncode == 0:
+                        result["files_restored"] = True
+                    else:
+                        result["ok"] = False
+                        result["error"] = res.stderr or res_loc.stderr or "git checkout -f failed"
+                        return result
 
                 # Clean up newly-created files recorded in subsequent snapshots of this session
                 if snap and snap.get("session_id"):
@@ -1042,13 +1167,15 @@ class TimeMachineLedger:
             try:
                 with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
                     conn.row_factory = sqlite3.Row
-                    parent_row = conn.execute(
-                        "SELECT * FROM sessions WHERE id = ?", (parent_session_id,)
-                    ).fetchone()
-                    if parent_row:
-                        parent_meta = dict(parent_row)
+                    tbls = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                    if "sessions" in tbls:
+                        parent_row = conn.execute(
+                            "SELECT * FROM sessions WHERE id = ?", (parent_session_id,)
+                        ).fetchone()
+                        if parent_row:
+                            parent_meta = dict(parent_row)
             except Exception as exc:
-                logger.warning("Could not read parent session %s: %s", parent_session_id, exc)
+                logger.debug("Could not read parent session %s: %s", parent_session_id, exc)
 
         title = branch_title or (
             f"{parent_meta.get('title') or parent_session_id} [branch @{snap['id'][:12]}]"
@@ -1080,104 +1207,99 @@ class TimeMachineLedger:
                     logger.debug("SessionDB.create_session fallback: %s", exc)
 
         if state_db_path.exists():
-            with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
-                conn.row_factory = sqlite3.Row
-                if not created_via_db:
-                    conn.execute(
-                        """
-                        INSERT INTO sessions (
-                            id, source, user_id, model, system_prompt,
-                            parent_session_id, title, started_at, message_count
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                        """,
-                        (
-                            new_session_id,
-                            parent_meta.get("source") or "cli",
-                            parent_meta.get("user_id"),
-                            parent_meta.get("model"),
-                            parent_meta.get("system_prompt"),
-                            parent_session_id,
-                            title,
-                            time.time(),
-                        ),
-                    )
-                else:
-                    try:
-                        conn.execute(
-                            "UPDATE sessions SET title = ? WHERE id = ?",
-                            (title, new_session_id),
-                        )
-                    except Exception:
-                        pass
+            try:
+                with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
+                    conn.row_factory = sqlite3.Row
+                    tbls = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
-                if watermark_id is not None:
-                    msg_rows = conn.execute(
-                        """
-                        SELECT role, content, tool_call_id, tool_calls, name,
-                               timestamp, token_count, finish_reason, reasoning,
-                               reasoning_details, codex_reasoning_items
-                        FROM messages
-                        WHERE session_id = ? AND COALESCE(active, 1) = 1 AND id <= ?
-                        ORDER BY id ASC
-                        """,
-                        (parent_session_id, watermark_id),
-                    ).fetchall()
-                else:
-                    msg_rows = conn.execute(
-                        """
-                        SELECT role, content, tool_call_id, tool_calls, name,
-                               timestamp, token_count, finish_reason, reasoning,
-                               reasoning_details, codex_reasoning_items
-                        FROM messages
-                        WHERE session_id = ? AND COALESCE(active, 1) = 1
-                        ORDER BY id ASC
-                        """,
-                        (parent_session_id,),
-                    ).fetchall()
+                    if "sessions" in tbls:
+                        if not created_via_db:
+                            conn.execute(
+                                """
+                                INSERT INTO sessions (
+                                    id, source, user_id, model, system_prompt,
+                                    parent_session_id, title, started_at, message_count
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                """,
+                                (
+                                    new_session_id,
+                                    parent_meta.get("source") or "cli",
+                                    parent_meta.get("user_id"),
+                                    parent_meta.get("model"),
+                                    parent_meta.get("system_prompt"),
+                                    parent_session_id,
+                                    title,
+                                    time.time(),
+                                ),
+                            )
+                        else:
+                            try:
+                                conn.execute(
+                                    "UPDATE sessions SET title = ? WHERE id = ?",
+                                    (title, new_session_id),
+                                )
+                            except Exception:
+                                pass
 
-                for m in msg_rows:
-                    conn.execute(
-                        """
-                        INSERT INTO messages (
-                            session_id, role, content, tool_call_id, tool_calls,
-                            name, timestamp, token_count, finish_reason,
-                            reasoning, reasoning_details, codex_reasoning_items, active
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                        """,
-                        (
-                            new_session_id,
-                            m["role"],
-                            m["content"],
-                            m["tool_call_id"],
-                            m["tool_calls"],
-                            m["name"],
-                            m["timestamp"] or time.time(),
-                            m["token_count"],
-                            m["finish_reason"],
-                            m["reasoning"],
-                            m["reasoning_details"],
-                            m["codex_reasoning_items"],
-                        ),
-                    )
-                    copied_messages += 1
+                    if "messages" in tbls:
+                        table_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+                        potential_cols = [
+                            "role", "content", "tool_call_id", "tool_calls", "name",
+                            "timestamp", "token_count", "finish_reason", "reasoning",
+                            "reasoning_details", "codex_reasoning_items"
+                        ]
+                        avail_cols = [c for c in potential_cols if c in table_cols]
 
-                conn.execute(
-                    "UPDATE sessions SET message_count = ? WHERE id = ?",
-                    (copied_messages, new_session_id),
-                )
-                conn.commit()
+                        if avail_cols:
+                            select_cols_str = ", ".join(avail_cols)
+                            where_sql = "WHERE session_id = ? AND COALESCE(active, 1) = 1"
+                            q_params = [parent_session_id]
+                            if watermark_id is not None and "id" in table_cols:
+                                where_sql += " AND id <= ?"
+                                q_params.append(watermark_id)
+                            order_sql = "ORDER BY id ASC" if "id" in table_cols else ""
+
+                            msg_rows = conn.execute(
+                                f"SELECT {select_cols_str} FROM messages {where_sql} {order_sql}",
+                                tuple(q_params),
+                            ).fetchall()
+
+                            insert_cols = ["session_id"] + avail_cols
+                            if "active" in table_cols:
+                                insert_cols.append("active")
+                            placeholders = ", ".join(["?"] * len(insert_cols))
+                            insert_sql = f"INSERT INTO messages ({', '.join(insert_cols)}) VALUES ({placeholders})"
+
+                            for m in msg_rows:
+                                row_vals = [new_session_id] + [m[c] for c in avail_cols]
+                                if "active" in table_cols:
+                                    row_vals.append(1)
+                                conn.execute(insert_sql, tuple(row_vals))
+                                copied_messages += 1
+
+                    if "sessions" in tbls:
+                        try:
+                            conn.execute(
+                                "UPDATE sessions SET message_count = ? WHERE id = ?",
+                                (copied_messages, new_session_id),
+                            )
+                        except Exception:
+                            pass
+                    conn.commit()
+            except Exception as exc:
+                logger.debug("State DB branch synchronization: %s", exc)
 
         files_restored = False
         restore_details = None
         if restore_files and commit_hash:
-            mgr = self._get_checkpoint_manager()
-            if mgr is not None:
-                restore_details = mgr.restore(wdir, commit_hash)
-                files_restored = bool(
-                    restore_details.get("ok", True)
-                    if isinstance(restore_details, dict)
-                    else True
-                )
+            restore_details = self.restore_snapshot(
+                snapshot_id=snapshot_id,
+                restore_files=True,
+                rewind_conversation=False,
+                working_dir=wdir,
+                confirm=True,
+            )
+            files_restored = bool(restore_details.get("ok", False))
 
         return {
             "ok": True,
@@ -1421,6 +1543,7 @@ class TimeMachineLedger:
         working_dir: Optional[str] = None,
         verify_command: Optional[str] = None,
         auto_verify: bool = True,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         """
         Autonomous self-healing recovery: diagnoses root-cause culprits, optionally
@@ -1433,31 +1556,44 @@ class TimeMachineLedger:
             working_dir=working_dir,
         )
 
+        culprit_files = diag.get("culprit_files") or []
+        preserved_files = diag.get("preserved_files") or []
+        rec_id = diag.get("recommended_snapshot_id")
+
         result = {
             "ok": True,
             "diagnosis": diag,
             "auto_applied": False,
             "restored_files": [],
+            "preserved_files": preserved_files,
             "pre_restore_backup_id": None,
             "retry_command": diag.get("retry_command"),
             "verification": None,
         }
 
-        if not auto_apply:
+        # First-Class Dry-Run Preview Mode
+        if not auto_apply or not confirm or dry_run:
+            dry_details = None
+            if rec_id:
+                dry_details = self.restore_snapshot(
+                    snapshot_id=rec_id,
+                    file_paths=culprit_files if culprit_files else None,
+                    working_dir=diag.get("working_dir") or working_dir,
+                    restore_files=True,
+                    dry_run=True,
+                    confirm=False,
+                )
+            result["dry_run"] = True
+            result["recommended_snapshot_id"] = rec_id
+            result["planned_restored_files"] = dry_details.get("planned_restored_files", culprit_files) if dry_details else culprit_files
+            result["planned_deleted_stray_files"] = dry_details.get("planned_deleted_stray_files", []) if dry_details else []
             result["message"] = (
-                f"Diagnostic complete. {diag['explanation']} "
-                f"Call with auto_apply=true and confirm=true to automatically revert."
+                f"Dry-run recovery preview complete. {diag.get('explanation', '')} "
+                f"Culprits: {culprit_files}. Preserved: {preserved_files}. "
+                f"No files were modified on disk. Call with auto_apply=true and confirm=true to execute."
             )
             return result
 
-        if not confirm:
-            return {
-                **result,
-                "ok": False,
-                "error": "Confirmation guard required: set confirm=true to execute autonomous recovery.",
-            }
-
-        rec_id = diag.get("recommended_snapshot_id")
         if not rec_id:
             return {
                 **result,
@@ -1465,13 +1601,13 @@ class TimeMachineLedger:
                 "error": "Cannot auto-recover: no valid safe snapshot identified.",
             }
 
-        culprit_files = diag.get("culprit_files")
         restore_res = self.restore_snapshot(
             snapshot_id=rec_id,
             file_paths=culprit_files if culprit_files else None,
             working_dir=diag.get("working_dir") or working_dir,
             restore_files=True,
             rewind_conversation=False,
+            confirm=True,
         )
 
         if not restore_res.get("ok"):
@@ -1487,7 +1623,7 @@ class TimeMachineLedger:
         result["unlinked_new_files"] = restore_res.get("unlinked_new_files")
         result["pre_restore_backup_id"] = restore_res.get("pre_restore_backup_id")
 
-        # Auto-Verification
+        # Auto-Verification (with shell=False and strict command allowlist)
         verification_info = None
         wdir_target = diag.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
         cmd_candidate = (
@@ -1499,39 +1635,49 @@ class TimeMachineLedger:
             cmd_candidate = cmd_candidate.split("=", 1)[1].strip()
 
         if auto_verify and cmd_candidate:
-            try:
-                v_res = subprocess.run(
-                    cmd_candidate,
-                    shell=True,
-                    cwd=wdir_target,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                passed = (v_res.returncode == 0)
-                out_snippet = (v_res.stdout.strip() or v_res.stderr.strip())
-                lines = out_snippet.splitlines()
-                summary = "\n".join(lines[-5:]) if len(lines) > 5 else out_snippet[:300]
-                verification_info = {
-                    "command": cmd_candidate,
-                    "exit_code": v_res.returncode,
-                    "passed": passed,
-                    "output_summary": summary,
-                }
-            except subprocess.TimeoutExpired:
+            is_valid, parsed_args, reason = validate_verify_command(cmd_candidate)
+            if not is_valid:
                 verification_info = {
                     "command": cmd_candidate,
                     "exit_code": -1,
                     "passed": False,
-                    "output_summary": "Verification command timed out after 15s.",
+                    "output_summary": f"Verification command rejected by security policy: {reason}",
                 }
-            except Exception as v_err:
-                verification_info = {
-                    "command": cmd_candidate,
-                    "exit_code": -1,
-                    "passed": False,
-                    "output_summary": f"Verification error: {v_err}",
-                }
+            else:
+                try:
+                    v_res = subprocess.run(
+                        parsed_args,
+                        shell=False,
+                        cwd=wdir_target,
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=15,
+                    )
+                    passed = (v_res.returncode == 0)
+                    out_snippet = (v_res.stdout.strip() or v_res.stderr.strip())
+                    lines = out_snippet.splitlines()
+                    summary = "\n".join(lines[-5:]) if len(lines) > 5 else out_snippet[:300]
+                    verification_info = {
+                        "command": cmd_candidate,
+                        "exit_code": v_res.returncode,
+                        "passed": passed,
+                        "output_summary": summary,
+                    }
+                except subprocess.TimeoutExpired:
+                    verification_info = {
+                        "command": cmd_candidate,
+                        "exit_code": -1,
+                        "passed": False,
+                        "output_summary": "Verification command timed out after 15s.",
+                    }
+                except Exception as v_err:
+                    verification_info = {
+                        "command": cmd_candidate,
+                        "exit_code": -1,
+                        "passed": False,
+                        "output_summary": f"Verification error: {v_err}",
+                    }
 
         result["verification"] = verification_info
         v_msg = ""

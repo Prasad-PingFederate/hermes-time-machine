@@ -113,10 +113,14 @@ def run_demo(
             encoding="utf-8",
         )
         test_py.write_text(
+            'import unittest\n'
             'from billing import calculate_total\n'
             'from tax import get_tax_rate\n\n'
-            'def test_calculate_total():\n'
-            '    assert calculate_total(100.0, get_tax_rate()) == 108.0\n',
+            'class TestBilling(unittest.TestCase):\n'
+            '    def test_calculate_total(self):\n'
+            '        self.assertEqual(calculate_total(100.0, get_tax_rate()), 108.0)\n\n'
+            'if __name__ == "__main__":\n'
+            '    unittest.main()\n',
             encoding="utf-8",
         )
 
@@ -126,8 +130,19 @@ def run_demo(
         res_sha = _run_cmd(["git", "rev-parse", "HEAD"], cwd=wdir)
         sha1 = res_sha.stdout.strip()
 
+        # Detect available test runner (pytest if installed, otherwise standard unittest)
+        has_pytest = False
+        try:
+            check_pt = _run_cmd([sys.executable, "-m", "pytest", "--version"], cwd=wdir)
+            has_pytest = (check_pt.returncode == 0)
+        except Exception:
+            has_pytest = False
+
+        runner_cmd_list = [sys.executable, "-m", "pytest", str(test_py)] if has_pytest else [sys.executable, "-m", "unittest", "test_billing.py"]
+        runner_verify_str = f'"{sys.executable}" -m pytest "{test_py}"' if has_pytest else f'"{sys.executable}" -m unittest test_billing.py'
+
         # Run test to verify initial pass
-        t_res = _run_cmd([sys.executable, "-m", "pytest", str(test_py)], cwd=wdir)
+        t_res = _run_cmd(runner_cmd_list, cwd=wdir)
         step1_pass = t_res.returncode == 0
 
         # Snapshot baseline in Time Machine
@@ -216,15 +231,15 @@ def run_demo(
         dump_file = target_dir / "debug_dump.tmp"
         dump_file.write_text("DEBUG LOG: memory dump 0xDEADBEEF\n", encoding="utf-8")
 
-        # Run pytest -> EXPECT FAILURE
-        t_fail = _run_cmd([sys.executable, "-m", "pytest", str(test_py)], cwd=wdir)
+        # Run test -> EXPECT FAILURE
+        t_fail = _run_cmd(runner_cmd_list, cwd=wdir)
         step3_failed = t_fail.returncode != 0
 
         snap3 = demo_ledger.record_pre_tool(
             session_id="demo_session",
             turn_id="turn_003",
             tool_name="terminal",
-            args={"command": "pytest"},
+            args={"command": "pytest" if has_pytest else "python -m unittest"},
             working_dir=wdir,
         )
 
@@ -262,7 +277,7 @@ def run_demo(
             auto_apply=True,
             confirm=True,
             auto_verify=True,
-            verify_command=f'"{sys.executable}" -m pytest "{test_py}"',
+            verify_command=runner_verify_str,
             working_dir=wdir,
         )
         restore_res = recover_res
