@@ -1177,6 +1177,9 @@ function registerCapability(ctx, spec) {
 export default {
   id: PLUGIN_ID,
   name: 'Hermes Time Machine',
+  register(ctx) {
+    return this.activate(ctx);
+  },
   activate(ctx) {
     registerCapability(ctx, {
       id: 'time-machine-status',
