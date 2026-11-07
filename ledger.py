@@ -65,7 +65,7 @@ def validate_safe_path(working_dir: str, rel_path: str) -> Path:
 SAFE_TEST_RUNNERS = frozenset({
     "pytest", "python", "python3", "py", "unittest",
     "npm", "pnpm", "yarn", "bun",
-    "cargo", "go",
+    "cargo", "go", "uv",
     "ruff", "flake8", "mypy", "vitest", "jest",
 })
 
@@ -128,6 +128,13 @@ def validate_verify_command(command: str) -> Tuple[bool, Optional[List[str]], st
         if len(args) < 2 or args[1] != "test":
             return False, None, "Cargo verification commands must strictly invoke 'cargo test'."
 
+    elif exe_name == "uv":
+        if len(args) < 2 or args[1] != "run":
+            return False, None, "uv verification commands must strictly invoke 'uv run'."
+        sub_run = [a.lower() for a in args[2:]]
+        if not any(t in sub_run for t in ("pytest", "unittest", "test")):
+            return False, None, "uv run verification command must invoke pytest or test suite."
+
     elif exe_name == "go":
         if len(args) < 2 or args[1] != "test":
             return False, None, "Go verification commands must strictly invoke 'go test'."
@@ -179,6 +186,18 @@ def resolve_working_dir(
             p = Path(val).expanduser().resolve()
             if p.is_dir():
                 return str(p)
+
+    cmd = args.get("command") or args.get("cmd") or args.get("script")
+    if isinstance(cmd, str) and cmd.strip():
+        m = re.search(r'(?:^|[;&|\n])\s*cd\s+["\']?([^"\'&;\n\r|]+)["\']?', cmd)
+        if m:
+            target = m.group(1).strip()
+            try:
+                p = Path(target).expanduser().resolve()
+                if p.is_dir():
+                    return str(p)
+            except Exception:
+                pass
 
     for path_key in ("path", "file_path", "target_file", "filepath"):
         val = args.get(path_key)
@@ -474,6 +493,21 @@ class TimeMachineLedger:
             checkpoint_hash = self.ensure_and_get_checkpoint(wdir, reason=reason)
         else:
             checkpoint_hash = self._read_shadow_ref_tip(wdir)
+
+        # Fallback: ensure non-empty checkpoint_hash if wdir is a git repository
+        if not checkpoint_hash and Path(wdir).resolve().exists():
+            try:
+                g_head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=wdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if g_head.returncode == 0 and g_head.stdout.strip():
+                    checkpoint_hash = g_head.stdout.strip()
+            except Exception:
+                pass
 
         msg_id_wm, msg_count_wm = self._get_message_watermark(session_id)
         snap_id = f"snap_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -892,9 +926,13 @@ class TimeMachineLedger:
         if commit_hash is None:
             commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
         wdir = (
-            snap["working_dir"]
-            if snap and snap.get("working_dir")
-            else (working_dir or resolve_working_dir(hermes_home=self.hermes_home))
+            str(Path(working_dir).expanduser().resolve())
+            if (working_dir and str(working_dir).strip())
+            else (
+                snap.get("working_dir")
+                if (snap and snap.get("working_dir"))
+                else resolve_working_dir(hermes_home=self.hermes_home)
+            )
         )
 
         target_files = []
@@ -1494,7 +1532,15 @@ class TimeMachineLedger:
         snaps = self.list_snapshots(session_id=sess, limit=50)
         if not snaps and working_dir:
             snaps = self.list_snapshots(working_dir=working_dir, limit=50)
-        wdir = working_dir or (snaps[0].get("working_dir") if snaps else resolve_working_dir(hermes_home=self.hermes_home))
+        wdir = (
+            str(Path(working_dir).expanduser().resolve())
+            if (working_dir and str(working_dir).strip())
+            else (
+                snaps[0].get("working_dir")
+                if snaps
+                else resolve_working_dir(hermes_home=self.hermes_home)
+            )
+        )
 
         err_msg = error_text or ""
         last_failed_command = ""
@@ -1538,6 +1584,24 @@ class TimeMachineLedger:
             if last_path:
                 implicated_files.append(str(last_path).replace("\\", "/").lstrip("/"))
 
+        # If still no implicated files, parse error_text / traceback directly for files existing in wdir
+        if not implicated_files and err_msg:
+            try:
+                p_wdir = Path(wdir).resolve()
+                candidates = re.findall(
+                    r'(?:FAILED\s+)?([a-zA-Z0-9_\-\\\/\.]+\.[a-zA-Z0-9_]+)(?:::|:|\s|,|\"|\'|\))',
+                    err_msg,
+                )
+                for cand in candidates:
+                    cand_clean = cand.replace("\\", "/").strip().lstrip("/")
+                    if cand_clean.endswith((".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".toml", ".rs", ".go")):
+                        check_file = p_wdir / cand_clean
+                        if check_file.exists() and check_file.is_file():
+                            if cand_clean not in implicated_files:
+                                implicated_files.append(cand_clean)
+            except Exception:
+                pass
+
         culprit_paths = list(implicated_files)
 
         # Detect stray temporary files created during the failed turn (e.g. *.tmp, debug_dump*)
@@ -1552,27 +1616,86 @@ class TimeMachineLedger:
             pass
 
         # Identify the recommended snapshot:
-        # It MUST be the snapshot captured immediately BEFORE the culprit file was modified!
+        # Candidate snapshots MUST have a non-empty, valid commit hash!
         recommended_snap = None
         if culprit_paths and culprit_paths[0] in snap_for_file:
-            recommended_snap = snap_for_file[culprit_paths[0]]
-        elif file_mut_snaps:
-            recommended_snap = file_mut_snaps[-1]
-        elif snaps:
-            recommended_snap = snaps[-1]
+            cand = snap_for_file[culprit_paths[0]]
+            if cand.get("checkpoint_hash"):
+                recommended_snap = cand
+
+        if not recommended_snap and file_mut_snaps:
+            for s in reversed(file_mut_snaps):
+                if s.get("checkpoint_hash"):
+                    recommended_snap = s
+                    break
+
+        if not recommended_snap and snaps:
+            for s in reversed(snaps):
+                if s.get("checkpoint_hash"):
+                    recommended_snap = s
+                    break
 
         rec_id = recommended_snap.get("id") if recommended_snap else None
+        rec_commit = recommended_snap.get("checkpoint_hash") if recommended_snap else None
+
+        # Git Commit History Fallback:
+        # If there is no valid in-session snapshot before the culprit modification (or if the
+        # file was already broken at session start / prior commit like DealDash_ai_Bot e6f554e):
+        git_fallback_commit = None
+        if culprit_paths and Path(wdir).resolve().exists():
+            try:
+                primary_culprit = culprit_paths[0]
+                gl = subprocess.run(
+                    ["git", "log", "-n", "5", "--format=%H", "--", primary_culprit],
+                    cwd=wdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if gl.returncode == 0:
+                    hashes = [h.strip() for h in gl.stdout.splitlines() if h.strip()]
+                    if len(hashes) >= 2:
+                        # hashes[0] is current broken commit, hashes[1] is the good pre-regression commit
+                        git_fallback_commit = hashes[1]
+                    elif len(hashes) == 1:
+                        # Only 1 commit for this file; check if HEAD~1 exists
+                        h_prev = subprocess.run(
+                            ["git", "rev-parse", "HEAD~1"],
+                            cwd=wdir,
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if h_prev.returncode == 0 and h_prev.stdout.strip():
+                            git_fallback_commit = h_prev.stdout.strip()
+            except Exception as g_exc:
+                logger.debug("git log fallback error: %s", g_exc)
+
+        # Use git fallback commit if no in-session snapshot exists for this culprit
+        # or if the in-session snapshot had no checkpoint_hash
+        used_git_fallback = False
+        if (not rec_id or not rec_commit or (culprit_paths and culprit_paths[0] not in snap_for_file)) and git_fallback_commit:
+            rec_id = git_fallback_commit
+            rec_commit = git_fallback_commit
+            used_git_fallback = True
 
         # Preserved files: files modified in the session that are NOT in culprit_paths
         preserved_files = sorted([f for f in session_touched_files if f not in culprit_paths])
 
-        explanation = (
-            f"Diagnosed failure culprit file(s): [{', '.join(culprit_paths)}]. "
-            f"Preserving concurrent modifications in: [{', '.join(preserved_files)}]. "
-            f"Recommended safe checkpoint: {rec_id}."
-            if culprit_paths and rec_id
-            else "No specific modified files detected prior to command failure."
-        )
+        if used_git_fallback:
+            explanation = (
+                f"Diagnosed regression in [{', '.join(culprit_paths)}]. No in-session snapshot preceded this change; "
+                f"inspected git history and identified safe parent commit: {rec_id[:7]}. "
+                f"Preserving concurrent modifications in: [{', '.join(preserved_files)}]."
+            )
+        elif culprit_paths and rec_id:
+            explanation = (
+                f"Diagnosed failure culprit file(s): [{', '.join(culprit_paths)}]. "
+                f"Preserving concurrent modifications in: [{', '.join(preserved_files)}]. "
+                f"Recommended safe checkpoint: {rec_id}."
+            )
+        else:
+            explanation = "No specific modified files detected prior to command failure."
 
         return {
             "ok": True,

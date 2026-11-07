@@ -6,6 +6,7 @@ LIST_SCHEMA = {
         "properties": {
             "session_id": {"type": "string", "description": "Optional session ID. Defaults to current session."},
             "limit": {"type": "integer", "description": "Max snapshots to return", "default": 50},
+            "working_dir": {"type": "string", "description": "Optional working directory override."},
         },
     },
 }
@@ -133,6 +134,10 @@ SEARCH_SCHEMA = {
                 "type": "integer",
                 "description": "Maximum matching snapshots to return (default 10).",
                 "default": 10,
+            },
+            "working_dir": {
+                "type": "string",
+                "description": "Optional working directory override.",
             },
         },
         "required": ["query"],

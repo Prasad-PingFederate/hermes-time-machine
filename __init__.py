@@ -38,6 +38,22 @@ _last_safe_snapshot: Dict[str, str] = {}
 _session_working_dirs: Dict[str, str] = {}
 
 
+def extract_cd_target(cmd: Any) -> Optional[str]:
+    """Auto-detect target directory from cd / pushd commands in terminal tools."""
+    if not cmd or not isinstance(cmd, str):
+        return None
+    m = re.search(r'(?:^|[;&|\n])\s*cd\s+["\']?([^"\'&;\n\r|]+)["\']?', cmd)
+    if m:
+        target = m.group(1).strip()
+        try:
+            p = Path(target).expanduser().resolve()
+            if p.is_dir():
+                return str(p)
+        except Exception:
+            pass
+    return None
+
+
 def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     """Called by Hermes PluginManager on startup."""
     ledger = ledger or TimeMachineLedger()
@@ -74,7 +90,19 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
         try:
             sess = session_id or task_id or "default"
             args = args or {}
-            wdir = kwargs.get("working_dir") or args.get("working_dir") or _session_working_dirs.get(sess) or resolve_working_dir(args=args, session_id=sess)
+            cmd = args.get("command") or args.get("cmd") or args.get("script")
+            cd_dir = extract_cd_target(cmd) if cmd else None
+            if cd_dir:
+                _session_working_dirs[sess] = cd_dir
+
+            wdir = (
+                kwargs.get("working_dir")
+                or args.get("working_dir")
+                or cd_dir
+                or _session_working_dirs.get(sess)
+                or resolve_working_dir(args=args, session_id=sess)
+            )
+            _session_working_dirs[sess] = wdir
             snap = ledger.record_pre_tool(
                 session_id=sess,
                 turn_id=turn_id,
@@ -126,7 +154,17 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             self_heal = False
             rec_snap = None
             if is_cmd_tool and has_error:
-                wdir = kwargs.get("working_dir") or _session_working_dirs.get(sess)
+                cmd = args.get("command") or args.get("cmd") or args.get("script") if args else None
+                cd_dir = extract_cd_target(cmd) if cmd else None
+                if cd_dir:
+                    _session_working_dirs[sess] = cd_dir
+                wdir = (
+                    kwargs.get("working_dir")
+                    or cd_dir
+                    or _session_working_dirs.get(sess)
+                    or resolve_working_dir(args=args, session_id=sess)
+                )
+                _session_working_dirs[sess] = wdir
                 diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 rec_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
                 self_heal = bool(rec_snap)
@@ -174,7 +212,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 )
 
             if is_cmd_tool and has_error:
-                wdir = kwargs.get("working_dir") or _session_working_dirs.get(sess)
+                wdir = kwargs.get("working_dir") or _session_working_dirs.get(sess) or resolve_working_dir(session_id=sess)
                 diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 culprits = diag.get("culprit_files", [])
                 culprit_repr = repr(culprits) if culprits else "None"
@@ -191,6 +229,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 preserved = diag.get("preserved_files", [])
 
                 if target_snap:
+                    wdir_escaped = str(wdir).replace("\\", "/")
                     hint = (
                         f"\n\n[🛡️ Time Machine Self-Heal Notice & Recommendation]:\n"
                         f"Command failed after recent file mutations.\n"
@@ -198,9 +237,9 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                         f"• Preserved good file(s): {preserved if preserved else 'none'}\n"
                         f"• Recommended safe checkpoint: '{target_snap}' (Confidence: {conf})\n"
                         f"• Quick 1-call autonomous recovery:\n"
-                        f"  `time_machine_recover(auto_apply=true, confirm=true)`\n"
+                        f"  `time_machine_recover(auto_apply=true, confirm=true, working_dir='{wdir_escaped}')`\n"
                         f"• Or surgical restore:\n"
-                        f"  `time_machine_restore(snapshot_id='{target_snap}', file_paths={culprit_repr}, confirm=true)`"
+                        f"  `time_machine_restore(snapshot_id='{target_snap}', file_paths={culprit_repr}, confirm=true, working_dir='{wdir_escaped}')`"
                     )
                     return res_str + hint
         except Exception as exc:

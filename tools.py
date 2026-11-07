@@ -230,6 +230,10 @@ SEARCH_SCHEMA: Dict[str, Any] = {
                 "description": "Maximum matching snapshots to return (default 10).",
                 "default": 10,
             },
+            "working_dir": {
+                "type": "string",
+                "description": "Optional working directory override.",
+            },
         },
         "required": ["query"],
     },
@@ -387,12 +391,14 @@ def handle_search(
 
     session_id = args.get("session_id") or kwargs.get("session_id")
     file_path = args.get("file_path")
+    working_dir = args.get("working_dir")
     limit = int(args.get("limit") or 10)
 
     res = ledger.search_snapshots(
         query=query,
         session_id=session_id,
         file_path=file_path,
+        working_dir=working_dir,
         limit=limit,
     )
     return json.dumps(res, indent=2, default=str)

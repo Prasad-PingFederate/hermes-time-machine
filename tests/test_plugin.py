@@ -1047,6 +1047,48 @@ new file mode 100644
             valid, args, reason = validate_verify_command(exp)
             self.assertFalse(valid, f"Security vulnerability: {exp!r} was NOT blocked! Reason: {reason}")
 
+    def test_recover_git_history_fallback_single_call(self):
+        """Simulate DealDash_ai_Bot pre-existing git sabotage: 1-call autonomous self-healing via git history fallback."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo_path = Path(td)
+            subprocess.run(["git", "init"], cwd=str(repo_path), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test TM"], cwd=str(repo_path), check=True)
+            subprocess.run(["git", "config", "user.email", "tm@test.local"], cwd=str(repo_path), check=True)
+
+            test_file = repo_path / "test_feature.py"
+            test_file.write_text("def test_feature():\n    assert 1 == 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True)
+            subprocess.run(["git", "commit", "-m", "feat: working test"], cwd=str(repo_path), check=True)
+            c1 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_path), capture_output=True, text=True).stdout.strip()
+
+            # Commit 2: sabotaged test
+            test_file.write_text("def test_feature():\n    assert 1 == 2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True)
+            subprocess.run(["git", "commit", "-m", "sabotage: break test"], cwd=str(repo_path), check=True)
+
+            # Failure output simulating pytest
+            failure_output = "FAILED test_feature.py::test_feature - assert 1 == 2"
+
+            # Execute 1-call recover with no prior in-session snapshot
+            res = self.ledger.recover(
+                session_id="dealbot_demo_sess",
+                error_summary=failure_output,
+                auto_apply=True,
+                confirm=True,
+                working_dir=str(repo_path),
+                verify_command="python -m pytest test_feature.py",
+                auto_verify=True,
+            )
+
+            self.assertTrue(res.get("ok"), f"Recover failed: {res}")
+            self.assertTrue(res.get("auto_applied"))
+            self.assertIn("test_feature.py", res.get("restored_files", []))
+            self.assertIn(c1[:7], res.get("diagnosis", {}).get("explanation", ""))
+            self.assertIn("assert 1 == 1", test_file.read_text(encoding="utf-8"))
+            if res.get("verification"):
+                self.assertTrue(res["verification"]["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()
