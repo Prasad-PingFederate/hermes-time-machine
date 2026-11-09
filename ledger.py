@@ -58,6 +58,10 @@ SAFE_GIT_ENV_KEYS = frozenset({
     "TMPDIR",
     "LANG",
     "LC_ALL",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
 })
 
 
@@ -70,7 +74,10 @@ def _minimal_git_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = {k: os.environ[k] for k in SAFE_GIT_ENV_KEYS if k in os.environ}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_AUTHOR_NAME"] = os.environ.get("GIT_AUTHOR_NAME", "Hermes Time Machine")
+    env["GIT_AUTHOR_EMAIL"] = os.environ.get("GIT_AUTHOR_EMAIL", "time-machine@hermes.local")
+    env["GIT_COMMITTER_NAME"] = os.environ.get("GIT_COMMITTER_NAME", "Hermes Time Machine")
+    env["GIT_COMMITTER_EMAIL"] = os.environ.get("GIT_COMMITTER_EMAIL", "time-machine@hermes.local")
     if extra:
         env.update(extra)
     return env
@@ -351,6 +358,10 @@ class TimeMachineLedger:
                         timeout=5,
                     )
                     return new_sha
+                else:
+                    logger.debug("commit-tree failed (code %s): %s", commit_res.returncode, commit_res.stderr)
+            else:
+                logger.debug("write-tree failed (code %s): %s", tree_res.returncode, tree_res.stderr)
         except Exception as exc:
             logger.debug("Plugin git store checkpoint failed: %s", exc)
 
