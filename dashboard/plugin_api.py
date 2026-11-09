@@ -46,14 +46,12 @@ def _get_latest_session_id() -> Optional[str]:
 
 class ManualSnapshotRequest(BaseModel):
     session_id: Optional[str] = None
-    working_dir: Optional[str] = None
     reason: Optional[str] = "manual_ui_checkpoint"
 
 
 class RestoreRequest(BaseModel):
     file_path: Optional[str] = None
     file_paths: Optional[List[str]] = None
-    working_dir: Optional[str] = None
     dry_run: bool = False
     user_approved: bool = True
 
@@ -61,7 +59,6 @@ class RestoreRequest(BaseModel):
 class RecoverRequest(BaseModel):
     error_summary: Optional[str] = None
     session_id: Optional[str] = None
-    working_dir: Optional[str] = None
     dry_run: bool = True
     user_approved: bool = False
 
@@ -158,7 +155,6 @@ async def create_manual_snapshot(req: ManualSnapshotRequest) -> Dict[str, Any]:
         tool_call_id=None,
         tool_name="write_file",
         args={"reason": req.reason},
-        working_dir=req.working_dir,
     )
     if snap:
         snap = ledger.record_post_tool(
@@ -178,7 +174,6 @@ async def recover_snapshots(req: RecoverRequest) -> Dict[str, Any]:
     res = ledger.recover(
         session_id=req.session_id or _get_latest_session_id(),
         error_summary=req.error_summary,
-        working_dir=req.working_dir,
         dry_run=req.dry_run,
         user_approved=req.user_approved,
     )
@@ -263,7 +258,6 @@ async def restore_snapshot(snapshot_id: str, req: RestoreRequest) -> Dict[str, A
         snapshot_id=snapshot_id,
         file_path=req.file_path,
         file_paths=req.file_paths,
-        working_dir=req.working_dir,
         dry_run=req.dry_run,
         user_approved=req.user_approved,
     )
@@ -287,13 +281,12 @@ async def restore_and_retry(snapshot_id: str, req: RestoreRequest) -> Dict[str, 
         snapshot_id=snapshot_id,
         file_path=req.file_path,
         file_paths=req.file_paths,
-        working_dir=req.working_dir,
         dry_run=req.dry_run,
         user_approved=req.user_approved,
     )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Restore failed"))
-    diag = ledger.diagnose_failure(working_dir=req.working_dir)
+    diag = ledger.diagnose_failure()
     return {
         **res,
         "suggested_verify_command": diag.get("suggested_verify_command") or "pytest",

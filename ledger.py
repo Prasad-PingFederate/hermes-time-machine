@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import threading
@@ -819,7 +818,6 @@ class TimeMachineLedger:
         working_dir: Optional[str] = None,
         dry_run: bool = True,
         user_approved: bool = False,
-        confirm: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -827,20 +825,32 @@ class TimeMachineLedger:
         Defaults to dry-run preview. Never touches disk unless user_approved is True and dry_run is False.
         Never runs git checkout -f in the user's repository.
         """
-        if confirm is True:
-            user_approved = True
-            if "dry_run" not in kwargs:
-                dry_run = False
-
         snap = self.get_snapshot(snapshot_id)
         if commit_hash is None or commit_hash == "None" or not commit_hash:
             commit_hash = (snap.get("checkpoint_hash") if snap else None) or snapshot_id
 
-        wdir = (
-            snap.get("working_dir")
-            if (snap and snap.get("working_dir"))
-            else resolve_working_dir(working_dir)
-        )
+        snap_wdir = snap.get("working_dir") if snap else None
+        target_cwd = working_dir or kwargs.get("session_cwd")
+
+        if target_cwd is not None:
+            active_cwd = resolve_working_dir(target_cwd)
+            if snap_wdir:
+                resolved_snap_wdir = resolve_working_dir(snap_wdir)
+                if Path(resolved_snap_wdir).resolve() != Path(active_cwd).resolve():
+                    return {
+                        "ok": False,
+                        "snapshot_id": snapshot_id,
+                        "working_dir": active_cwd,
+                        "error": (
+                            f"Refusing to restore snapshot '{snapshot_id}': snapshot workspace "
+                            f"'{resolved_snap_wdir}' does not match active session_cwd '{active_cwd}'."
+                        ),
+                    }
+                wdir = resolved_snap_wdir
+            else:
+                wdir = active_cwd
+        else:
+            wdir = resolve_working_dir(snap_wdir)
 
         target_files = []
         if file_paths:
@@ -1156,8 +1166,6 @@ class TimeMachineLedger:
         working_dir: Optional[str] = None,
         dry_run: bool = True,
         user_approved: bool = False,
-        auto_apply: Optional[bool] = None,
-        confirm: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -1165,11 +1173,6 @@ class TimeMachineLedger:
         Returns suggested_verify_command for execution through Hermes' terminal tool.
         Defaults to dry-run mode (never writes disk without user approval).
         """
-        if confirm is True or auto_apply is True:
-            user_approved = True
-            if "dry_run" not in kwargs:
-                dry_run = False
-
         diag = self.diagnose_failure(
             session_id=session_id,
             error_text=error_summary,

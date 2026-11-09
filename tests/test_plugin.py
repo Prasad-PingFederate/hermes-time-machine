@@ -1056,6 +1056,61 @@ new file mode 100644
         self.assertEqual(r_export.status_code, 200)
         self.assertIn("Time Machine", r_export.json().get("markdown", ""))
 
+    def test_restore_refuses_outside_session_cwd(self):
+        """Item 3: restore_snapshot must refuse to restore if snapshot workspace != active session_cwd."""
+        dir_a = self.temp_dir / "workspace_a"
+        dir_b = self.temp_dir / "workspace_b"
+        dir_a.mkdir(parents=True, exist_ok=True)
+        dir_b.mkdir(parents=True, exist_ok=True)
+        (dir_a / "app.py").write_text("print('hello')", encoding="utf-8")
+
+        snap = self.ledger.record_pre_tool(
+            session_id="s_cwd_sec",
+            tool_name="write_file",
+            args={"path": "app.py"},
+            working_dir=str(dir_a),
+        )
+
+        # Attempt to restore against different session_cwd (dir_b)
+        res = self.ledger.restore_snapshot(
+            snapshot_id=snap["id"],
+            working_dir=str(dir_b),
+            dry_run=False,
+            user_approved=True,
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("does not match active session_cwd", res.get("error", ""))
+
+    def test_confirm_alias_cannot_bypass_approval(self):
+        """Item 2: confirm=True or auto_apply=True cannot bypass user_approved=False or dry_run=True."""
+        snap = self.ledger.record_pre_tool(
+            session_id="s_bypass",
+            tool_name="write_file",
+            args={"path": "main.py"},
+            working_dir=str(self.temp_dir),
+        )
+
+        res_restore = self.ledger.restore_snapshot(
+            snapshot_id=snap["id"],
+            working_dir=str(self.temp_dir),
+            dry_run=True,
+            user_approved=False,
+            confirm=True,  # Attempt bypass
+        )
+        self.assertTrue(res_restore.get("dry_run", False))
+        self.assertFalse(res_restore.get("files_restored", False))
+
+        res_recover = self.ledger.recover(
+            session_id="s_bypass",
+            working_dir=str(self.temp_dir),
+            dry_run=True,
+            user_approved=False,
+            confirm=True,
+            auto_apply=True,  # Attempt bypass
+        )
+        self.assertTrue(res_recover.get("dry_run", False))
+        self.assertFalse(res_recover.get("restored", False))
+
 
 if __name__ == "__main__":
     unittest.main()
