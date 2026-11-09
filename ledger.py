@@ -174,7 +174,7 @@ def file_exists_in_commit(commit_hash: str, rel_path: str, store_dir: Path) -> b
     try:
         norm = rel_path.replace("\\", "/").lstrip("/")
         res = subprocess.run(
-            ["git", f"--git-dir={store_dir}", "cat-file", "-e", f"{commit_hash}:{norm}"],
+            ["git", f"--git-dir={store_dir}", "cat-file", "-e", "--end-of-options", f"{commit_hash}:{norm}"],
             capture_output=True,
             timeout=5,
             env=_minimal_git_env(),
@@ -495,7 +495,7 @@ class TimeMachineLedger:
                 if pre_hash and post_hash and pre_hash != post_hash:
                     try:
                         res = subprocess.run(
-                            ["git", f"--git-dir={self.store_dir}", "diff", "--numstat", pre_hash, post_hash],
+                            ["git", f"--git-dir={self.store_dir}", "diff", "--numstat", "--end-of-options", pre_hash, post_hash],
                             capture_output=True,
                             text=True,
                             timeout=5,
@@ -686,6 +686,38 @@ class TimeMachineLedger:
 
         return "\n".join(lines)
 
+    def _resolve_candidate_hash(
+        self, candidate: Any
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        """Validate snapshot candidate before running git.
+
+        - Reject any candidate that startswith '-'.
+        - If the candidate is a row in snapshots.id, use that row's checkpoint_hash.
+        - Else accept the candidate only if re.fullmatch(r"[0-9a-f]{7,64}", candidate).
+        - After taking checkpoint_hash from the database, also require that same hex regex.
+        - Unknown ids (not in the db, not hex, or starting with -) return ok:false and must not run git.
+        """
+        if not candidate or not isinstance(candidate, str):
+            return False, None, None, "Invalid snapshot candidate identifier."
+        if candidate.startswith("-"):
+            return False, None, None, f"Invalid identifier '{candidate}': cannot start with '-'."
+
+        snap = None
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM snapshots WHERE id = ?", (candidate,)).fetchone()
+            if row:
+                snap = dict(row)
+        if snap:
+            c_hash = snap.get("checkpoint_hash")
+            if not c_hash or not isinstance(c_hash, str) or not re.fullmatch(r"[0-9a-f]{7,64}", c_hash):
+                return False, None, snap, f"Snapshot '{candidate}' has invalid or missing checkpoint hash."
+            return True, c_hash, snap, None
+
+        if re.fullmatch(r"[0-9a-f]{7,64}", candidate):
+            return True, candidate, None, None
+
+        return False, None, None, f"Snapshot '{candidate}' does not exist."
+
     def get_diff(
         self,
         snapshot_id: str,
@@ -693,21 +725,20 @@ class TimeMachineLedger:
         working_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Compute unified diff between snapshot and working tree or parent."""
-        snap = self.get_snapshot(snapshot_id)
-        target_hash = snap["checkpoint_hash"] if snap else snapshot_id
+        ok_snap, target_hash, snap, err_snap = self._resolve_candidate_hash(snapshot_id)
+        if not ok_snap:
+            return {
+                "ok": False,
+                "snapshot_id": snapshot_id,
+                "working_dir": resolve_working_dir(working_dir),
+                "error": err_snap or f"Invalid snapshot identifier '{snapshot_id}'.",
+            }
+
         wdir = (
             snap["working_dir"]
             if snap and snap.get("working_dir")
             else resolve_working_dir(working_dir)
         )
-
-        if not target_hash:
-            return {
-                "ok": False,
-                "snapshot_id": snapshot_id,
-                "working_dir": wdir,
-                "error": f"Snapshot '{snapshot_id}' does not have an associated checkpoint hash.",
-            }
 
         other_snap = None
         base_hash = None
@@ -716,8 +747,15 @@ class TimeMachineLedger:
         if compare_to_id == "WORKING_TREE":
             mode = "working_tree"
         elif compare_to_id:
-            other_snap = self.get_snapshot(compare_to_id)
-            base_hash = other_snap["checkpoint_hash"] if other_snap else compare_to_id
+            ok_cmp, base_hash, other_snap, err_cmp = self._resolve_candidate_hash(compare_to_id)
+            if not ok_cmp:
+                return {
+                    "ok": False,
+                    "snapshot_id": snapshot_id,
+                    "compare_to_id": compare_to_id,
+                    "working_dir": wdir,
+                    "error": err_cmp or f"Invalid compare_to identifier '{compare_to_id}'.",
+                }
             mode = "arbitrary"
         elif snap and snap.get("session_id"):
             with self._lock, self._connect() as conn:
@@ -731,8 +769,10 @@ class TimeMachineLedger:
                 ).fetchone()
                 if prev_row:
                     prev_dict = dict(prev_row)
-                    base_hash = prev_dict.get("checkpoint_hash")
-                    mode = "parent_snapshot"
+                    p_hash = prev_dict.get("checkpoint_hash")
+                    if p_hash and re.fullmatch(r"[0-9a-f]{7,64}", p_hash):
+                        base_hash = p_hash
+                        mode = "parent_snapshot"
 
         diff_text = ""
         store = self.store_dir
@@ -747,7 +787,7 @@ class TimeMachineLedger:
         if mode == "working_tree":
             try:
                 res = subprocess.run(
-                    ["git", f"--git-dir={store}", f"--work-tree={wdir}", "diff", target_hash],
+                    ["git", f"--git-dir={store}", f"--work-tree={wdir}", "diff", "--end-of-options", target_hash],
                     capture_output=True,
                     timeout=15,
                     env=env,
@@ -759,7 +799,7 @@ class TimeMachineLedger:
         elif base_hash and base_hash != target_hash:
             try:
                 res = subprocess.run(
-                    ["git", f"--git-dir={store}", "diff", base_hash, target_hash],
+                    ["git", f"--git-dir={store}", "diff", "--end-of-options", base_hash, target_hash],
                     capture_output=True,
                     timeout=15,
                     env=env,
@@ -772,7 +812,7 @@ class TimeMachineLedger:
         if not diff_text and mode != "working_tree":
             try:
                 res = subprocess.run(
-                    ["git", f"--git-dir={store}", "show", target_hash, "--format="],
+                    ["git", f"--git-dir={store}", "show", "--format=", "--end-of-options", target_hash],
                     capture_output=True,
                     timeout=15,
                     env=env,
@@ -825,9 +865,15 @@ class TimeMachineLedger:
         Defaults to dry-run preview. Never touches disk unless user_approved is True and dry_run is False.
         Never runs git checkout -f in the user's repository.
         """
-        snap = self.get_snapshot(snapshot_id)
-        if commit_hash is None or commit_hash == "None" or not commit_hash:
-            commit_hash = (snap.get("checkpoint_hash") if snap else None) or snapshot_id
+        ok_snap, resolved_commit, snap, err_snap = self._resolve_candidate_hash(snapshot_id)
+        if not ok_snap:
+            return {
+                "ok": False,
+                "snapshot_id": snapshot_id,
+                "working_dir": resolve_working_dir(working_dir or kwargs.get("session_cwd")),
+                "error": err_snap or f"Invalid snapshot identifier '{snapshot_id}'.",
+            }
+        commit_hash = resolved_commit
 
         snap_wdir = snap.get("working_dir") if snap else None
         target_cwd = working_dir or kwargs.get("session_cwd")
@@ -878,7 +924,7 @@ class TimeMachineLedger:
 
         # Verify commit exists strictly in plugin's isolated bare store
         c_check = subprocess.run(
-            ["git", f"--git-dir={store}", "cat-file", "-t", str(commit_hash)],
+            ["git", f"--git-dir={store}", "cat-file", "-t", "--end-of-options", str(commit_hash)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -947,7 +993,7 @@ class TimeMachineLedger:
                 existed = file_exists_in_commit(commit_hash, rel_tf, store)
                 if existed:
                     res = subprocess.run(
-                        ["git", f"--git-dir={store}", "show", f"{commit_hash}:{rel_tf}"],
+                        ["git", f"--git-dir={store}", "show", "--end-of-options", f"{commit_hash}:{rel_tf}"],
                         capture_output=True,
                         timeout=10,
                         env=_minimal_git_env(),
@@ -970,36 +1016,38 @@ class TimeMachineLedger:
                             errors.append(f"Could not remove {rel_tf}: {rm_err}")
         else:
             # Full restoration from store via git archive (safe, never detaches user's HEAD)
+            import tarfile
+            if not hasattr(tarfile, "data_filter"):
+                return {
+                    "ok": False,
+                    "snapshot_id": snap["id"] if snap else snapshot_id,
+                    "checkpoint_hash": commit_hash,
+                    "working_dir": wdir,
+                    "error": "tarfile.data_filter is required for safe full restore",
+                }
+
             try:
                 archive_res = subprocess.run(
-                    ["git", f"--git-dir={store}", "archive", commit_hash],
+                    ["git", f"--git-dir={store}", "archive", "--end-of-options", commit_hash],
                     capture_output=True,
                     timeout=30,
                     env=_minimal_git_env(),
                 )
                 if archive_res.returncode == 0:
                     import io
-                    import tarfile
                     with tarfile.open(fileobj=io.BytesIO(archive_res.stdout)) as tf_archive:
-                        if hasattr(tarfile, "data_filter"):
-                            tf_archive.extractall(path=wdir, filter="data")
-                        else:
-                            tf_archive.extractall(path=wdir)
+                        tf_archive.extractall(path=wdir, filter="data")
                     restored_files.append("(all workspace files)")
                 else:
                     errors.append(f"Full archive extraction failed: {archive_res.stderr.decode('utf-8', 'replace')}")
             except Exception as a_exc:
-                errors.append(f"Full extraction error: {a_exc}")
-                if archive_res.returncode == 0:
-                    import tarfile
-                    import io
-                    with tarfile.open(fileobj=io.BytesIO(archive_res.stdout)) as tf_archive:
-                        tf_archive.extractall(path=wdir)
-                    restored_files.append("(all workspace files)")
-                else:
-                    errors.append(f"Full archive extraction failed: {archive_res.stderr.decode('utf-8', 'replace')}")
-            except Exception as a_exc:
-                errors.append(f"Full extraction error: {a_exc}")
+                return {
+                    "ok": False,
+                    "snapshot_id": snap["id"] if snap else snapshot_id,
+                    "checkpoint_hash": commit_hash,
+                    "working_dir": wdir,
+                    "error": str(a_exc),
+                }
 
         ok = len(errors) == 0 and (len(restored_files) > 0 or len(unlinked_files) > 0)
         return {

@@ -80,7 +80,10 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
     snapshot_on_every_tool = bool(cfg.get("snapshot_on_every_tool", False))
     max_snapshots_per_session = int(cfg.get("max_snapshots_per_session", 100))
 
-    ledger = ledger or TimeMachineLedger(max_snapshots_per_session=max_snapshots_per_session)
+    def _get_ledger() -> TimeMachineLedger:
+        if ledger is not None:
+            return ledger
+        return TimeMachineLedger(max_snapshots_per_session=max_snapshots_per_session)
 
     def on_session_start(
         session_id: Optional[str] = None,
@@ -93,7 +96,8 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
             if kwargs.get("working_dir"):
                 _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
             wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
-            ledger.record_pre_tool(
+            cur_ledger = _get_ledger()
+            cur_ledger.record_pre_tool(
                 session_id=sess,
                 tool_name="session_start",
                 tool_args_summary="",
@@ -120,7 +124,8 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                     _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
                 wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
                 args_summary = json.dumps(args) if isinstance(args, (dict, list)) else str(args or {})
-                snap = ledger.record_pre_tool(
+                cur_ledger = _get_ledger()
+                snap = cur_ledger.record_pre_tool(
                     session_id=sess,
                     turn_id=turn_id,
                     tool_call_id=tool_call_id,
@@ -170,6 +175,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
 
             self_heal = False
             rec_snap = None
+            cur_ledger = _get_ledger()
             if is_cmd_tool and has_error:
                 if kwargs.get("working_dir"):
                     _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
@@ -177,12 +183,12 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                 cmd_str = ""
                 if args:
                     cmd_str = args.get("command") or args.get("cmd") or args.get("script") or ""
-                ledger._last_failed_commands[sess] = cmd_str
-                diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
+                cur_ledger._last_failed_commands[sess] = cmd_str
+                diag = cur_ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 rec_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
                 self_heal = bool(rec_snap)
 
-            ledger.record_post_tool(
+            cur_ledger.record_post_tool(
                 session_id=sess,
                 turn_id=turn_id,
                 tool_call_id=tool_call_id,
@@ -223,12 +229,13 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                 )
 
             if is_cmd_tool and has_error:
+                cur_ledger = _get_ledger()
                 wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
-                diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
+                diag = cur_ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 culprits = diag.get("culprit_files", [])
                 target_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
                 if not target_snap:
-                    safe_snap = ledger.get_last_safe_snapshot(sess)
+                    safe_snap = cur_ledger.get_last_safe_snapshot(sess)
                     if safe_snap and safe_snap.get("checkpoint_hash"):
                         target_snap = safe_snap.get("id")
 
@@ -258,11 +265,12 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
         subcmd = parts[0].lower() if parts else "list"
         session_id = kwargs.get("session_id") or "default"
         session_cwd = kwargs.get("working_dir") or _session_working_dirs.get(session_id)
+        cur_ledger = _get_ledger()
 
         if subcmd in ("list", "ls", ""):
-            snaps = ledger.list_snapshots(session_id=session_id, working_dir=session_cwd, limit=10)
+            snaps = cur_ledger.list_snapshots(session_id=session_id, working_dir=session_cwd, limit=10)
             if not snaps and session_cwd:
-                snaps = ledger.list_snapshots(session_id=session_id, limit=10)
+                snaps = cur_ledger.list_snapshots(session_id=session_id, limit=10)
             if not snaps:
                 return "⏱️ No Time Machine snapshots recorded for this session yet."
             lines = ["⏱️ Time Machine Snapshots (Recent):"]
@@ -280,7 +288,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
 
         elif subcmd == "diff":
             if len(parts) < 2:
-                snaps = ledger.list_snapshots(session_id=session_id, working_dir=session_cwd, limit=1)
+                snaps = cur_ledger.list_snapshots(session_id=session_id, working_dir=session_cwd, limit=1)
                 if not snaps:
                     return "Error: No snapshot available to diff."
                 target_id = snaps[0]["id"]
@@ -288,7 +296,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
             else:
                 target_id = parts[1]
                 compare_to_id = parts[2] if len(parts) > 2 else None
-            res = ledger.get_diff(target_id, compare_to_id=compare_to_id, working_dir=session_cwd)
+            res = cur_ledger.get_diff(target_id, compare_to_id=compare_to_id, working_dir=session_cwd)
             if not res.get("ok"):
                 return f"Error retrieving diff: {res.get('error')}"
             diff_preview = res.get("diff", "")[:1500]
@@ -307,7 +315,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                     target_files = parts[idx + 3].split(",")
 
             # Since the user explicitly typed /tm restore, this is an authorized human restore
-            res = ledger.restore_snapshot(
+            res = cur_ledger.restore_snapshot(
                 snapshot_id=target_id,
                 file_paths=target_files,
                 working_dir=session_cwd,
@@ -322,7 +330,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
 
         elif subcmd == "recover":
             # Recover via slash command displays diagnosis and suggested verify command
-            rec_res = ledger.recover(
+            rec_res = cur_ledger.recover(
                 session_id=session_id,
                 working_dir=session_cwd,
                 dry_run=True,
@@ -345,7 +353,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                 return "Usage: /tm search <query> [file_path]"
             query = parts[1]
             f_filter = parts[2] if len(parts) > 2 else None
-            s_res = ledger.search_snapshots(
+            s_res = cur_ledger.search_snapshots(
                 query=query,
                 session_id=session_id,
                 file_path=f_filter,
@@ -363,7 +371,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
             return "\n".join(lines)
 
         elif subcmd == "export":
-            return ledger.export_timeline_markdown(session_id=session_id)
+            return cur_ledger.export_timeline_markdown(session_id=session_id)
 
         elif subcmd == "demo":
             try:

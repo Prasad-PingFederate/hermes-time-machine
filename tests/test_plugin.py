@@ -1111,6 +1111,77 @@ new file mode 100644
         self.assertTrue(res_recover.get("dry_run", False))
         self.assertFalse(res_recover.get("restored", False))
 
+    def test_register_tool_signatures_and_command(self):
+        import __init__ as tm_plugin
+        class MockCtx:
+            def __init__(self):
+                self.tools = []
+                self.commands = []
+            def register_tool(self, name, toolset=None, schema=None, handler=None, description=None, **kwargs):
+                assert isinstance(schema, dict) and callable(handler) and toolset == "time_machine"
+                self.tools.append(name)
+            def register_hook(self, *a, **k): pass
+            def register_command(self, name, handler=None, description=None, args_hint=None, **kwargs):
+                self.commands.append(name)
+            def register_system_prompt_section(self, *a, **k): pass
+
+        ctx = MockCtx()
+        tm_plugin.register(ctx, ledger=self.ledger)
+        expected_tools = [
+            "time_machine_list_snapshots",
+            "time_machine_diff",
+            "time_machine_restore",
+            "time_machine_recover",
+            "time_machine_search",
+        ]
+        self.assertEqual(sorted(ctx.tools), sorted(expected_tools))
+        self.assertIn("tm", ctx.commands)
+
+    def test_git_option_injection_refused(self):
+        """Verify snapshot ids starting with '-' or not in db/hex are refused and cannot become git options."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            target = tmp / "pwned.txt"
+            bad = "--output=" + str(target)
+
+            # Record a real snapshot to test compare_to_id=bad and normal diff
+            snap = self.ledger.record_pre_tool(
+                session_id="test_inj",
+                tool_name="write_file",
+                working_dir=str(tmp),
+                reason="test",
+            )
+            real_id = snap["id"]
+
+            # 1. get_diff with bad snapshot_id
+            res_diff1 = self.ledger.get_diff(snapshot_id=bad, working_dir=str(tmp))
+            self.assertFalse(res_diff1.get("ok"))
+
+            # 2. get_diff with real snapshot_id and bad compare_to_id
+            res_diff2 = self.ledger.get_diff(snapshot_id=real_id, compare_to_id=bad, working_dir=str(tmp))
+            self.assertFalse(res_diff2.get("ok"))
+
+            # 3. restore_snapshot with bad snapshot_id
+            res_restore = self.ledger.restore_snapshot(
+                snapshot_id=bad,
+                user_approved=True,
+                dry_run=False,
+                working_dir=str(tmp),
+            )
+            self.assertFalse(res_restore.get("ok"))
+
+            # 4. Target file must not exist
+            self.assertFalse(target.exists(), f"Security vulnerability: {target} was created via git option injection!")
+
+            # 5. Normal snap_ id still diffs
+            res_normal = self.ledger.get_diff(snapshot_id=real_id, working_dir=str(tmp))
+            self.assertTrue(res_normal.get("ok"))
+
+            # 6. compare_to_id='WORKING_TREE' still works
+            res_wt = self.ledger.get_diff(snapshot_id=real_id, compare_to_id="WORKING_TREE", working_dir=str(tmp))
+            self.assertTrue(res_wt.get("ok"))
+
 
 if __name__ == "__main__":
     unittest.main()

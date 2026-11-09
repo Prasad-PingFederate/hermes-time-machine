@@ -63,6 +63,7 @@ function TimeMachineStatusChip({ ctx }) {
       host.openWorkspace('time-machine', {
         title: 'Time Machine',
         dock: { pane: 'workspace', pos: 'right' },
+        render: () => jsx(TimeMachinePane, { ctx }),
       });
     } else if (typeof host?.notify === 'function') {
       host.notify({
@@ -346,6 +347,7 @@ const plugin = {
               host.openWorkspace('time-machine', {
                 title: 'Time Machine',
                 dock: { pane: 'workspace', pos: 'right' },
+                render: () => jsx(TimeMachinePane, { ctx }),
               });
             }
           },

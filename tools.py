@@ -186,27 +186,59 @@ def handle_search(
 
 def register_time_machine_tools(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     """Register all 5 time_machine_* tools with the plugin context."""
-    ledger = ledger or TimeMachineLedger()
+
+    def _get_ledger() -> TimeMachineLedger:
+        return ledger if ledger is not None else TimeMachineLedger()
 
     def list_wrapper(args, **kw):
-        return handle_list_snapshots(args, ledger=ledger, ctx=ctx, **kw)
+        return handle_list_snapshots(args, ledger=_get_ledger(), ctx=ctx, **kw)
 
     def diff_wrapper(args, **kw):
-        return handle_diff(args, ledger=ledger, ctx=ctx, **kw)
+        return handle_diff(args, ledger=_get_ledger(), ctx=ctx, **kw)
 
     def restore_wrapper(args, **kw):
-        return handle_restore(args, ledger=ledger, ctx=ctx, **kw)
+        return handle_restore(args, ledger=_get_ledger(), ctx=ctx, **kw)
 
     def recover_wrapper(args, **kw):
-        return handle_recover(args, ledger=ledger, ctx=ctx, **kw)
+        return handle_recover(args, ledger=_get_ledger(), ctx=ctx, **kw)
 
     def search_wrapper(args, **kw):
-        return handle_search(args, ledger=ledger, ctx=ctx, **kw)
+        return handle_search(args, ledger=_get_ledger(), ctx=ctx, **kw)
 
     if hasattr(ctx, "register_tool"):
-        ctx.register_tool("time_machine_list_snapshots", list_wrapper, LIST_SCHEMA)
-        ctx.register_tool("time_machine_diff", diff_wrapper, DIFF_SCHEMA)
-        ctx.register_tool("time_machine_restore", restore_wrapper, RESTORE_SCHEMA)
-        ctx.register_tool("time_machine_recover", recover_wrapper, RECOVER_SCHEMA)
-        ctx.register_tool("time_machine_search", search_wrapper, SEARCH_SCHEMA)
+        ctx.register_tool(
+            name="time_machine_list_snapshots",
+            toolset="time_machine",
+            schema=LIST_SCHEMA,
+            handler=list_wrapper,
+            description=LIST_SCHEMA["description"],
+        )
+        ctx.register_tool(
+            name="time_machine_diff",
+            toolset="time_machine",
+            schema=DIFF_SCHEMA,
+            handler=diff_wrapper,
+            description=DIFF_SCHEMA["description"],
+        )
+        ctx.register_tool(
+            name="time_machine_restore",
+            toolset="time_machine",
+            schema=RESTORE_SCHEMA,
+            handler=restore_wrapper,
+            description=RESTORE_SCHEMA["description"],
+        )
+        ctx.register_tool(
+            name="time_machine_recover",
+            toolset="time_machine",
+            schema=RECOVER_SCHEMA,
+            handler=recover_wrapper,
+            description=RECOVER_SCHEMA["description"],
+        )
+        ctx.register_tool(
+            name="time_machine_search",
+            toolset="time_machine",
+            schema=SEARCH_SCHEMA,
+            handler=search_wrapper,
+            description=SEARCH_SCHEMA["description"],
+        )
 
