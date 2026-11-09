@@ -24,4 +24,6 @@ Thumbs.db
 
 
 # Dependencies
-node_modules/
+node_modules/*
+!node_modules/@hermes/
+!node_modules/react/
