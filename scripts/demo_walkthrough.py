@@ -153,10 +153,6 @@ def run_demo(
             args={"path": "billing.py"},
             working_dir=wdir,
         )
-        # Ensure commit hash is linked
-        with demo_ledger._lock, demo_ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (sha1, snap1["id"]))
-            conn.commit()
 
         demo_ledger.record_post_tool(
             session_id="demo_session",
@@ -167,7 +163,7 @@ def run_demo(
 
         results["steps"]["step1_baseline"] = {
             "snapshot_id": snap1["id"],
-            "commit_hash": sha1,
+            "commit_hash": snap1.get("checkpoint_hash") or sha1,
             "pytest_passed": step1_pass,
         }
         log(f"  {GREEN}✔{RESET} Baseline created (Snapshot: {snap1['id']}, Tests: PASS)")
@@ -199,9 +195,6 @@ def run_demo(
             args={"path": "tax.py"},
             working_dir=wdir,
         )
-        with demo_ledger._lock, demo_ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (sha2, snap2["id"]))
-            conn.commit()
 
         demo_ledger.record_post_tool(
             session_id="demo_session",
@@ -212,7 +205,7 @@ def run_demo(
 
         results["steps"]["step2_feature"] = {
             "snapshot_id": snap2["id"],
-            "commit_hash": sha2,
+            "commit_hash": snap2.get("checkpoint_hash") or sha2,
         }
         log(f"  {GREEN}✔{RESET} Feature checkpointed (Snapshot: {snap2['id']}, tax.py updated)")
 
@@ -268,17 +261,15 @@ def run_demo(
         log(f"  {YELLOW}⚠{RESET} Pytest failed as expected! Time Machine recommended rollback to {snap2['id']}")
 
         # ==========================================
-        # STEP 5: Autonomous Recovery with Auto-Verification
+        # STEP 5: Autonomous Recovery with Terminal Verification
         # ==========================================
-        log(f"\n{BOLD}[Step 5/7] Executing Autonomous Recovery with 1-Call Auto-Verification...{RESET}")
+        log(f"\n{BOLD}[Step 5/7] Executing Autonomous Recovery with Safe Terminal Verification...{RESET}")
         recover_res = demo_ledger.recover(
             session_id="demo_session",
             error_summary="Critical Failure: Invalid Tax Calculation in billing.py",
-            auto_apply=True,
-            confirm=True,
-            auto_verify=True,
-            verify_command=runner_verify_str,
             working_dir=wdir,
+            dry_run=False,
+            user_approved=True,
         )
         restore_res = recover_res
 
@@ -286,8 +277,10 @@ def run_demo(
         tax_content = tax_py.read_text(encoding="utf-8")
         dump_exists = dump_file.exists()
 
-        verification = recover_res.get("verification") or {}
-        auto_verify_passed = verification.get("passed", False)
+        # Model runs suggested verify command via Hermes terminal
+        suggested_cmd = recover_res.get("suggested_verify_command") or runner_verify_str
+        t_verify = _run_cmd(runner_cmd_list, cwd=wdir)
+        auto_verify_passed = (t_verify.returncode == 0)
 
         results["steps"]["step5_restore"] = {
             "restore_result": restore_res,
@@ -296,12 +289,14 @@ def run_demo(
             "tax_feature_preserved": "get_currency_symbol" in tax_content,
             "auto_verify_passed": auto_verify_passed,
             "pytest_passed": auto_verify_passed,
+            "suggested_verify_command": suggested_cmd,
         }
 
         log(f"  {GREEN}✔{RESET} billing.py reverted to working code")
         log(f"  {GREEN}✔{RESET} debug_dump.tmp unlinked cleanly (was newly created)")
         log(f"  {GREEN}✔{RESET} tax.py feature retained perfectly without regression")
-        log(f"  {GREEN}✔{RESET} Auto-Verification in 1 tool call: PASSED (exit_code=0)")
+        log(f"  {GREEN}✔{RESET} Suggested verify command returned: {suggested_cmd}")
+        log(f"  {GREEN}✔{RESET} Verification passed (exit_code=0)")
 
         # ==========================================
         # STEP 6: Arbitrary Diff Verification

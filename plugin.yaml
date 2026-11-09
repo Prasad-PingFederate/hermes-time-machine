@@ -1,7 +1,7 @@
 name: time-machine
 version: "0.3.0"
 requires_hermes: ">=0.21.0"
-description: "Visual timeline scrubber, surgical file rollback, session branching, and autonomous self-healing for Hermes Agent & Desktop."
+description: "Visual timeline scrubber, surgical file rollback, and autonomous self-healing for Hermes Agent & Desktop."
 author: "Prasad-PingFederate"
 manifest_version: 2
 api_version: 1
@@ -12,9 +12,11 @@ provides_tools:
   - time_machine_list_snapshots
   - time_machine_diff
   - time_machine_restore
-  - time_machine_branch
   - time_machine_recover
   - time_machine_search
+
+provides_commands:
+  - tm
 
 provides_hooks:
   - on_session_start
@@ -25,19 +27,11 @@ provides_hooks:
 python_dependencies: []
 
 config_schema:
-  safe_mode:
-    type: bool
-    default: true
-    description: "Aggressive checkpointing and proactive self-healing recovery recommendations"
-  auto_enable_checkpoints:
-    type: bool
-    default: true
-    description: "Force-enable Hermes checkpoints when this plugin loads"
   snapshot_on_every_tool:
     type: bool
     default: false
-    description: "Aggressive mode (higher disk use)"
+    description: "Capture snapshots before every tool call (default: false, snapshots file mutations and terminal commands)"
   max_snapshots_per_session:
     type: int
-    default: 50
+    default: 100
     description: "Maximum snapshots retained per session before pruning oldest"

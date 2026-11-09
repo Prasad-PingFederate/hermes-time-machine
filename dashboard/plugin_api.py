@@ -5,10 +5,9 @@ Mounted automatically by Hermes Dashboard / Desktop Gateway at:
 """
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -21,21 +20,26 @@ from ledger import TimeMachineLedger, resolve_hermes_home  # noqa: E402
 
 router = APIRouter()
 
+_ledger_instance: Optional[TimeMachineLedger] = None
+
+
+def set_ledger(ledger: Optional[TimeMachineLedger]) -> None:
+    global _ledger_instance
+    _ledger_instance = ledger
+
 
 def _get_ledger() -> TimeMachineLedger:
-    return TimeMachineLedger()
+    return _ledger_instance or TimeMachineLedger()
 
 
 def _get_latest_session_id() -> Optional[str]:
-    state_db = resolve_hermes_home() / "state.db"
-    if not state_db.exists():
-        return None
+    ledger = _get_ledger()
     try:
-        with sqlite3.connect(str(state_db), timeout=2.0) as conn:
+        with ledger._get_db() as conn:
             row = conn.execute(
-                "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1"
+                "SELECT session_id FROM snapshots ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
-            return row[0] if row else None
+            return row["session_id"] if row else None
     except Exception:
         return None
 
@@ -47,28 +51,20 @@ class ManualSnapshotRequest(BaseModel):
 
 
 class RestoreRequest(BaseModel):
-    restore_files: bool = True
-    rewind_conversation: bool = False
     file_path: Optional[str] = None
     file_paths: Optional[List[str]] = None
     working_dir: Optional[str] = None
-
-
-class BranchRequest(BaseModel):
-    branch_title: Optional[str] = None
-    restore_files: bool = True
-    working_dir: Optional[str] = None
-
+    dry_run: bool = False
+    user_approved: bool = True
 
 
 class RecoverRequest(BaseModel):
     error_summary: Optional[str] = None
-    auto_apply: bool = False
-    confirm: bool = True
-    verify_command: Optional[str] = None
-    auto_verify: bool = True
     session_id: Optional[str] = None
     working_dir: Optional[str] = None
+    dry_run: bool = True
+    user_approved: bool = False
+
 
 @router.get("/status")
 async def get_status(session_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
@@ -97,31 +93,31 @@ async def get_status(session_id: Optional[str] = Query(default=None)) -> Dict[st
         "self_heal_available": has_self_heal,
         "recommended_snapshot_id": (latest or {}).get("recommended_snapshot_id") or (safe_snap or {}).get("id"),
         "hermes_home": str(ledger.hermes_home),
+        "data_dir": str(ledger.data_dir),
     }
 
 
 @router.get("/sessions")
 async def list_recent_sessions(limit: int = Query(default=20, ge=1, le=100)) -> Dict[str, Any]:
     ledger = _get_ledger()
-    state_db = ledger.hermes_home / "state.db"
     sessions = []
-    if state_db.exists():
-        try:
-            with sqlite3.connect(str(state_db), timeout=3.0) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    """
-                    SELECT id, source, title, model, parent_session_id,
-                           started_at, message_count, tool_call_count, rewind_count
-                    FROM sessions
-                    ORDER BY started_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-                sessions = [dict(r) for r in rows]
-        except Exception:
-            pass
+    try:
+        with ledger._get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id as id,
+                       COUNT(*) as snapshot_count,
+                       MAX(created_at) as last_active
+                FROM snapshots
+                GROUP BY session_id
+                ORDER BY last_active DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            sessions = [dict(r) for r in rows]
+    except Exception:
+        pass
 
     return {
         "ok": True,
@@ -182,14 +178,10 @@ async def recover_snapshots(req: RecoverRequest) -> Dict[str, Any]:
     res = ledger.recover(
         session_id=req.session_id or _get_latest_session_id(),
         error_summary=req.error_summary,
-        auto_apply=req.auto_apply,
-        confirm=req.confirm,
         working_dir=req.working_dir,
-        verify_command=req.verify_command,
-        auto_verify=req.auto_verify,
+        dry_run=req.dry_run,
+        user_approved=req.user_approved,
     )
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("error", "Recovery failed"))
     return res
 
 
@@ -269,11 +261,11 @@ async def restore_snapshot(snapshot_id: str, req: RestoreRequest) -> Dict[str, A
     ledger = _get_ledger()
     res = ledger.restore_snapshot(
         snapshot_id=snapshot_id,
-        restore_files=req.restore_files,
-        rewind_conversation=req.rewind_conversation,
         file_path=req.file_path,
         file_paths=req.file_paths,
         working_dir=req.working_dir,
+        dry_run=req.dry_run,
+        user_approved=req.user_approved,
     )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Restore failed"))
@@ -281,20 +273,11 @@ async def restore_snapshot(snapshot_id: str, req: RestoreRequest) -> Dict[str, A
 
 
 @router.post("/snapshots/{snapshot_id}/branch")
-async def branch_snapshot(snapshot_id: str, req: BranchRequest) -> Dict[str, Any]:
-    ledger = _get_ledger()
-    res = ledger.branch_from_snapshot(
-        snapshot_id=snapshot_id,
-        branch_title=req.branch_title,
-        restore_files=req.restore_files,
-        working_dir=req.working_dir,
-    )
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("error", "Branch failed"))
-    return res
-
-
-
+async def branch_snapshot(snapshot_id: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "Conversation and branch management is handled natively by Hermes core '/branch' command.",
+    }
 
 
 @router.post("/snapshots/{snapshot_id}/retry")
@@ -302,16 +285,16 @@ async def restore_and_retry(snapshot_id: str, req: RestoreRequest) -> Dict[str, 
     ledger = _get_ledger()
     res = ledger.restore_snapshot(
         snapshot_id=snapshot_id,
-        restore_files=req.restore_files,
-        rewind_conversation=req.rewind_conversation,
         file_path=req.file_path,
         file_paths=req.file_paths,
         working_dir=req.working_dir,
+        dry_run=req.dry_run,
+        user_approved=req.user_approved,
     )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Restore failed"))
     diag = ledger.diagnose_failure(working_dir=req.working_dir)
     return {
         **res,
-        "retry_command": diag.get("retry_command") or "pytest",
+        "suggested_verify_command": diag.get("suggested_verify_command") or "pytest",
     }

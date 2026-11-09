@@ -1,16 +1,18 @@
 """
-SQLite Ledger + CheckpointManager & SessionDB Bridge for hermes-time-machine.
+SQLite Ledger + Checkpoint Store for hermes-time-machine.
+
+Stores snapshots strictly in HERMES_HOME/plugin-data/time-machine/ (ledger.db and bare git store).
+Zero writes to core SQLite databases or core checkpoints/store.
+Restores files exclusively from the plugin's own snapshot store without touching the user's .git repo.
 """
 from __future__ import annotations
 from contextlib import contextmanager
 
 import hashlib
-import inspect
 import json
-import re
 import logging
 import os
-import shlex
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -36,9 +38,42 @@ COMMAND_TOOLS = frozenset({
     "bash",
     "execute_code",
     "run_command",
+    "browser_exec",
+    "code_execution",
 })
 
 MUTATING_TOOLS = FILE_MUTATING_TOOLS | COMMAND_TOOLS
+
+SAFE_GIT_ENV_KEYS = frozenset({
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TMP",
+    "TEMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+})
+
+
+def _minimal_git_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """
+    Construct a hardened, minimal environment for Git subprocesses.
+    Strips secret API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.) and
+    forces non-interactive execution with no global/system config tampering.
+    """
+    env = {k: os.environ[k] for k in SAFE_GIT_ENV_KEYS if k in os.environ}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    if extra:
+        env.update(extra)
+    return env
 
 
 def resolve_hermes_home() -> Path:
@@ -52,6 +87,17 @@ def resolve_hermes_home() -> Path:
         return Path.home() / ".hermes"
 
 
+def resolve_working_dir(session_cwd: Optional[str] = None, hermes_home: Optional[Any] = None, **kwargs: Any) -> str:
+    """Resolve workspace directory, strictly bound to session_cwd."""
+    if session_cwd and str(session_cwd).strip():
+        try:
+            p = Path(session_cwd).expanduser().resolve()
+            if p.is_dir():
+                return str(p)
+        except Exception:
+            pass
+    return str(Path.cwd().resolve())
+
 
 def validate_safe_path(working_dir: str, rel_path: str) -> Path:
     """Validate that rel_path does not escape working_dir (prevents ../ path traversal attacks)."""
@@ -62,255 +108,129 @@ def validate_safe_path(working_dir: str, rel_path: str) -> Path:
     return target
 
 
-SAFE_TEST_RUNNERS = frozenset({
-    "pytest", "python", "python3", "py", "unittest",
-    "npm", "pnpm", "yarn", "bun",
-    "cargo", "go", "uv",
-    "ruff", "flake8", "mypy", "vitest", "jest",
-})
+def parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
+    """Parse git unified diff output into structured per-file change entries."""
+    if not diff_text or not diff_text.strip():
+        return []
 
-FORBIDDEN_SHELL_PATTERNS = (";", "&&", "||", "|", "`", "$(", ">", "<", "\n", "\r")
+    files = []
+    current_file = None
+    additions = 0
+    deletions = 0
+    patch_lines = []
+
+    def _build_entry(f_name: str, adds: int, dels: int, p_lines: list[str]) -> Dict[str, Any]:
+        p_text = "\n".join(p_lines)
+        status = "modified"
+        if "new file mode" in p_text or "--- /dev/null" in p_text:
+            status = "added"
+        elif "deleted file mode" in p_text or "+++ /dev/null" in p_text:
+            status = "deleted"
+        return {
+            "file": f_name,
+            "path": f_name,
+            "status": status,
+            "additions": adds,
+            "deletions": dels,
+            "patch": p_text,
+            "diff_chunk": p_text,
+        }
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git"):
+            if current_file:
+                files.append(_build_entry(current_file, additions, deletions, patch_lines))
+            m = re.search(r"b/(.+)$", line)
+            current_file = m.group(1) if m else "unknown"
+            additions = 0
+            deletions = 0
+            patch_lines = [line]
+        elif line.startswith("+++ b/"):
+            current_file = line[6:]
+            patch_lines.append(line)
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+            patch_lines.append(line)
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+            patch_lines.append(line)
+        else:
+            patch_lines.append(line)
+
+    if current_file:
+        files.append(_build_entry(current_file, additions, deletions, patch_lines))
+
+    return files
 
 
-def validate_verify_command(command: str) -> Tuple[bool, Optional[List[str]], str]:
-    """
-    Validates a command string for auto-verification against command-injection, shell
-    operators, unauthorized executables, and malicious test-runner parameters.
-    Returns (is_valid, parsed_args, reason).
-    """
-    if not command or not isinstance(command, str):
-        return False, None, "Verification command is empty or not a string."
-
-    for pattern in FORBIDDEN_SHELL_PATTERNS:
-        if pattern in command:
-            return False, None, f"Verification command contains forbidden shell operator: {pattern!r}"
-
+def file_exists_in_commit(commit_hash: str, rel_path: str, store_dir: Path) -> bool:
+    """Check if a file path existed in a commit within the plugin's bare git store."""
     try:
-        args = shlex.split(command, posix=(os.name != "nt"))
-        args = [a.strip('\'"') for a in args if a.strip('\'"')]
-    except Exception as e:
-        return False, None, f"Failed parsing command arguments: {e}"
-
-    if not args:
-        return False, None, "Parsed command arguments list is empty."
-
-    raw_exe = args[0]
-    exe_name = Path(raw_exe).name.lower()
-    if exe_name.endswith(".exe"):
-        exe_name = exe_name[:-4]
-
-    if exe_name not in SAFE_TEST_RUNNERS:
-        return False, None, f"Executable '{exe_name}' is not in safe test runner allowlist ({', '.join(sorted(SAFE_TEST_RUNNERS))})."
-
-    # Strict runner-specific validation
-    if exe_name in {"python", "python3", "py"}:
-        if len(args) < 3 or args[1] != "-m" or args[2] not in {"pytest", "unittest"}:
-            return False, None, "Python verification commands must strictly invoke '-m pytest' or '-m unittest' (e.g. 'python -m pytest'). Arbitrary modules like 'pip' or 'http.server' are rejected."
-
-    elif exe_name == "pytest":
-        forbidden_pytest_flags = {"-c", "-o", "--override-ini", "--rootdir", "--import-mode"}
-        for arg in args[1:]:
-            for f in forbidden_pytest_flags:
-                if arg == f or arg.startswith(f"{f}=") or arg.startswith(f"{f}:"):
-                    return False, None, f"Pytest flag '{arg}' is disallowed by security policy."
-
-    elif exe_name in {"npm", "pnpm", "yarn", "bun"}:
-        forbidden_subcommands = {"exec", "dlx", "-e", "--eval", "eval", "install", "add", "i", "publish", "run"}
-        if len(args) < 2:
-            return False, None, f"{exe_name} verification command requires 'test' subcommand."
-        sub = args[1].lower()
-        if sub in forbidden_subcommands and not (sub == "run" and len(args) >= 3 and "test" in args[2].lower()):
-            return False, None, f"Subcommand '{sub}' is disallowed for {exe_name} verification; only test runs are permitted."
-        if "test" not in sub and not (sub == "run" and len(args) >= 3 and "test" in args[2].lower()):
-            return False, None, f"Only test subcommands are permitted for {exe_name} (received '{sub}')."
-
-    elif exe_name == "cargo":
-        if len(args) < 2 or args[1] != "test":
-            return False, None, "Cargo verification commands must strictly invoke 'cargo test'."
-
-    elif exe_name == "uv":
-        if len(args) < 2 or args[1] != "run":
-            return False, None, "uv verification commands must strictly invoke 'uv run'."
-        sub_run = [a.lower() for a in args[2:]]
-        if not any(t in sub_run for t in ("pytest", "unittest", "test")):
-            return False, None, "uv run verification command must invoke pytest or test suite."
-
-    elif exe_name == "go":
-        if len(args) < 2 or args[1] != "test":
-            return False, None, "Go verification commands must strictly invoke 'go test'."
-
-    return True, args, ""
-
-
-def file_exists_in_commit(
-    commit_hash: str,
-    rel_path: str,
-    working_dir: str,
-    store_dir: Optional[Path] = None,
-) -> bool:
-    """Check if rel_path existed at commit_hash in shadow git store or local git repository."""
-    norm_path = rel_path.replace("\\", "/").lstrip("/")
-    if store_dir and store_dir.exists():
-        try:
-            res = subprocess.run(
-                ["git", f"--git-dir={store_dir}", "cat-file", "-e", f"{commit_hash}:{norm_path}"],
-                capture_output=True,
-                timeout=5,
-            )
-            if res.returncode == 0:
-                return True
-        except Exception:
-            pass
-
-    try:
+        norm = rel_path.replace("\\", "/").lstrip("/")
         res = subprocess.run(
-            ["git", "cat-file", "-e", f"{commit_hash}:{norm_path}"],
-            cwd=working_dir,
+            ["git", f"--git-dir={store_dir}", "cat-file", "-e", f"{commit_hash}:{norm}"],
             capture_output=True,
             timeout=5,
+            env=_minimal_git_env(),
         )
         return res.returncode == 0
     except Exception:
         return False
 
 
-def resolve_working_dir(
-    args: Optional[Dict[str, Any]] = None,
-    session_id: Optional[str] = None,
-    hermes_home: Optional[Path] = None,
-) -> str:
-    args = args or {}
-    for key in ("workdir", "working_dir", "cwd", "directory"):
-        val = args.get(key)
-        if isinstance(val, str) and val.strip():
-            p = Path(val).expanduser().resolve()
-            if p.is_dir():
-                return str(p)
-
-    cmd = args.get("command") or args.get("cmd") or args.get("script")
-    if isinstance(cmd, str) and cmd.strip():
-        m = re.search(r'(?:^|[;&|\n])\s*cd\s+["\']?([^"\'&;\n\r|]+)["\']?', cmd)
-        if m:
-            target = m.group(1).strip()
-            try:
-                p = Path(target).expanduser().resolve()
-                if p.is_dir():
-                    return str(p)
-            except Exception:
-                pass
-
-    for path_key in ("path", "file_path", "target_file", "filepath"):
-        val = args.get(path_key)
-        if isinstance(val, str) and val.strip():
-            p = Path(val).expanduser().resolve()
-            parent = p if p.is_dir() else p.parent
-            if parent.exists():
-                cur = parent
-                while cur != cur.parent:
-                    if (cur / ".git").exists():
-                        return str(cur)
-                    cur = cur.parent
-                return str(parent)
-
-    if session_id:
-        home = hermes_home or resolve_hermes_home()
-        tm_db = home / "time_machine.db"
-        if tm_db.exists():
-            try:
-                with sqlite3.connect(str(tm_db), timeout=2.0) as conn:
-                    row = conn.execute(
-                        "SELECT working_dir FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
-                        (session_id,),
-                    ).fetchone()
-                    if row and row[0] and Path(row[0]).is_dir():
-                        return str(Path(row[0]).resolve())
-            except Exception:
-                pass
-
-    env_cwd = os.environ.get("TERMINAL_CWD")
-    if env_cwd and Path(env_cwd).is_dir():
-        return str(Path(env_cwd).resolve())
-
-    return str(Path.cwd().resolve())
-
-
-
-def parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
-    """Parse git unified diff into structured per-file records with +/- line stats."""
-    if not diff_text or not diff_text.strip():
-        return []
-
-    files = []
-    chunks = re.split(r"(?=diff --git )", diff_text)
-    for chunk in chunks:
-        if not chunk.startswith("diff --git"):
-            continue
-        lines = chunk.splitlines()
-        if not lines:
-            continue
-        first_line = lines[0]
-        m = re.match(r"diff --git a/(.*?) b/(.*)", first_line)
-        path = m.group(2) if m else "unknown"
-
-        status = "modified"
-        if any(l.startswith("new file mode") for l in lines[:5]):
-            status = "added"
-        elif any(l.startswith("deleted file mode") for l in lines[:5]):
-            status = "deleted"
-
-        additions = 0
-        deletions = 0
-        chunk_lines = []
-        in_hunk = False
-        for l in lines:
-            if l.startswith("@@"):
-                in_hunk = True
-            if in_hunk:
-                chunk_lines.append(l)
-                if l.startswith("+") and not l.startswith("+++"):
-                    additions += 1
-                elif l.startswith("-") and not l.startswith("---"):
-                    deletions += 1
-
-        files.append({
-            "path": path,
-            "status": status,
-            "additions": additions,
-            "deletions": deletions,
-            "diff_chunk": "\n".join(chunk_lines) if chunk_lines else chunk,
-        })
-    return files
-
-
-
 def _extract_args(snap: Dict[str, Any]) -> Dict[str, Any]:
-    args = snap.get("tool_args")
-    if isinstance(args, dict) and args:
-        return args
     raw = snap.get("tool_args_summary") or ""
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
         raw = raw.strip()
-        if raw.startswith("{") and raw.endswith("}"):
+        if (raw.startswith("{") and raw.endswith("}")) or (raw.startswith("[") and raw.endswith("]")):
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict):
                     return parsed
             except Exception:
-                pass
+                try:
+                    import ast
+                    parsed = ast.literal_eval(raw)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
         m = re.match(r"^([a-zA-Z_]+)=(.*)$", raw)
         if m:
             return {m.group(1): m.group(2)}
     return {}
 
+
 class TimeMachineLedger:
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        plugin_data_dir: Optional[Path] = None,
+        max_snapshots_per_session: int = 100,
+    ):
         self.hermes_home = resolve_hermes_home()
-        self.db_path = Path(db_path) if db_path else (self.hermes_home / "time_machine.db")
+        self.plugin_data_dir = (
+            Path(plugin_data_dir).resolve()
+            if plugin_data_dir
+            else (self.hermes_home / "plugin-data" / "time-machine")
+        )
+        self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        self.store_dir = self.plugin_data_dir / "store"
+        self.db_path = Path(db_path) if db_path else (self.plugin_data_dir / "ledger.db")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_snapshots_per_session = max(10, int(max_snapshots_per_session or 100))
         self._lock = threading.Lock()
+        self._last_failed_commands: Dict[str, str] = {}
+        self._ensure_store_dir()
         self._init_db()
+        self._get_db = self._connect
+
+    @property
+    def data_dir(self) -> Path:
+        """Alias for plugin_data_dir."""
+        return self.plugin_data_dir
 
     @contextmanager
     def _connect(self):
@@ -351,51 +271,45 @@ class TimeMachineLedger:
                     files_changed INTEGER DEFAULT 0,
                     insertions INTEGER DEFAULT 0,
                     deletions INTEGER DEFAULT 0,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    self_heal_candidate INTEGER DEFAULT 0,
+                    recommended_snapshot_id TEXT
                 )
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_session ON snapshots(session_id, created_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_call_id ON snapshots(tool_call_id)")
-            try:
-                conn.execute("ALTER TABLE snapshots ADD COLUMN self_heal_candidate INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE snapshots ADD COLUMN recommended_snapshot_id TEXT")
-            except sqlite3.OperationalError:
-                pass
             conn.commit()
 
-    def _get_session_db(self):
-        try:
-            from hermes_state import SessionDB
-            return SessionDB(db_path=self.hermes_home / "state.db")
-        except Exception as exc:
-            logger.debug("SessionDB import failed: %s", exc)
-            return None
+    def _ensure_store_dir(self) -> Path:
+        """Ensure the plugin's private bare git store is initialized."""
+        if not (self.store_dir / "HEAD").exists():
+            self.store_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["git", "init", "--bare", str(self.store_dir)],
+                capture_output=True,
+                check=True,
+                timeout=10,
+                env=_minimal_git_env(),
+            )
+        return self.store_dir
 
     def _project_hash16(self, working_dir: str) -> str:
         abs_dir = str(Path(working_dir).expanduser().resolve())
         return hashlib.sha256(abs_dir.encode("utf-8")).hexdigest()[:16]
 
-    def _read_shadow_ref_tip(self, working_dir: str) -> Optional[str]:
-        store_dir = self.hermes_home / "checkpoints" / "store"
-        if not store_dir.exists():
+    def _read_snapshot_ref_tip(self, working_dir: str) -> Optional[str]:
+        """Read the tip commit of this project in the plugin's bare git store."""
+        if not self.store_dir.exists():
             return None
         hash16 = self._project_hash16(working_dir)
-        ref_file = store_dir / "refs" / "hermes" / hash16
-        if ref_file.exists():
-            try:
-                return ref_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
         try:
             res = subprocess.run(
-                ["git", f"--git-dir={store_dir}", "rev-parse", f"refs/hermes/{hash16}"],
+                ["git", f"--git-dir={self.store_dir}", "rev-parse", f"refs/time-machine/{hash16}"],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=5,
+                env=_minimal_git_env(),
             )
             if res.returncode == 0 and res.stdout.strip():
                 return res.stdout.strip()
@@ -404,231 +318,199 @@ class TimeMachineLedger:
         return None
 
     def ensure_and_get_checkpoint(self, working_dir: str, reason: str) -> Optional[str]:
+        """Capture a checkpoint of working_dir into the plugin's private bare git store."""
         abs_dir = str(Path(working_dir).expanduser().resolve())
-        store_dir = self.hermes_home / "checkpoints" / "store"
-        if store_dir.exists():
-            hash16 = self._project_hash16(abs_dir)
-            idx = store_dir / "indexes" / hash16
-            idx.parent.mkdir(parents=True, exist_ok=True)
-            env = {
-                **os.environ,
-                "GIT_DIR": str(store_dir),
-                "GIT_WORK_TREE": abs_dir,
-                "GIT_INDEX_FILE": str(idx),
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_CONFIG_NOSYSTEM": "1",
-            }
-            try:
-                subprocess.run(["git", "add", "-A"], cwd=abs_dir, env=env, capture_output=True, timeout=10)
-                tree_res = subprocess.run(["git", "write-tree"], cwd=abs_dir, env=env, capture_output=True, text=True, timeout=5)
-                if tree_res.returncode == 0 and tree_res.stdout.strip():
-                    tree_sha = tree_res.stdout.strip()
-                    parent_sha = self._read_shadow_ref_tip(abs_dir)
-                    cmd = ["git", "commit-tree", tree_sha, "-m", reason or "checkpoint"]
-                    if parent_sha:
-                        cmd.extend(["-p", parent_sha])
-                    commit_res = subprocess.run(cmd, cwd=abs_dir, env=env, capture_output=True, text=True, timeout=5)
-                    if commit_res.returncode == 0 and commit_res.stdout.strip():
-                        new_sha = commit_res.stdout.strip()
-                        subprocess.run(
-                            ["git", "update-ref", f"refs/hermes/{hash16}", new_sha],
-                            cwd=abs_dir,
-                            env=env,
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        return new_sha
-            except Exception as exc:
-                logger.debug("Shadow git checkpoint failed: %s", exc)
+        store = self._ensure_store_dir()
+        hash16 = self._project_hash16(abs_dir)
+        idx_dir = self.plugin_data_dir / "indexes"
+        idx_dir.mkdir(parents=True, exist_ok=True)
+        idx_file = idx_dir / hash16
 
-        tip = self._read_shadow_ref_tip(abs_dir)
+        env = _minimal_git_env({
+            "GIT_DIR": str(store),
+            "GIT_WORK_TREE": abs_dir,
+            "GIT_INDEX_FILE": str(idx_file),
+        })
+        try:
+            subprocess.run(["git", "add", "-A"], cwd=abs_dir, env=env, capture_output=True, timeout=10)
+            tree_res = subprocess.run(["git", "write-tree"], cwd=abs_dir, env=env, capture_output=True, text=True, timeout=5)
+            if tree_res.returncode == 0 and tree_res.stdout.strip():
+                tree_sha = tree_res.stdout.strip()
+                parent_sha = self._read_snapshot_ref_tip(abs_dir)
+                cmd = ["git", "commit-tree", tree_sha, "-m", reason or "checkpoint"]
+                if parent_sha:
+                    cmd.extend(["-p", parent_sha])
+                commit_res = subprocess.run(cmd, cwd=abs_dir, env=env, capture_output=True, text=True, timeout=5)
+                if commit_res.returncode == 0 and commit_res.stdout.strip():
+                    new_sha = commit_res.stdout.strip()
+                    subprocess.run(
+                        ["git", "update-ref", f"refs/time-machine/{hash16}", new_sha],
+                        cwd=abs_dir,
+                        env=env,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    return new_sha
+        except Exception as exc:
+            logger.debug("Plugin git store checkpoint failed: %s", exc)
+
+        tip = self._read_snapshot_ref_tip(abs_dir)
         if tip:
             return tip
-        try:
-            loc_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=abs_dir, capture_output=True, text=True, timeout=3)
-            if loc_res.returncode == 0 and loc_res.stdout.strip():
-                return loc_res.stdout.strip()
-        except Exception:
-            pass
         return None
 
-    def _get_message_watermark(self, session_id: str) -> tuple[Optional[int], int]:
-        state_db = self.hermes_home / "state.db"
-        if not state_db.exists() or not session_id:
-            return None, 0
+    def _prune_old_snapshots(self, session_id: str) -> None:
+        """Prune oldest snapshots when session count exceeds max_snapshots_per_session."""
+        if not self.max_snapshots_per_session or self.max_snapshots_per_session <= 0:
+            return
         try:
-            with sqlite3.connect(str(state_db), timeout=2.0) as conn:
-                cur = conn.execute(
-                    """
-                    SELECT MAX(id), COUNT(*)
-                    FROM messages
-                    WHERE session_id = ? AND COALESCE(active, 1) = 1
-                    """,
+            with self._lock, self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM snapshots WHERE session_id = ? ORDER BY created_at DESC",
                     (session_id,),
-                )
-                row = cur.fetchone()
-                if row:
-                    return row[0], int(row[1] or 0)
+                ).fetchall()
+                if len(rows) > self.max_snapshots_per_session:
+                    to_delete = [r[0] for r in rows[self.max_snapshots_per_session:]]
+                    placeholders = ",".join("?" for _ in to_delete)
+                    conn.execute(f"DELETE FROM snapshots WHERE id IN ({placeholders})", to_delete)
         except Exception as exc:
-            logger.debug("Failed reading message watermark from state.db: %s", exc)
-        return None, 0
+            logger.debug("Snapshot prune error: %s", exc)
 
     def record_pre_tool(
         self,
-        *,
-        session_id: str,
+        session_id: str = "default",
         turn_id: Optional[str] = None,
         tool_call_id: Optional[str] = None,
-        tool_name: str,
-        args: Optional[Dict[str, Any]] = None,
+        tool_name: str = "tool",
+        tool_args_summary: Optional[str] = None,
         working_dir: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        if tool_name.startswith("time_machine_"):
-            return None
-
-        wdir = str(Path(working_dir or resolve_working_dir(args, session_id, self.hermes_home)).expanduser().resolve())
-        reason = f"pre:{tool_name}"
-        if tool_name in MUTATING_TOOLS:
-            checkpoint_hash = self.ensure_and_get_checkpoint(wdir, reason=reason)
-        else:
-            checkpoint_hash = self._read_shadow_ref_tip(wdir)
-
-        # Fallback: ensure non-empty checkpoint_hash if wdir is a git repository
-        if not checkpoint_hash and Path(wdir).resolve().exists():
-            try:
-                g_head = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=wdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if g_head.returncode == 0 and g_head.stdout.strip():
-                    checkpoint_hash = g_head.stdout.strip()
-            except Exception:
-                pass
-
-        msg_id_wm, msg_count_wm = self._get_message_watermark(session_id)
+        reason: Optional[str] = None,
+        args: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Record pre-tool snapshot into the plugin's bare git store."""
+        if args is not None and not tool_args_summary:
+            tool_args_summary = json.dumps(args) if isinstance(args, (dict, list)) else str(args)
+        wdir = resolve_working_dir(working_dir)
         snap_id = f"snap_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-        args_summary = self._summarize_args(tool_name, args or {})
-
         now = time.time()
+        cp_reason = reason or f"pre-{tool_name}"
+        checkpoint_hash = self.ensure_and_get_checkpoint(wdir, cp_reason)
+
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO snapshots (
                     id, session_id, turn_id, tool_call_id, tool_name,
-                    tool_args_summary, working_dir, checkpoint_hash,
-                    reason, message_id_watermark, message_count_watermark,
-                    status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_flight', ?)
+                    tool_args_summary, working_dir, checkpoint_hash, reason,
+                    message_id_watermark, message_count_watermark, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
                 (
                     snap_id,
-                    session_id or "unknown",
+                    session_id,
                     turn_id,
                     tool_call_id,
                     tool_name,
-                    args_summary,
+                    tool_args_summary or "",
                     wdir,
                     checkpoint_hash,
-                    reason,
-                    msg_id_wm,
-                    msg_count_wm,
+                    cp_reason,
+                    None,
+                    0,
                     now,
                 ),
             )
-            conn.commit()
 
-        return self.get_snapshot(snap_id)
+        self._prune_old_snapshots(session_id)
+
+        return {
+            "id": snap_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "working_dir": wdir,
+            "checkpoint_hash": checkpoint_hash,
+            "created_at": now,
+        }
 
     def record_post_tool(
         self,
-        *,
-        session_id: str,
+        session_id: str = "default",
         turn_id: Optional[str] = None,
         tool_call_id: Optional[str] = None,
-        tool_name: str,
-        args: Optional[Dict[str, Any]] = None,
-        status: str = "ok",
+        tool_name: str = "tool",
         duration_ms: Optional[float] = None,
+        status: str = "ok",
         self_heal_candidate: bool = False,
         recommended_snapshot_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
-        if tool_name.startswith("time_machine_"):
-            return None
-
-        row = None
+        now = time.time()
         with self._lock, self._connect() as conn:
+            row = None
             if tool_call_id:
-                cur = conn.execute(
-                    "SELECT * FROM snapshots WHERE tool_call_id = ? ORDER BY created_at DESC LIMIT 1",
+                row = conn.execute(
+                    "SELECT id, working_dir, checkpoint_hash FROM snapshots WHERE tool_call_id = ? ORDER BY created_at DESC LIMIT 1",
                     (tool_call_id,),
-                )
-                row = cur.fetchone()
-            if not row and session_id:
-                cur = conn.execute(
-                    """
-                    SELECT * FROM snapshots
-                    WHERE session_id = ? AND tool_name = ? AND status = 'in_flight'
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    (session_id, tool_name),
-                )
-                row = cur.fetchone()
+                ).fetchone()
 
-        if not row:
-            return None
+            if not row and turn_id:
+                row = conn.execute(
+                    "SELECT id, working_dir, checkpoint_hash FROM snapshots WHERE session_id = ? AND turn_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (session_id, turn_id),
+                ).fetchone()
 
-        snap = dict(row)
-        wdir = snap["working_dir"]
-        post_hash = snap.get("checkpoint_hash")
-        files_changed = 0
-        insertions = 0
-        deletions = 0
+            if not row:
+                row = conn.execute(
+                    "SELECT id, working_dir, checkpoint_hash FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
 
-        if tool_name in MUTATING_TOOLS and status == "ok":
-            post_hash = self.ensure_and_get_checkpoint(wdir, reason=f"post:{tool_name}") or post_hash
-            if post_hash and snap.get("checkpoint_hash"):
-                base_h = snap["checkpoint_hash"]
-                store_dir = self.hermes_home / "checkpoints" / "store"
-                try:
-                    env = {"GIT_DIR": str(store_dir), **os.environ} if store_dir.exists() else None
-                    stat_res = subprocess.run(
-                        ["git", "diff", "--shortstat", base_h, post_hash],
-                        cwd=wdir,
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    if stat_res.returncode == 0 and stat_res.stdout.strip():
-                        m_f = re.search(r"(\d+)\s+file", stat_res.stdout)
-                        m_i = re.search(r"(\d+)\s+insertion", stat_res.stdout)
-                        m_d = re.search(r"(\d+)\s+deletion", stat_res.stdout)
-                        if m_f:
-                            files_changed = int(m_f.group(1))
-                        if m_i:
-                            insertions = int(m_i.group(1))
-                        if m_d:
-                            deletions = int(m_d.group(1))
-                except Exception:
-                    pass
+            if not row:
+                return
 
-        if status != "ok" or self_heal_candidate:
-            cmd = (args or {}).get("command") or (args or {}).get("cmd") or snap.get("tool_args_summary") or ""
-            if cmd and tool_name in {"terminal", "bash", "execute_code", "run_command"}:
-                if not hasattr(self, "_last_failed_commands"):
-                    self._last_failed_commands = {}
-                clean_cmd = str(cmd).replace("command=", "").strip()
-                self._last_failed_commands[session_id or "default"] = clean_cmd
+            snap_id = row["id"]
+            wdir = row["working_dir"]
+            pre_hash = row["checkpoint_hash"]
 
-        with self._lock, self._connect() as conn:
+            post_hash = None
+            files_changed = 0
+            insertions = 0
+            deletions = 0
+
+            if tool_name in FILE_MUTATING_TOOLS:
+                post_hash = self.ensure_and_get_checkpoint(wdir, f"post-{tool_name}")
+                if pre_hash and post_hash and pre_hash != post_hash:
+                    try:
+                        res = subprocess.run(
+                            ["git", f"--git-dir={self.store_dir}", "diff", "--numstat", pre_hash, post_hash],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                            env=_minimal_git_env(),
+                        )
+                        if res.returncode == 0:
+                            for line in res.stdout.splitlines():
+                                parts = line.split("\t")
+                                if len(parts) >= 3:
+                                    files_changed += 1
+                                    try:
+                                        insertions += int(parts[0])
+                                    except ValueError:
+                                        pass
+                                    try:
+                                        deletions += int(parts[1])
+                                    except ValueError:
+                                        pass
+                    except Exception:
+                        pass
+
             conn.execute(
                 """
-                UPDATE snapshots
-                SET post_checkpoint_hash = ?,
+                UPDATE snapshots SET
+                    post_checkpoint_hash = COALESCE(?, post_checkpoint_hash),
                     status = ?,
                     duration_ms = ?,
                     files_changed = ?,
@@ -647,48 +529,21 @@ class TimeMachineLedger:
                     deletions,
                     1 if self_heal_candidate else 0,
                     recommended_snapshot_id,
-                    snap["id"],
+                    snap_id,
                 ),
             )
-            conn.commit()
-
-        return self.get_snapshot(snap["id"])
-
-
-    def get_last_safe_snapshot(self, session_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT * FROM snapshots
-                WHERE session_id = ? AND status = 'ok' AND checkpoint_hash IS NOT NULL
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (session_id,),
-            )
-            row = cur.fetchone()
-            if row:
-                d = dict(row)
-                d["tool_args"] = _extract_args(d)
-                return d
-            return None
+            return dict(conn.execute("SELECT * FROM snapshots WHERE id = ?", (snap_id,)).fetchone() or {})
+        return None
 
     def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
-        if not snapshot_id:
-            return None
         with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT * FROM snapshots WHERE id = ?", (snapshot_id,))
-            row = cur.fetchone()
-            if not row:
-                cur = conn.execute(
-                    """
-                    SELECT * FROM snapshots
-                    WHERE id LIKE ? OR checkpoint_hash LIKE ? OR post_checkpoint_hash LIKE ?
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    (f"{snapshot_id}%", f"{snapshot_id}%", f"{snapshot_id}%"),
-                )
-                row = cur.fetchone()
-            return dict(row) if row else None
+            row = conn.execute("SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+            if row:
+                return dict(row)
+            row_cp = conn.execute("SELECT * FROM snapshots WHERE checkpoint_hash = ? ORDER BY created_at DESC LIMIT 1", (snapshot_id,)).fetchone()
+            if row_cp:
+                return dict(row_cp)
+        return None
 
     def list_snapshots(
         self,
@@ -696,74 +551,130 @@ class TimeMachineLedger:
         working_dir: Optional[str] = None,
         limit: int = 50,
         include_raw_checkpoints: bool = True,
+        **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        clauses = []
-        params: List[Any] = []
-        if session_id:
-            clauses.append("session_id = ?")
-            params.append(session_id)
-        if working_dir:
-            abs_wdir = str(Path(working_dir).expanduser().resolve())
-            clauses.append("(working_dir = ? OR working_dir = ?)")
-            params.extend([working_dir, abs_wdir])
+        with self._lock, self._connect() as conn:
+            query = "SELECT * FROM snapshots"
+            params: List[Any] = []
+            clauses = []
+            if session_id:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            if working_dir:
+                clauses.append("working_dir = ?")
+                params.append(str(Path(working_dir).expanduser().resolve()))
 
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"SELECT * FROM snapshots {where_sql} ORDER BY created_at DESC LIMIT ?"
-        params.append(int(limit))
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+
+            rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+
+        if not include_raw_checkpoints:
+            return [r for r in rows if r.get("checkpoint_hash")]
+        return rows
+
+    def prune_snapshots(self, session_id: Optional[str] = None, keep_last: int = 50) -> Dict[str, Any]:
+        """Keep most recent keep_last snapshots per session, preserving baselines and safety backups."""
+        with self._lock, self._connect() as conn:
+            query = "SELECT id, tool_name, recommended_snapshot_id FROM snapshots"
+            params = []
+            if session_id:
+                query += " WHERE session_id = ?"
+                params.append(session_id)
+            query += " ORDER BY created_at DESC"
+
+            rows = [dict(r) for r in conn.execute(query, tuple(params)).fetchall()]
+            total_before = len(rows)
+
+            keep_ids = set()
+            for r in rows[:keep_last]:
+                keep_ids.add(r["id"])
+
+            for r in rows:
+                if r.get("tool_name") in ("session_start", "pre_restore_safety_backup"):
+                    keep_ids.add(r["id"])
+                if r.get("recommended_snapshot_id"):
+                    keep_ids.add(r["id"])
+                    keep_ids.add(r["recommended_snapshot_id"])
+
+            to_delete = [r["id"] for r in rows if r["id"] not in keep_ids]
+            if to_delete:
+                placeholders = ",".join("?" for _ in to_delete)
+                conn.execute(f"DELETE FROM snapshots WHERE id IN ({placeholders})", to_delete)
+
+            return {
+                "ok": True,
+                "total_before": total_before,
+                "pruned_count": len(to_delete),
+                "remaining_count": total_before - len(to_delete),
+            }
+
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Return total snapshots, sessions, self-heal alerts, and estimated store size."""
+        total_snaps = 0
+        total_sess = 0
+        heal_alerts = 0
+        db_size = 0
+
+        if self.db_path.exists():
+            db_size = self.db_path.stat().st_size
+
+        store_size = 0
+        if self.store_dir.exists():
+            for f in self.store_dir.rglob("*"):
+                if f.is_file():
+                    store_size += f.stat().st_size
 
         with self._lock, self._connect() as conn:
-            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
-            for r in rows:
-                r["tool_args"] = _extract_args(r)
+            try:
+                row = conn.execute("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM snapshots").fetchone()
+                if row:
+                    total_snaps = int(row[0] or 0)
+                    total_sess = int(row[1] or 0)
+                heal_row = conn.execute("SELECT COUNT(*) FROM snapshots WHERE self_heal_candidate = 1").fetchone()
+                if heal_row:
+                    heal_alerts = int(heal_row[0] or 0)
+            except Exception:
+                pass
 
-        if include_raw_checkpoints:
-            target_dir = working_dir or (rows[0]["working_dir"] if rows else None)
-            if target_dir:
-                known_hashes = {
-                    r.get("checkpoint_hash") for r in rows if r.get("checkpoint_hash")
-                } | {
-                    r.get("post_checkpoint_hash") for r in rows if r.get("post_checkpoint_hash")
-                }
-                store_dir = self.hermes_home / "checkpoints" / "store"
-                hash16 = self._project_hash16(target_dir)
-                if store_dir.exists():
-                    try:
-                        log_res = subprocess.run(
-                            ["git", f"--git-dir={store_dir}", "log", f"-n{limit}", "--format=%H|%h|%s|%ct", f"refs/hermes/{hash16}"],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if log_res.returncode == 0:
-                            for line in log_res.stdout.splitlines():
-                                parts = line.strip().split("|")
-                                if len(parts) >= 4:
-                                    cp_h, cp_sh, cp_reason, cp_ts = parts[0], parts[1], parts[2], float(parts[3])
-                                    if cp_h not in known_hashes:
-                                        rows.append({
-                                            "id": f"cp_{cp_sh}",
-                                            "session_id": session_id or "shadow-store",
-                                            "turn_id": None,
-                                            "tool_call_id": None,
-                                            "tool_name": "checkpoint",
-                                            "tool_args_summary": cp_reason or "checkpoint",
-                                            "working_dir": str(Path(target_dir).expanduser().resolve()),
-                                            "checkpoint_hash": cp_h,
-                                            "post_checkpoint_hash": cp_h,
-                                            "reason": cp_reason or "checkpoint",
-                                            "message_id_watermark": None,
-                                            "message_count_watermark": 0,
-                                            "status": "ok",
-                                            "duration_ms": None,
-                                            "files_changed": 0,
-                                            "insertions": 0,
-                                            "deletions": 0,
-                                            "created_at": cp_ts,
-                                        })
-                    except Exception:
-                        pass
+        return {
+            "total_snapshots": total_snaps,
+            "total_sessions": total_sess,
+            "self_heal_alerts": heal_alerts,
+            "db_size_bytes": db_size,
+            "store_size_bytes": store_size,
+            "total_storage_bytes": db_size + store_size,
+        }
 
-        return rows[:limit]
+    def export_timeline_markdown(self, session_id: Optional[str] = None) -> str:
+        """Export session Time Machine history as structured Markdown report."""
+        sess = session_id or "default"
+        snaps = self.list_snapshots(session_id=session_id, limit=200)
+        stats = self.get_storage_stats()
+
+        lines = [
+            "# ⏱️ Hermes Time Machine Timeline Report",
+            f"**Session:** `{sess}` | **Exported At:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}`",
+            f"**Total Snapshots:** {len(snaps)} | **Store Size:** {round(stats.get('total_storage_bytes', 0) / 1024, 1)} KB\n",
+            "## Snapshots History\n",
+            "| Step | Timestamp | Tool | Checkpoint | Status | Changes | Details |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+
+        for idx, s in enumerate(reversed(snaps), 1):
+            ts = datetime.fromtimestamp(s['created_at']).strftime('%H:%M:%S') if s.get('created_at') else '-'
+            tool = s.get('tool_name', 'unknown')
+            sha = (s.get('checkpoint_hash') or '')[:8] or 'no-git'
+            st = '✅ ok' if s.get('status') == 'ok' else '❌ error'
+            if s.get('self_heal_candidate'):
+                st = '⚠️ heal-candidate'
+            changes = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
+            summary = (s.get('tool_args_summary') or s.get('reason') or '').replace('\n', ' ')[:50]
+            lines.append(f"| {idx} | {ts} | `{tool}` | `{sha}` | {st} | {changes} | {summary} |")
+
+        return "\n".join(lines)
 
     def get_diff(
         self,
@@ -771,12 +682,13 @@ class TimeMachineLedger:
         compare_to_id: Optional[str] = None,
         working_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Compute unified diff between snapshot and working tree or parent."""
         snap = self.get_snapshot(snapshot_id)
         target_hash = snap["checkpoint_hash"] if snap else snapshot_id
         wdir = (
             snap["working_dir"]
             if snap and snap.get("working_dir")
-            else (working_dir or resolve_working_dir(hermes_home=self.hermes_home))
+            else resolve_working_dir(working_dir)
         )
 
         if not target_hash:
@@ -798,7 +710,6 @@ class TimeMachineLedger:
             base_hash = other_snap["checkpoint_hash"] if other_snap else compare_to_id
             mode = "arbitrary"
         elif snap and snap.get("session_id"):
-            # Find previous snapshot in same session
             with self._lock, self._connect() as conn:
                 prev_row = conn.execute(
                     """
@@ -814,72 +725,50 @@ class TimeMachineLedger:
                     mode = "parent_snapshot"
 
         diff_text = ""
-        store_dir = self.hermes_home / "checkpoints" / "store"
+        store = self.store_dir
         hash16 = self._project_hash16(wdir)
-        env = {
-            **os.environ,
-            "GIT_DIR": str(store_dir),
+        idx_file = self.plugin_data_dir / "indexes" / hash16
+        env = _minimal_git_env({
+            "GIT_DIR": str(store),
             "GIT_WORK_TREE": str(Path(wdir).resolve()),
-            "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
-        }
+            "GIT_INDEX_FILE": str(idx_file),
+        })
 
-        # Case 1: Live Working Tree Drift (diff target_hash against current uncommitted workspace)
         if mode == "working_tree":
             try:
                 res = subprocess.run(
-                    ["git", "diff", target_hash],
-                    cwd=wdir,
-                    env=env if store_dir.exists() else None,
+                    ["git", f"--git-dir={store}", f"--work-tree={wdir}", "diff", target_hash],
                     capture_output=True,
-                    text=True,
                     timeout=15,
+                    env=env,
                 )
                 if res.returncode == 0:
-                    diff_text = res.stdout
-                else:
-                    res_loc = subprocess.run(["git", "diff", target_hash], cwd=wdir, capture_output=True, text=True, timeout=15)
-                    if res_loc.returncode == 0:
-                        diff_text = res_loc.stdout
+                    diff_text = res.stdout.decode("utf-8", "replace")
             except Exception as exc:
                 logger.debug("working_tree diff error: %s", exc)
-
-        # Case 2: Arbitrary A <-> B or Parent Snapshot comparison
         elif base_hash and base_hash != target_hash:
             try:
                 res = subprocess.run(
-                    ["git", "diff", base_hash, target_hash],
-                    cwd=wdir,
-                    env=env if store_dir.exists() else None,
+                    ["git", f"--git-dir={store}", "diff", base_hash, target_hash],
                     capture_output=True,
-                    text=True,
                     timeout=15,
+                    env=env,
                 )
                 if res.returncode == 0:
-                    diff_text = res.stdout
-                else:
-                    res_loc = subprocess.run(["git", "diff", base_hash, target_hash], cwd=wdir, capture_output=True, text=True, timeout=15)
-                    if res_loc.returncode == 0:
-                        diff_text = res_loc.stdout
+                    diff_text = res.stdout.decode("utf-8", "replace")
             except Exception as exc:
                 logger.debug("arbitrary diff error: %s", exc)
 
-        # Case 3: Single commit delta (target_hash~1 .. target_hash via git show)
         if not diff_text and mode != "working_tree":
             try:
                 res = subprocess.run(
-                    ["git", "show", target_hash, "--format="],
-                    cwd=wdir,
-                    env=env if store_dir.exists() else None,
+                    ["git", f"--git-dir={store}", "show", target_hash, "--format="],
                     capture_output=True,
-                    text=True,
                     timeout=15,
+                    env=env,
                 )
                 if res.returncode == 0:
-                    diff_text = res.stdout
-                else:
-                    res_loc = subprocess.run(["git", "show", target_hash, "--format="], cwd=wdir, capture_output=True, text=True, timeout=15)
-                    if res_loc.returncode == 0:
-                        diff_text = res_loc.stdout
+                    diff_text = res.stdout.decode("utf-8", "replace")
             except Exception as exc:
                 logger.debug("git show fallback error: %s", exc)
 
@@ -914,25 +803,32 @@ class TimeMachineLedger:
         snapshot_id: str,
         *,
         commit_hash: Optional[str] = None,
-        restore_files: bool = True,
-        rewind_conversation: bool = False,
         file_path: Optional[str] = None,
         file_paths: Optional[List[str]] = None,
         working_dir: Optional[str] = None,
-        dry_run: bool = False,
-        confirm: bool = True,
+        dry_run: bool = True,
+        user_approved: bool = False,
+        confirm: Optional[bool] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        """
+        Surgically restore files from the plugin's bare git store.
+        Defaults to dry-run preview. Never touches disk unless user_approved is True and dry_run is False.
+        Never runs git checkout -f in the user's repository.
+        """
+        if confirm is True:
+            user_approved = True
+            if "dry_run" not in kwargs:
+                dry_run = False
+
         snap = self.get_snapshot(snapshot_id)
-        if commit_hash is None:
-            commit_hash = snap["checkpoint_hash"] if snap else snapshot_id
+        if commit_hash is None or commit_hash == "None" or not commit_hash:
+            commit_hash = (snap.get("checkpoint_hash") if snap else None) or snapshot_id
+
         wdir = (
-            str(Path(working_dir).expanduser().resolve())
-            if (working_dir and str(working_dir).strip())
-            else (
-                snap.get("working_dir")
-                if (snap and snap.get("working_dir"))
-                else resolve_working_dir(hermes_home=self.hermes_home)
-            )
+            snap.get("working_dir")
+            if (snap and snap.get("working_dir"))
+            else resolve_working_dir(working_dir)
         )
 
         target_files = []
@@ -941,7 +837,7 @@ class TimeMachineLedger:
         if file_path and file_path.strip() not in target_files:
             target_files.append(file_path.strip())
 
-        # Path Traversal Security Check
+        # Path Traversal Guard: ensure all target files resolve strictly within wdir
         validated_targets = []
         for tf in target_files:
             try:
@@ -956,565 +852,151 @@ class TimeMachineLedger:
                     "error": str(val_err),
                 }
 
-        result: Dict[str, Any] = {
-            "ok": True,
+        store = self.store_dir
+        self._ensure_store_dir()
+
+        # Verify commit exists strictly in plugin's isolated bare store
+        c_check = subprocess.run(
+            ["git", f"--git-dir={store}", "cat-file", "-t", str(commit_hash)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_minimal_git_env(),
+        )
+        if c_check.returncode != 0 or c_check.stdout.strip() != "commit":
+            return {
+                "ok": False,
+                "snapshot_id": snapshot_id,
+                "working_dir": wdir,
+                "error": f"Target commit '{commit_hash}' does not exist in Time Machine store.",
+            }
+
+        planned_restores = [vt[0] for vt in validated_targets] if validated_targets else ["(all files)"]
+        planned_unlinks = []
+
+        # Identify files that did not exist in commit_hash (newly created files to unlink)
+        for rel_tf, abs_tf in validated_targets:
+            if not file_exists_in_commit(commit_hash, rel_tf, store):
+                if abs_tf.exists():
+                    planned_unlinks.append(rel_tf)
+
+        # DRY RUN MODE (Default): Return preview diff and instructions without touching disk
+        if dry_run or not user_approved:
+            diff_res = self.get_diff(snapshot_id, compare_to_id="WORKING_TREE", working_dir=wdir)
+            return {
+                "ok": True,
+                "dry_run": True,
+                "snapshot_id": snap["id"] if snap else snapshot_id,
+                "checkpoint_hash": commit_hash,
+                "working_dir": wdir,
+                "files_restored": False,
+                "planned_restored_files": planned_restores,
+                "planned_unlinked_files": planned_unlinks,
+                "planned_deleted_stray_files": planned_unlinks,
+                "diff": diff_res.get("diff", "(No diff)"),
+                "message": (
+                    f"Dry run preview for snapshot '{snapshot_id}'. "
+                    f"Planned surgical restores: {planned_restores}. "
+                    f"Planned deletions of new files: {planned_unlinks}. "
+                    f"No files were modified on disk. To execute, run: /tm restore {snapshot_id} "
+                    f"(or confirm via Hermes approval prompt / Dashboard)."
+                ),
+            }
+
+        # EXECUTION MODE (User Approved):
+        # 1. Take a pre-restore safety backup into plugin store first
+        backup_hash = self.ensure_and_get_checkpoint(wdir, f"pre-restore-safety-backup-{snapshot_id}")
+        backup_snap = None
+        if backup_hash:
+            backup_snap = self.record_pre_tool(
+                session_id=snap.get("session_id") if snap else "recovery",
+                tool_name="pre_restore_safety_backup",
+                tool_args_summary=f"pre_restore_safety_backup before reverting to {snapshot_id}",
+                working_dir=wdir,
+                reason=f"pre_restore_safety_backup before reverting to {snapshot_id}",
+            )
+
+        # 2. Extract and restore files strictly from plugin bare git store (NEVER git checkout -f in user repo)
+        restored_files = []
+        unlinked_files = []
+        errors = []
+
+        if validated_targets:
+            for rel_tf, abs_tf in validated_targets:
+                existed = file_exists_in_commit(commit_hash, rel_tf, store)
+                if existed:
+                    res = subprocess.run(
+                        ["git", f"--git-dir={store}", "show", f"{commit_hash}:{rel_tf}"],
+                        capture_output=True,
+                        timeout=10,
+                        env=_minimal_git_env(),
+                    )
+                    if res.returncode == 0:
+                        try:
+                            abs_tf.parent.mkdir(parents=True, exist_ok=True)
+                            abs_tf.write_bytes(res.stdout)
+                            restored_files.append(rel_tf)
+                        except OSError as io_err:
+                            errors.append(f"Write error on {rel_tf}: {io_err}")
+                    else:
+                        errors.append(f"Extract error on {rel_tf}: {res.stderr.decode('utf-8', 'replace')}")
+                else:
+                    if abs_tf.exists():
+                        try:
+                            abs_tf.unlink()
+                            unlinked_files.append(rel_tf)
+                        except OSError as rm_err:
+                            errors.append(f"Could not remove {rel_tf}: {rm_err}")
+        else:
+            # Full restoration from store via git archive (safe, never detaches user's HEAD)
+            try:
+                archive_res = subprocess.run(
+                    ["git", f"--git-dir={store}", "archive", commit_hash],
+                    capture_output=True,
+                    timeout=30,
+                    env=_minimal_git_env(),
+                )
+                if archive_res.returncode == 0:
+                    import io
+                    import tarfile
+                    with tarfile.open(fileobj=io.BytesIO(archive_res.stdout)) as tf_archive:
+                        if hasattr(tarfile, "data_filter"):
+                            tf_archive.extractall(path=wdir, filter="data")
+                        else:
+                            tf_archive.extractall(path=wdir)
+                    restored_files.append("(all workspace files)")
+                else:
+                    errors.append(f"Full archive extraction failed: {archive_res.stderr.decode('utf-8', 'replace')}")
+            except Exception as a_exc:
+                errors.append(f"Full extraction error: {a_exc}")
+                if archive_res.returncode == 0:
+                    import tarfile
+                    import io
+                    with tarfile.open(fileobj=io.BytesIO(archive_res.stdout)) as tf_archive:
+                        tf_archive.extractall(path=wdir)
+                    restored_files.append("(all workspace files)")
+                else:
+                    errors.append(f"Full archive extraction failed: {archive_res.stderr.decode('utf-8', 'replace')}")
+            except Exception as a_exc:
+                errors.append(f"Full extraction error: {a_exc}")
+
+        ok = len(errors) == 0 and (len(restored_files) > 0 or len(unlinked_files) > 0)
+        return {
+            "ok": ok,
+            "dry_run": False,
             "snapshot_id": snap["id"] if snap else snapshot_id,
             "checkpoint_hash": commit_hash,
             "working_dir": wdir,
-            "files_restored": False,
-            "restored_files": [vt[0] for vt in validated_targets] if validated_targets else "all",
-            "unlinked_new_files": [],
-            "conversation_rewound": False,
-            "messages_deactivated": 0,
-            "pre_restore_backup_id": None,
-        }
-
-        if restore_files:
-            if not commit_hash:
-                return {
-                    **result,
-                    "ok": False,
-                    "error": f"No checkpoint hash available for snapshot '{snapshot_id}'.",
-                }
-
-            store_dir = self.hermes_home / "checkpoints" / "store"
-            # Verify target commit exists and is a valid commit before touching ANY files on disk
-            is_valid_commit = False
-            if store_dir and store_dir.exists():
-                c_check = subprocess.run(
-                    ["git", f"--git-dir={store_dir}", "cat-file", "-t", commit_hash],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if c_check.returncode == 0 and c_check.stdout.strip() == "commit":
-                    is_valid_commit = True
-
-            if not is_valid_commit:
-                c_check_loc = subprocess.run(
-                    ["git", "cat-file", "-t", commit_hash],
-                    cwd=wdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if c_check_loc.returncode == 0 and c_check_loc.stdout.strip() == "commit":
-                    is_valid_commit = True
-
-            if not is_valid_commit:
-                return {
-                    **result,
-                    "ok": False,
-                    "error": f"Commit {commit_hash} does not exist in checkpoint store or repository.",
-                    "files_restored": False,
-                }
-            hash16 = self._project_hash16(wdir)
-            env = {
-                **os.environ,
-                "GIT_DIR": str(store_dir),
-                "GIT_WORK_TREE": str(Path(wdir).resolve()),
-                "GIT_INDEX_FILE": str(store_dir / "indexes" / hash16),
-            }
-
-            # First-Class Dry-Run Preview Mode: Return planned changes without modifying disk
-            if dry_run or not confirm:
-                planned_restored = []
-                planned_unlinked = []
-                if validated_targets:
-                    for rel_tf, abs_tf in validated_targets:
-                        if file_exists_in_commit(commit_hash, rel_tf, wdir, store_dir):
-                            planned_restored.append(rel_tf)
-                        elif abs_tf.exists():
-                            planned_unlinked.append(rel_tf)
-                else:
-                    planned_restored = ["all"]
-
-                return {
-                    **result,
-                    "ok": True,
-                    "dry_run": True,
-                    "files_restored": False,
-                    "planned_restored_files": planned_restored,
-                    "planned_deleted_stray_files": planned_unlinked,
-                    "message": "Dry-run preview complete. No files were modified on disk. Set confirm=true to apply changes.",
-                }
-
-            # 1. "Rollback of a Rollback" Safety Backup: Capture pre-restore safety snapshot
-            try:
-                safety_snap = self.record_pre_tool(
-                    session_id=snap.get("session_id") if snap else "default",
-                    tool_name="pre_restore_safety_backup",
-                    args={
-                        "target_snapshot_id": snapshot_id,
-                        "target_commit": commit_hash,
-                        "file_paths": [vt[0] for vt in validated_targets] or None,
-                    },
-                    working_dir=wdir,
-                )
-                if safety_snap:
-                    result["pre_restore_backup_id"] = safety_snap.get("id")
-            except Exception as exc:
-                logger.warning("Could not capture pre-restore safety snapshot: %s", exc)
-
-            # 2. Surgical File Restoration (Handles newly created files without git pathspec failure)
-            if validated_targets:
-                restored_any = False
-                unlinked = []
-                errors = []
-
-                for rel_tf, abs_tf in validated_targets:
-                    existed = file_exists_in_commit(commit_hash, rel_tf, wdir, store_dir)
-                    if existed:
-                        # Restore file from commit
-                        res = subprocess.run(
-                            ["git", "checkout", commit_hash, "--", rel_tf],
-                            cwd=wdir,
-                            env=env if store_dir.exists() else None,
-                            capture_output=True,
-                            text=True,
-                            timeout=15,
-                        )
-                        if res.returncode == 0:
-                            restored_any = True
-                        else:
-                            res_loc = subprocess.run(["git", "checkout", commit_hash, "--", rel_tf], cwd=wdir, capture_output=True, text=True, timeout=15)
-                            if res_loc.returncode == 0:
-                                restored_any = True
-                            else:
-                                errors.append(f"{rel_tf}: {res.stderr or res_loc.stderr or 'checkout failed'}")
-                    else:
-                        # Newly created file that did not exist in commit_hash: unlink safely
-                        if abs_tf.exists():
-                            try:
-                                if abs_tf.is_file() or abs_tf.is_symlink():
-                                    abs_tf.unlink()
-                                    unlinked.append(rel_tf)
-                                    restored_any = True
-                            except OSError as rm_err:
-                                errors.append(f"Could not remove newly created file {rel_tf}: {rm_err}")
-
-                result["files_restored"] = restored_any
-                result["unlinked_new_files"] = unlinked
-                if not restored_any and errors:
-                    result["ok"] = False
-                    result["error"] = "; ".join(errors)
-                    return result
-
-            else:
-                # Full Workspace Restoration via git checkout -f
-                res = subprocess.run(
-                    ["git", "checkout", "-f", commit_hash],
-                    cwd=wdir,
-                    env=env if store_dir.exists() else None,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                if res.returncode == 0:
-                    result["files_restored"] = True
-                else:
-                    res_loc = subprocess.run(
-                        ["git", "checkout", "-f", commit_hash],
-                        cwd=wdir,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if res_loc.returncode == 0:
-                        result["files_restored"] = True
-                    else:
-                        result["ok"] = False
-                        result["error"] = res.stderr or res_loc.stderr or "git checkout -f failed"
-                        return result
-
-                # Clean up newly-created files recorded in subsequent snapshots of this session
-                if snap and snap.get("session_id"):
-                    with self._lock, self._connect() as conn:
-                        later_rows = conn.execute(
-                            "SELECT tool_args_summary FROM snapshots WHERE session_id = ? AND created_at > ?",
-                            (snap["session_id"], snap["created_at"]),
-                        ).fetchall()
-                        for r in later_rows:
-                            summary = r[0] or ""
-                            # Simple regex matching file names in tool args
-                            for m_path in re.findall(r'[\'\"]([\w./\\-]+\.[a-zA-Z0-9]+)[\'\"]', summary):
-                                try:
-                                    abs_file = (Path(wdir) / m_path).resolve()
-                                    if abs_file.exists() and abs_file.is_file():
-                                        rel_f = str(abs_file.relative_to(Path(wdir).resolve())).replace("\\", "/")
-                                        if not file_exists_in_commit(commit_hash, rel_f, wdir, store_dir):
-                                            abs_file.unlink()
-                                            result["unlinked_new_files"].append(rel_f)
-                                except Exception:
-                                    pass
-
-        # Conversation rewind: Only if explicitly requested
-        if rewind_conversation and snap and snap.get("session_id"):
-            session_id = snap["session_id"]
-            watermark_id = snap.get("message_id_watermark")
-            deactivated = self._rewind_session_to_watermark(session_id, watermark_id)
-            result["conversation_rewound"] = True
-            result["messages_deactivated"] = deactivated
-            result["session_id"] = session_id
-            result["message_id_watermark"] = watermark_id
-
-        return result
-
-    def _rewind_session_to_watermark(
-        self, session_id: str, watermark_id: Optional[int]
-    ) -> int:
-        if watermark_id is None:
-            return 0
-
-        state_db_path = self.hermes_home / "state.db"
-        if not state_db_path.exists():
-            return 0
-
-        before_active = 0
-        first_user_after_id: Optional[int] = None
-
-        try:
-            with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND COALESCE(active, 1) = 1",
-                    (session_id,),
-                ).fetchone()
-                before_active = int(row[0] or 0) if row else 0
-
-                user_row = conn.execute(
-                    """
-                    SELECT id FROM messages
-                    WHERE session_id = ? AND id > ? AND role = 'user' AND COALESCE(active, 1) = 1
-                    ORDER BY id ASC LIMIT 1
-                    """,
-                    (session_id, watermark_id),
-                ).fetchone()
-                if user_row:
-                    first_user_after_id = int(user_row[0])
-        except Exception as exc:
-            logger.error("Failed reading state.db before rewind: %s", exc)
-            return 0
-
-        rewound_via_session_db = False
-        if first_user_after_id is not None:
-            db = self._get_session_db()
-            if db is not None and hasattr(db, "rewind_to_message"):
-                try:
-                    rewound_via_session_db = bool(
-                        db.rewind_to_message(session_id, first_user_after_id)
-                    )
-                except Exception as exc:
-                    logger.debug("SessionDB.rewind_to_message fallback: %s", exc)
-
-        try:
-            with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
-                conn.execute(
-                    """
-                    UPDATE messages
-                    SET active = 0
-                    WHERE session_id = ? AND id > ? AND COALESCE(active, 1) = 1
-                    """,
-                    (session_id, watermark_id),
-                )
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND COALESCE(active, 1) = 1",
-                    (session_id,),
-                ).fetchone()
-                after_active = int(row[0] or 0) if row else 0
-                deactivated = max(0, before_active - after_active)
-
-                conn.execute(
-                    """
-                    UPDATE sessions
-                    SET message_count = ?,
-                        rewind_count = COALESCE(rewind_count, 0) + ?
-                    WHERE id = ?
-                    """,
-                    (
-                        after_active,
-                        1 if (deactivated > 0 and not rewound_via_session_db) else 0,
-                        session_id,
-                    ),
-                )
-                conn.commit()
-                return deactivated
-        except Exception as exc:
-            logger.error(
-                "Failed finalizing rewind for session %s to watermark %s: %s",
-                session_id,
-                watermark_id,
-                exc,
-            )
-            return 0
-
-    def branch_from_snapshot(
-        self,
-        snapshot_id: str,
-        *,
-        branch_title: Optional[str] = None,
-        restore_files: bool = True,
-        working_dir: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        snap = self.get_snapshot(snapshot_id)
-        if not snap:
-            return {
-                "ok": False,
-                "error": f"Snapshot '{snapshot_id}' not found in Time Machine ledger.",
-            }
-
-        parent_session_id = snap["session_id"]
-        watermark_id = snap.get("message_id_watermark")
-        commit_hash = snap.get("checkpoint_hash")
-        wdir = snap.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
-
-        new_session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        db = self._get_session_db()
-        state_db_path = self.hermes_home / "state.db"
-
-        parent_meta: Dict[str, Any] = {}
-        copied_messages = 0
-
-        if state_db_path.exists():
-            try:
-                with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
-                    conn.row_factory = sqlite3.Row
-                    tbls = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-                    if "sessions" in tbls:
-                        parent_row = conn.execute(
-                            "SELECT * FROM sessions WHERE id = ?", (parent_session_id,)
-                        ).fetchone()
-                        if parent_row:
-                            parent_meta = dict(parent_row)
-            except Exception as exc:
-                logger.debug("Could not read parent session %s: %s", parent_session_id, exc)
-
-        title = branch_title or (
-            f"{parent_meta.get('title') or parent_session_id} [branch @{snap['id'][:12]}]"
-        )
-
-        created_via_db = False
-        if db is not None and hasattr(db, "create_session"):
-            try:
-                db.create_session(
-                    session_id=new_session_id,
-                    source=parent_meta.get("source") or "cli",
-                    user_id=parent_meta.get("user_id"),
-                    model=parent_meta.get("model"),
-                    system_prompt=parent_meta.get("system_prompt"),
-                    parent_session_id=parent_session_id,
-                    title=title,
-                )
-                created_via_db = True
-            except TypeError:
-                try:
-                    db.create_session(
-                        session_id=new_session_id,
-                        source=parent_meta.get("source") or "cli",
-                        model=parent_meta.get("model"),
-                        parent_session_id=parent_session_id,
-                    )
-                    created_via_db = True
-                except Exception as exc:
-                    logger.debug("SessionDB.create_session fallback: %s", exc)
-
-        if state_db_path.exists():
-            try:
-                with sqlite3.connect(str(state_db_path), timeout=5.0) as conn:
-                    conn.row_factory = sqlite3.Row
-                    tbls = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-
-                    if "sessions" in tbls:
-                        if not created_via_db:
-                            conn.execute(
-                                """
-                                INSERT INTO sessions (
-                                    id, source, user_id, model, system_prompt,
-                                    parent_session_id, title, started_at, message_count
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                                """,
-                                (
-                                    new_session_id,
-                                    parent_meta.get("source") or "cli",
-                                    parent_meta.get("user_id"),
-                                    parent_meta.get("model"),
-                                    parent_meta.get("system_prompt"),
-                                    parent_session_id,
-                                    title,
-                                    time.time(),
-                                ),
-                            )
-                        else:
-                            try:
-                                conn.execute(
-                                    "UPDATE sessions SET title = ? WHERE id = ?",
-                                    (title, new_session_id),
-                                )
-                            except Exception:
-                                pass
-
-                    if "messages" in tbls:
-                        table_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
-                        potential_cols = [
-                            "role", "content", "tool_call_id", "tool_calls", "name",
-                            "timestamp", "token_count", "finish_reason", "reasoning",
-                            "reasoning_details", "codex_reasoning_items"
-                        ]
-                        avail_cols = [c for c in potential_cols if c in table_cols]
-
-                        if avail_cols:
-                            select_cols_str = ", ".join(avail_cols)
-                            where_sql = "WHERE session_id = ? AND COALESCE(active, 1) = 1"
-                            q_params = [parent_session_id]
-                            if watermark_id is not None and "id" in table_cols:
-                                where_sql += " AND id <= ?"
-                                q_params.append(watermark_id)
-                            order_sql = "ORDER BY id ASC" if "id" in table_cols else ""
-
-                            msg_rows = conn.execute(
-                                f"SELECT {select_cols_str} FROM messages {where_sql} {order_sql}",
-                                tuple(q_params),
-                            ).fetchall()
-
-                            insert_cols = ["session_id"] + avail_cols
-                            if "active" in table_cols:
-                                insert_cols.append("active")
-                            placeholders = ", ".join(["?"] * len(insert_cols))
-                            insert_sql = f"INSERT INTO messages ({', '.join(insert_cols)}) VALUES ({placeholders})"
-
-                            for m in msg_rows:
-                                row_vals = [new_session_id] + [m[c] for c in avail_cols]
-                                if "active" in table_cols:
-                                    row_vals.append(1)
-                                conn.execute(insert_sql, tuple(row_vals))
-                                copied_messages += 1
-
-                    if "sessions" in tbls:
-                        try:
-                            conn.execute(
-                                "UPDATE sessions SET message_count = ? WHERE id = ?",
-                                (copied_messages, new_session_id),
-                            )
-                        except Exception:
-                            pass
-                    conn.commit()
-            except Exception as exc:
-                logger.debug("State DB branch synchronization: %s", exc)
-
-        files_restored = False
-        restore_details = None
-        if restore_files and commit_hash:
-            restore_details = self.restore_snapshot(
-                snapshot_id=snapshot_id,
-                restore_files=True,
-                rewind_conversation=False,
-                working_dir=wdir,
-                confirm=True,
-            )
-            files_restored = bool(restore_details.get("ok", False))
-
-        return {
-            "ok": True,
-            "snapshot_id": snap["id"],
-            "parent_session_id": parent_session_id,
-            "new_session_id": new_session_id,
-            "title": title,
-            "copied_messages": copied_messages,
-            "message_id_watermark": watermark_id,
-            "checkpoint_hash": commit_hash,
-            "working_dir": wdir,
-            "files_restored": files_restored,
-            "checkpoint_restore_result": restore_details,
-        }
-
-    @staticmethod
-    def _summarize_args(tool_name: str, args: Dict[str, Any]) -> str:
-        if not args:
-            return ""
-        for k in ("path", "file_path", "target_file", "command", "query"):
-            if k in args and isinstance(args[k], str):
-                val = args[k].strip().replace("\n", " ")
-                return f"{k}={val[:80]}"
-        raw = json.dumps(args, ensure_ascii=False, default=str)
-        return raw[:100]
-
-
-    def prune_snapshots(self, session_id: Optional[str] = None, keep_last: int = 50) -> Dict[str, Any]:
-        """Keep most recent keep_last snapshots per session, preserving baselines and safety backups."""
-        with self._lock, self._connect() as conn:
-            query = "SELECT id, tool_name, recommended_snapshot_id FROM snapshots"
-            params = []
-            if session_id:
-                query += " WHERE session_id = ?"
-                params.append(session_id)
-            query += " ORDER BY created_at DESC"
-
-            rows = [dict(r) for r in conn.execute(query, tuple(params)).fetchall()]
-            total_before = len(rows)
-
-            keep_ids = set()
-            # 1. Keep the most recent keep_last
-            for r in rows[:keep_last]:
-                keep_ids.add(r["id"])
-
-            # 2. Always keep protected snapshots
-            for r in rows:
-                if r.get("tool_name") in ("session_start", "pre_restore_safety_backup"):
-                    keep_ids.add(r["id"])
-                if r.get("recommended_snapshot_id"):
-                    keep_ids.add(r["id"])
-                    keep_ids.add(r["recommended_snapshot_id"])
-
-            delete_ids = [r["id"] for r in rows if r["id"] not in keep_ids]
-            if delete_ids:
-                placeholders = ",".join("?" for _ in delete_ids)
-                conn.execute(f"DELETE FROM snapshots WHERE id IN ({placeholders})", tuple(delete_ids))
-                conn.commit()
-
-            return {
-                "ok": True,
-                "session_id": session_id,
-                "keep_last": keep_last,
-                "total_before": total_before,
-                "pruned_count": len(delete_ids),
-                "retained_count": len(keep_ids),
-            }
-
-    def get_storage_stats(self) -> Dict[str, Any]:
-        """Return total snapshots, sessions, self-heal alerts, and estimated store size."""
-        total_snaps = 0
-        total_sess = 0
-        heal_alerts = 0
-        db_size = 0
-
-        if self.db_path.exists():
-            db_size = self.db_path.stat().st_size
-
-        store_dir = self.hermes_home / "checkpoints" / "store"
-        store_size = 0
-        if store_dir.exists():
-            for f in store_dir.rglob("*"):
-                if f.is_file():
-                    store_size += f.stat().st_size
-
-        with self._lock, self._connect() as conn:
-            try:
-                row = conn.execute("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM snapshots").fetchone()
-                if row:
-                    total_snaps = int(row[0] or 0)
-                    total_sess = int(row[1] or 0)
-                heal_row = conn.execute("SELECT COUNT(*) FROM snapshots WHERE self_heal_candidate = 1").fetchone()
-                if heal_row:
-                    heal_alerts = int(heal_row[0] or 0)
-            except Exception:
-                pass
-
-        return {
-            "total_snapshots": total_snaps,
-            "total_sessions": total_sess,
-            "self_heal_alerts_count": heal_alerts,
-            "db_size_bytes": db_size,
-            "store_size_bytes": store_size,
-            "total_storage_bytes": db_size + store_size,
+            "files_restored": len(restored_files) > 0,
+            "restored_files": restored_files,
+            "unlinked_new_files": unlinked_files,
+            "pre_restore_backup_id": backup_snap.get("id") if backup_snap else None,
+            "errors": errors if errors else None,
+            "message": (
+                f"Successfully restored {len(restored_files)} file(s) from snapshot '{snapshot_id}'. "
+                f"Safety backup captured: '{backup_snap.get('id') if backup_snap else None}'."
+                if ok else f"Restoration encountered errors: {'; '.join(errors)}"
+            ),
         }
 
     def diagnose_failure(
@@ -1524,40 +1006,26 @@ class TimeMachineLedger:
         working_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Diagnose failure root-cause by correlating test/compiler error output with
-        recently modified files and checkpoints. Returns culprit files, recommended
-        safe snapshot, preserved files, confidence score, and suggested action.
+        Diagnose failure root-cause by correlating error output with recently modified files.
+        Only selects candidate snapshots with verified commits from the plugin's store.
         """
         sess = session_id or "default"
+        wdir = resolve_working_dir(working_dir)
         snaps = self.list_snapshots(session_id=sess, limit=50)
-        if not snaps and working_dir:
-            snaps = self.list_snapshots(working_dir=working_dir, limit=50)
-        wdir = (
-            str(Path(working_dir).expanduser().resolve())
-            if (working_dir and str(working_dir).strip())
-            else (
-                snaps[0].get("working_dir")
-                if snaps
-                else resolve_working_dir(hermes_home=self.hermes_home)
-            )
-        )
 
         err_msg = error_text or ""
-        last_failed_command = ""
+        last_failed_command = self._last_failed_commands.get(sess, "")
 
-        # Find the failed command if any
         for s in snaps:
             if s.get("status") == "error" or s.get("self_heal_candidate"):
                 if s.get("tool_args_summary"):
                     last_failed_command = s.get("tool_args_summary")
                 break
 
-        # Collect all file-mutating snapshots in this session (chronological order)
         file_mut_snaps = [s for s in reversed(snaps) if s.get("tool_name") in FILE_MUTATING_TOOLS]
 
-        # Determine all files touched across the session's file-mutating tools
         session_touched_files = []
-        snap_for_file = {}  # file_path -> snapshot right before that file was modified
+        snap_for_file = {}
 
         for s in file_mut_snaps:
             args = _extract_args(s)
@@ -1566,25 +1034,21 @@ class TimeMachineLedger:
                 norm = str(fpath).replace("\\", "/").lstrip("/")
                 if norm not in session_touched_files:
                     session_touched_files.append(norm)
-                # The earliest pre-tool snapshot for this file before the error
-                if norm not in snap_for_file:
+                if norm not in snap_for_file and s.get("checkpoint_hash"):
                     snap_for_file[norm] = s
 
-        # Correlate with err_msg
         implicated_files = []
         for f in session_touched_files:
             basename = Path(f).name
             if (basename in err_msg) or (f in err_msg):
                 implicated_files.append(f)
 
-        # If traceback did not name any session file, pick the file from the latest file-mutating snapshot
         if not implicated_files and file_mut_snaps:
             last_mut_args = _extract_args(file_mut_snaps[-1])
             last_path = last_mut_args.get("path") or last_mut_args.get("file_path") or last_mut_args.get("file")
             if last_path:
                 implicated_files.append(str(last_path).replace("\\", "/").lstrip("/"))
 
-        # If still no implicated files, parse error_text / traceback directly for files existing in wdir
         if not implicated_files and err_msg:
             try:
                 p_wdir = Path(wdir).resolve()
@@ -1604,24 +1068,9 @@ class TimeMachineLedger:
 
         culprit_paths = list(implicated_files)
 
-        # Detect stray temporary files created during the failed turn (e.g. *.tmp, debug_dump*)
-        # Never treat innocent untracked files like notes.txt as culprits!
-        try:
-            p_wdir = Path(wdir).resolve()
-            for tmp_file in p_wdir.glob("*.tmp"):
-                rel_tmp = str(tmp_file.relative_to(p_wdir)).replace("\\", "/")
-                if rel_tmp not in culprit_paths:
-                    culprit_paths.append(rel_tmp)
-        except Exception:
-            pass
-
-        # Identify the recommended snapshot:
-        # Candidate snapshots MUST have a non-empty, valid commit hash!
         recommended_snap = None
         if culprit_paths and culprit_paths[0] in snap_for_file:
-            cand = snap_for_file[culprit_paths[0]]
-            if cand.get("checkpoint_hash"):
-                recommended_snap = cand
+            recommended_snap = snap_for_file[culprit_paths[0]]
 
         if not recommended_snap and file_mut_snaps:
             for s in reversed(file_mut_snaps):
@@ -1635,67 +1084,45 @@ class TimeMachineLedger:
                     recommended_snap = s
                     break
 
-        rec_id = recommended_snap.get("id") if recommended_snap else None
-        rec_commit = recommended_snap.get("checkpoint_hash") if recommended_snap else None
+        rec_id = recommended_snap.get("id") if (recommended_snap and recommended_snap.get("checkpoint_hash")) else None
 
-        # Git Commit History Fallback:
-        # If there is no valid in-session snapshot before the culprit modification (or if the
-        # file was already broken at session start / prior commit like DealDash_ai_Bot e6f554e):
-        git_fallback_commit = None
-        if culprit_paths and Path(wdir).resolve().exists():
+        # Detect newly created stray files created in working_dir after recommended safe snapshot
+        if recommended_snap:
+            rec_time = float(recommended_snap.get("created_at") or 0.0)
+            rec_cp = recommended_snap.get("checkpoint_hash")
             try:
-                primary_culprit = culprit_paths[0]
-                gl = subprocess.run(
-                    ["git", "log", "-n", "5", "--format=%H", "--", primary_culprit],
-                    cwd=wdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if gl.returncode == 0:
-                    hashes = [h.strip() for h in gl.stdout.splitlines() if h.strip()]
-                    if len(hashes) >= 2:
-                        # hashes[0] is current broken commit, hashes[1] is the good pre-regression commit
-                        git_fallback_commit = hashes[1]
-                    elif len(hashes) == 1:
-                        # Only 1 commit for this file; check if HEAD~1 exists
-                        h_prev = subprocess.run(
-                            ["git", "rev-parse", "HEAD~1"],
-                            cwd=wdir,
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if h_prev.returncode == 0 and h_prev.stdout.strip():
-                            git_fallback_commit = h_prev.stdout.strip()
-            except Exception as g_exc:
-                logger.debug("git log fallback error: %s", g_exc)
+                p_wdir = Path(wdir).resolve()
+                for entry in p_wdir.iterdir():
+                    if entry.is_file():
+                        name = entry.name
+                        if name.startswith("."):
+                            continue
+                        rel_name = name
+                        if rel_name in session_touched_files or rel_name in culprit_paths:
+                            continue
+                        try:
+                            # If created after safe checkpoint and not in the safe commit
+                            if entry.stat().st_mtime >= (rec_time - 0.5):
+                                if rec_cp and not file_exists_in_commit(rec_cp, rel_name, self.store_dir):
+                                    culprit_paths.append(rel_name)
+                        except OSError:
+                            pass
+            except Exception:
+                pass
 
-        # Use git fallback commit if no in-session snapshot exists for this culprit
-        # or if the in-session snapshot had no checkpoint_hash
-        used_git_fallback = False
-        if (not rec_id or not rec_commit or (culprit_paths and culprit_paths[0] not in snap_for_file)) and git_fallback_commit:
-            rec_id = git_fallback_commit
-            rec_commit = git_fallback_commit
-            used_git_fallback = True
-
-        # Preserved files: files modified in the session that are NOT in culprit_paths
+        # Preserved files: files modified in session that are NOT in culprit_paths
         preserved_files = sorted([f for f in session_touched_files if f not in culprit_paths])
 
-        if used_git_fallback:
-            explanation = (
-                f"Diagnosed regression in [{', '.join(culprit_paths)}]. No in-session snapshot preceded this change; "
-                f"inspected git history and identified safe parent commit: {rec_id[:7]}. "
-                f"Preserving concurrent modifications in: [{', '.join(preserved_files)}]."
-            )
-        elif culprit_paths and rec_id:
+        if culprit_paths and rec_id:
             explanation = (
                 f"Diagnosed failure culprit file(s): [{', '.join(culprit_paths)}]. "
                 f"Preserving concurrent modifications in: [{', '.join(preserved_files)}]. "
                 f"Recommended safe checkpoint: {rec_id}."
             )
+        elif rec_id:
+            explanation = f"Recommended safe checkpoint prior to failure: {rec_id}."
         else:
-            explanation = "No specific modified files detected prior to command failure."
+            explanation = "No safe checkpoint identified for recovery."
 
         return {
             "ok": True,
@@ -1709,25 +1136,29 @@ class TimeMachineLedger:
             "confidence_score": 0.95 if culprit_paths else 0.5,
             "explanation": explanation,
             "retry_command": last_failed_command,
-            "suggested_action": f"time_machine_recover(auto_apply=true, confirm=true)" if culprit_paths else "time_machine_restore(confirm=true)",
         }
 
     def recover(
         self,
         session_id: Optional[str] = None,
         error_summary: Optional[str] = None,
-        auto_apply: bool = False,
-        confirm: bool = True,
         working_dir: Optional[str] = None,
-        verify_command: Optional[str] = None,
-        auto_verify: bool = True,
-        dry_run: bool = False,
+        dry_run: bool = True,
+        user_approved: bool = False,
+        auto_apply: Optional[bool] = None,
+        confirm: Optional[bool] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Autonomous self-healing recovery: diagnoses root-cause culprits, optionally
-        auto-applies surgical rollback with safety backup, and automatically re-verifies
-        test suites in a single atomic tool call.
+        Diagnose failure and preview recovery plan.
+        Returns suggested_verify_command for execution through Hermes' terminal tool.
+        Defaults to dry-run mode (never writes disk without user approval).
         """
+        if confirm is True or auto_apply is True:
+            user_approved = True
+            if "dry_run" not in kwargs:
+                dry_run = False
+
         diag = self.diagnose_failure(
             session_id=session_id,
             error_text=error_summary,
@@ -1738,163 +1169,61 @@ class TimeMachineLedger:
         preserved_files = diag.get("preserved_files") or []
         rec_id = diag.get("recommended_snapshot_id")
 
-        result = {
-            "ok": True,
-            "diagnosis": diag,
-            "auto_applied": False,
-            "restored_files": [],
-            "preserved_files": preserved_files,
-            "pre_restore_backup_id": None,
-            "retry_command": diag.get("retry_command"),
-            "verification": None,
-        }
-
-        # First-Class Dry-Run Preview Mode
-        if not auto_apply or not confirm or dry_run:
-            dry_details = None
-            if rec_id:
-                dry_details = self.restore_snapshot(
-                    snapshot_id=rec_id,
-                    file_paths=culprit_files if culprit_files else None,
-                    working_dir=diag.get("working_dir") or working_dir,
-                    restore_files=True,
-                    dry_run=True,
-                    confirm=False,
-                )
-            result["dry_run"] = True
-            result["recommended_snapshot_id"] = rec_id
-            result["planned_restored_files"] = dry_details.get("planned_restored_files", culprit_files) if dry_details else culprit_files
-            result["planned_deleted_stray_files"] = dry_details.get("planned_deleted_stray_files", []) if dry_details else []
-            result["message"] = (
-                f"Dry-run recovery preview complete. {diag.get('explanation', '')} "
-                f"Culprits: {culprit_files}. Preserved: {preserved_files}. "
-                f"No files were modified on disk. Call with auto_apply=true and confirm=true to execute."
-            )
-            return result
-
-        if not rec_id:
-            return {
-                **result,
-                "ok": False,
-                "error": "Cannot auto-recover: no valid safe snapshot identified.",
-            }
-
-        restore_res = self.restore_snapshot(
-            snapshot_id=rec_id,
-            file_paths=culprit_files if culprit_files else None,
-            working_dir=diag.get("working_dir") or working_dir,
-            restore_files=True,
-            rewind_conversation=False,
-            confirm=True,
+        suggested_cmd = (
+            diag.get("retry_command")
+            or self._last_failed_commands.get(session_id or "default", "")
         )
-
-        if not restore_res.get("ok"):
-            return {
-                **result,
-                "ok": False,
-                "error": f"Recovery restoration failed: {restore_res.get('error')}",
-                "restore_details": restore_res,
-            }
-
-        result["auto_applied"] = True
-        result["restored_files"] = restore_res.get("restored_files")
-        result["unlinked_new_files"] = restore_res.get("unlinked_new_files")
-        result["pre_restore_backup_id"] = restore_res.get("pre_restore_backup_id")
-
-        # Auto-Verification (with shell=False and strict command allowlist)
-        verification_info = None
-        wdir_target = diag.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
-        cmd_candidate = (
-            verify_command
-            or diag.get("retry_command")
-            or getattr(self, "_last_failed_commands", {}).get(session_id or "default")
-        )
-        if cmd_candidate and cmd_candidate.startswith("command="):
-            cmd_candidate = cmd_candidate.split("=", 1)[1].strip()
-
-        if auto_verify and cmd_candidate:
-            is_valid, parsed_args, reason = validate_verify_command(cmd_candidate)
-            if not is_valid:
-                verification_info = {
-                    "command": cmd_candidate,
-                    "exit_code": -1,
-                    "passed": False,
-                    "output_summary": f"Verification command rejected by security policy: {reason}",
-                }
-            else:
+        if isinstance(suggested_cmd, str):
+            s_str = suggested_cmd.strip()
+            if s_str.startswith("{") and s_str.endswith("}"):
                 try:
-                    v_res = subprocess.run(
-                        parsed_args,
-                        shell=False,
-                        cwd=wdir_target,
-                        capture_output=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=15,
-                    )
-                    passed = (v_res.returncode == 0)
-                    out_snippet = (v_res.stdout.strip() or v_res.stderr.strip())
-                    lines = out_snippet.splitlines()
-                    summary = "\n".join(lines[-5:]) if len(lines) > 5 else out_snippet[:300]
-                    verification_info = {
-                        "command": cmd_candidate,
-                        "exit_code": v_res.returncode,
-                        "passed": passed,
-                        "output_summary": summary,
-                    }
-                except subprocess.TimeoutExpired:
-                    verification_info = {
-                        "command": cmd_candidate,
-                        "exit_code": -1,
-                        "passed": False,
-                        "output_summary": "Verification command timed out after 15s.",
-                    }
-                except Exception as v_err:
-                    verification_info = {
-                        "command": cmd_candidate,
-                        "exit_code": -1,
-                        "passed": False,
-                        "output_summary": f"Verification error: {v_err}",
-                    }
+                    parsed = json.loads(s_str)
+                    if isinstance(parsed, dict) and "command" in parsed:
+                        suggested_cmd = parsed["command"]
+                except Exception:
+                    pass
+            elif s_str.startswith("command="):
+                suggested_cmd = s_str.split("=", 1)[1].strip()
 
-        result["verification"] = verification_info
-        v_msg = ""
-        if verification_info:
-            v_msg = f" Verification '{verification_info['command']}' {'PASSED ✔' if verification_info['passed'] else 'FAILED ❌'}."
+        restore_preview = None
+        if rec_id:
+            restore_preview = self.restore_snapshot(
+                snapshot_id=rec_id,
+                file_paths=culprit_files if culprit_files else None,
+                working_dir=diag.get("working_dir") or working_dir,
+                dry_run=dry_run,
+                user_approved=user_approved,
+            )
 
-        result["message"] = (
-            f"Successfully auto-recovered! Reverted {restore_res.get('restored_files')} "
-            f"to safe snapshot {rec_id}. Safety snapshot {restore_res.get('pre_restore_backup_id')} captured.{v_msg}"
-        )
-        return result
+        is_dry_run = dry_run or not user_approved
 
-    def export_timeline_markdown(self, session_id: Optional[str] = None) -> str:
-        """Export session Time Machine history as structured Markdown report."""
-        sess = session_id or "default"
-        snaps = self.list_snapshots(session_id=session_id, limit=200)
-        stats = self.get_storage_stats()
-
-        lines = [
-            "# ⏱️ Hermes Time Machine Timeline Report",
-            f"**Session:** `{sess}` | **Exported At:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}`",
-            f"**Total Snapshots:** {len(snaps)} | **Store Size:** {round(stats.get('total_storage_bytes', 0) / 1024, 1)} KB\n",
-            "## Snapshots History\n",
-            "| Step | Timestamp | Tool | Checkpoint | Status | Changes | Details |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-
-        for idx, s in enumerate(reversed(snaps), 1):
-            ts = datetime.fromtimestamp(s['created_at']).strftime('%H:%M:%S') if s.get('created_at') else '-'
-            tool = s.get('tool_name', 'unknown')
-            sha = (s.get('checkpoint_hash') or '')[:8] or 'no-git'
-            st = '✅ ok' if s.get('status') == 'ok' else '❌ error'
-            if s.get('self_heal_candidate'):
-                st = '⚠️ heal-candidate'
-            changes = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
-            summary = (s.get('tool_args_summary') or s.get('reason') or '').replace('\n', ' ')[:50]
-            lines.append(f"| {idx} | {ts} | `{tool}` | `{sha}` | {st} | {changes} | {summary} |")
-
-        return "\n".join(lines)
+        return {
+            "ok": bool(rec_id),
+            "dry_run": is_dry_run,
+            "restored": not is_dry_run and bool(restore_preview and restore_preview.get("ok")),
+            "auto_applied": not is_dry_run and bool(restore_preview and restore_preview.get("ok")),
+            "restored_files": restore_preview.get("restored_files", culprit_files) if (restore_preview and not is_dry_run) else [],
+            "pre_restore_backup_id": restore_preview.get("pre_restore_backup_id") if (restore_preview and not is_dry_run) else None,
+            "unlinked_new_files": restore_preview.get("unlinked_new_files", []) if (restore_preview and not is_dry_run) else [],
+            "diagnosis": diag,
+            "recommended_snapshot_id": rec_id,
+            "culprit_files": culprit_files,
+            "preserved_files": preserved_files,
+            "planned_restored_files": restore_preview.get("planned_restored_files", culprit_files) if restore_preview else culprit_files,
+            "planned_unlinked_files": restore_preview.get("planned_unlinked_files", []) if restore_preview else [],
+            "diff": restore_preview.get("diff") if restore_preview else None,
+            "suggested_verify_command": suggested_cmd,
+            "action_required": (
+                f"To apply this surgical restoration, run: /tm restore {rec_id}\n"
+                f"Then verify using Hermes' terminal tool: {suggested_cmd}"
+                if is_dry_run
+                else f"Restoration applied. Please run verification using Hermes' terminal tool: {suggested_cmd}"
+            ),
+            "message": (
+                f"Recovery diagnosis complete. {diag.get('explanation', '')} "
+                f"{'Dry-run preview: no files modified on disk.' if is_dry_run else 'Files restored to disk.'}"
+            ),
+        }
 
     def search_snapshots(
         self,
@@ -1903,6 +1232,7 @@ class TimeMachineLedger:
         file_path: Optional[str] = None,
         limit: int = 20,
         working_dir: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Search historical snapshot diffs, modified files, and tool arguments to find
@@ -1917,8 +1247,10 @@ class TimeMachineLedger:
         q_lower = q.lower()
 
         for s in snaps:
-            snap_id = s["id"]
-            wdir = s.get("working_dir") or working_dir or resolve_working_dir(hermes_home=self.hermes_home)
+            snap_id = s.get("id")
+            if not snap_id:
+                continue
+            wdir = s.get("working_dir") or working_dir or resolve_working_dir(working_dir)
             diff_res = self.get_diff(snap_id, working_dir=wdir)
             files_structured = diff_res.get("files", [])
 
@@ -1926,11 +1258,11 @@ class TimeMachineLedger:
             matched_files: List[str] = []
 
             for f in files_structured:
-                fpath = f.get("path") or ""
+                fpath = f.get("path") or f.get("file") or ""
                 if file_path and file_path not in fpath:
                     continue
 
-                chunk = f.get("diff_chunk") or ""
+                chunk = f.get("diff_chunk") or f.get("patch") or ""
                 for line in chunk.splitlines():
                     if (line.startswith("+") or line.startswith("-")) and not line.startswith("+++") and not line.startswith("---"):
                         if q_lower in line.lower():
@@ -1968,3 +1300,19 @@ class TimeMachineLedger:
             "total_matches": len(matches),
             "matches": matches,
         }
+
+    def get_last_safe_snapshot(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get the latest file-mutating snapshot that succeeded."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM snapshots
+                WHERE session_id = ? AND tool_name IN ('write_file', 'patch', 'edit_file', 'apply_patch', 'multi_patch')
+                  AND status = 'ok' AND checkpoint_hash IS NOT NULL AND checkpoint_hash != ''
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if row:
+                return dict(row)
+        return None

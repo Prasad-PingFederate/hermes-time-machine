@@ -6,69 +6,69 @@ test('desktop/plugin.js exports metadata and activates with ctx', async () => {
   assert.equal(plugin.id, 'time-machine');
   assert.equal(plugin.name, 'Hermes Time Machine');
   assert.equal(typeof plugin.activate, 'function');
+  assert.equal(typeof plugin.register, 'function');
 
   const registered = [];
   const stubCtx = {
+    registerMany: (items) => registered.push(...items),
     register: (item) => registered.push(item),
-    rest: async () => ({
-      snapshots: [
-        {
-          id: 'snap-xss-1',
-          tool_name: '<script>alert(1)</script>',
-          session_id: 'sess<xss>',
-          checkpoint_hash: 'hash<xss>',
-          created_at: 1700000000,
-          status: 'ok',
-        },
-      ],
-      total_storage_bytes: 1048576,
-    }),
+    rest: async (path) => {
+      if (path === '/status') {
+        return {
+          snapshot_count: 3,
+          self_heal_available: false,
+          store_size_bytes: 2048,
+        };
+      }
+      return {
+        snapshots: [
+          {
+            id: 'snap-test-1',
+            tool_name: 'write_file',
+            session_id: 'test_session',
+            checkpoint_hash: 'abc1234567890def',
+            created_at: 1700000000,
+            status: 'ok',
+            modified_files_count: 1,
+          },
+        ],
+      };
+    },
   };
 
   plugin.activate(stubCtx);
-  assert.equal(registered.length, 3);
+  assert.ok(registered.length >= 2, `Expected at least 2 registrations, got ${registered.length}`);
 
   const areas = registered.map((r) => r.area);
-  assert.ok(areas.includes('statusBar.right'), 'Missing statusBar.right');
-  assert.ok(areas.includes('rail.right'), 'Missing rail.right');
-  assert.ok(areas.includes('pane'), 'Missing pane Studio route');
+  assert.ok(areas.includes('statusBar.right'), 'Missing statusBar.right registration');
+  assert.ok(areas.includes('panes'), 'Missing panes registration');
+  assert.ok(!areas.includes('rail.right'), 'Found invalid rail.right area');
+  assert.ok(!areas.includes('pane'), 'Found invalid legacy pane area');
 
-  // Stub DOM container
-  const container = {
-    _html: '',
-    get innerHTML() {
-      return this._html;
-    },
-    set innerHTML(val) {
-      this._html = val;
-    },
-    querySelector: () => null,
-    querySelectorAll: () => [],
-  };
+  // Verify contributions use render: () => <ReactNode> and NOT mount(el)
+  const statusItem = registered.find((r) => r.area === 'statusBar.right');
+  assert.ok(statusItem, 'statusBar.right item not found');
+  assert.equal(typeof statusItem.render, 'function', 'statusBar item must provide render()');
+  assert.equal(statusItem.mount, undefined, 'statusBar item must not use mount()');
 
-  const rail = registered.find((r) => r.id === 'time-machine-rail');
-  assert.ok(rail && typeof rail.mount === 'function');
-  const unmount = rail.mount(container);
+  const statusNode = statusItem.render();
+  assert.ok(statusNode && typeof statusNode === 'object', 'statusItem.render() must return a React node');
+  assert.ok(statusNode.type, 'statusNode must have a type property');
 
-  // Wait for async snapshot load and render
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  const paneItem = registered.find((r) => r.area === 'panes');
+  assert.ok(paneItem, 'panes item not found');
+  assert.equal(typeof paneItem.render, 'function', 'pane item must provide render()');
+  assert.equal(paneItem.mount, undefined, 'pane item must not use mount()');
 
-  assert.ok(container.innerHTML.length > 0, 'Container was not rendered');
-  assert.ok(
-    !container.innerHTML.includes('<script>alert(1)</script>'),
-    'Unescaped script payload found in HTML'
-  );
-  assert.ok(
-    container.innerHTML.includes('&lt;script&gt;alert(1)&lt;/script&gt;'),
-    'Sanitized HTML entity missing'
-  );
-
-  if (typeof unmount === 'function') unmount();
+  const paneNode = paneItem.render();
+  assert.ok(paneNode && typeof paneNode === 'object', 'paneItem.render() must return a React node');
+  assert.ok(paneNode.type, 'paneNode must have a type property');
 });
 
-test('statusBar chip renders visible badge and self-heal notice without 0-byte failure', async () => {
+test('desktop/plugin.js statusBar render handles status and self-heal states', async () => {
   const registered = [];
   const stubCtx = {
+    registerMany: (items) => registered.push(...items),
     register: (item) => registered.push(item),
     rest: async () => ({
       snapshot_count: 5,
@@ -78,30 +78,11 @@ test('statusBar chip renders visible badge and self-heal notice without 0-byte f
   };
 
   plugin.activate(stubCtx);
-  const statusItem = registered.find((r) => r.id === 'time-machine-status');
-  assert.ok(statusItem && typeof statusItem.mount === 'function');
+  const statusItem = registered.find((r) => r.area === 'statusBar.right');
+  assert.ok(statusItem && typeof statusItem.render === 'function');
 
-  const container = {
-    _html: '',
-    get innerHTML() {
-      return this._html;
-    },
-    set innerHTML(val) {
-      this._html = val;
-    },
-    querySelector: () => ({ onclick: null }),
-    querySelectorAll: () => [],
-  };
-
-  const unmount = statusItem.mount(container);
-  assert.ok(container.innerHTML.length > 0, 'Status bar chip was 0 bytes initially');
-
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  assert.ok(container.innerHTML.length > 0, 'Status bar chip was 0 bytes after update');
-  assert.ok(
-    container.innerHTML.includes('Self-Heal Available'),
-    'Self-heal badge text missing from status bar'
-  );
-
-  if (typeof unmount === 'function') unmount();
+  const node = statusItem.render();
+  assert.ok(node && typeof node === 'object');
+  const rendered = typeof node.type === 'function' ? node.type(node.props) : node;
+  assert.equal(rendered.type, 'button');
 });

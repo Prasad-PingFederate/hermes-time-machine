@@ -4,116 +4,96 @@
 *Built for the Nous Research Hermes Agent Hackathon*
 
 [![Hermes Plugin Validate](https://img.shields.io/badge/hermes_plugin_validate-16%2F16_PASS-success.svg)](#official-hermes-admission-validator)
-[![Tests](https://img.shields.io/badge/pytest-31%2F31_PASS-brightgreen.svg)](#unit--integration-test-suite-pytest)
-[![Unittest](https://img.shields.io/badge/unittest-31%2F31_PASS-brightgreen.svg)](#standard-library-unittest-compatibility)
 [![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](plugin.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Prasad-PingFederate/hermes-time-machine/actions/workflows/ci.yml/badge.svg)](https://github.com/Prasad-PingFederate/hermes-time-machine/actions/workflows/ci.yml)
 
 ---
 
-## ⚡ Why Time Machine Over Built-In `/rollback`?
+## ⚡ What is Time Machine?
 
-While Hermes Agent includes basic `/rollback` support, `hermes-time-machine` elevates autonomous development into a **self-healing, zero-risk, surgical engineering platform**:
+`hermes-time-machine` transforms Hermes Agent into a fearless, zero-risk autonomous software developer. By maintaining an isolated bare git store and SQLite ledger inside the plugin's private data directory (`$HERMES_HOME/plugin-data/time-machine/`), it provides both human operators and autonomous agents with:
 
-| Capability | Built-In `/rollback` | `hermes-time-machine` |
-| :--- | :--- | :--- |
-| **Recovery Workflow** | Multi-turn manual reset | **1-Call Autonomous Recovery (`time_machine_recover`):** Diagnoses culprit files from tracebacks, reverts only broken files, unlinks stray temp files, and re-verifies the test suite inside the same tool call. |
-| **File Granularity** | Blunt whole-repo rollback | **Surgical Per-File Rollback:** Reverts broken `billing.py` while preserving newly written `tax.py` feature additions. |
-| **Safety Net** | Overwrites disk state | **Rollback of a Rollback:** Captures automatic `pre_restore_safety_backup` before modifying disk state—zero data loss guarantee. |
-| **Inspection & Control** | Blind rollback | **First-Class Dry-Run:** `confirm=false` or `dry_run=true` returns structured preview of affected files without touching disk. |
-| **Desktop Experience** | Text-only CLI | **Interactive Visual Timeline Scrubber:** Horizontal step scrubber in Hermes Desktop with split diffs, branch badges (`🌿 Forked`), and 1-click **"⚡ Restore & Retry"**. |
-| **Investigation** | Manual git diff inspection | **"What Introduced This?" Diff Search (`time_machine_search`):** Search code diffs across history to pinpoint exact snapshots and line numbers. |
+- **Autonomous Self-Healing Recovery (`time_machine_recover`):** Diagnoses broken tests, identifies root-cause culprit edits from tracebacks, safely stages restoration plans in dry-run mode, and returns `suggested_verify_command` for execution through Hermes' native `terminal` tool.
+- **Surgical Per-File Rollback (`time_machine_restore`):** Reverts only the broken file while preserving newly added features in other files. Never executes `git checkout -f` on the user's repository.
+- **Rollback of a Rollback Safety Net:** Captures an automatic `pre_restore_safety_backup` snapshot in the plugin's bare store before any file is restored—zero data loss guarantee.
+- **Human Approval Guard:** Restorations default to preview mode (`dry_run=true`) and require explicit user approval (via `/tm restore <snapshot_id>` or interactive confirmation) before modifying files on disk.
+- **"What Introduced This?" Diff Search (`time_machine_search`):** Search code diffs across history to pinpoint exact snapshots and line numbers.
+- **Hermes Desktop & Dashboard Surfaces:** Status bar indicator (`statusBar.right`), timeline sidebar pane (`panes`), and web dashboard tab.
 
 ---
 
-## 🛡️ Rock-Solid Security & Control Guarantees
+## 🛡️ Architecture & Security Guarantees
 
-1. **Zero Command Injection (`shell=False`):**
-   Auto-verification uses strict `shlex.split(verify_command)` and executes exclusively via `subprocess.run(args, shell=False)`. Shell chaining and redirection operators (`;`, `&&`, `||`, `|`, `` ` ``, `$(`, `>`, `<`, `\n`, `\r`) are blocked by security policy.
-2. **Safe Test Runner Allowlist:**
-   Verification commands are restricted to standard test and build runners (`pytest`, `python -m`, `npm`, `pnpm`, `yarn`, `bun`, `cargo`, `go`, `ruff`, `flake8`, `mypy`, `vitest`, `jest`). Generic `python` scripts without `-m` are rejected.
-3. **Zero Private Core Imports (Rule 9 Compliant):**
-   The plugin strictly uses public plugin APIs and native shadow-git plumbing (`refs/hermes/<hash16>`). Zero imports of internal modules (e.g. `tools.checkpoint_manager`). Passes `hermes plugins validate` with **0 errors and 0 Rule 9 warnings**.
-4. **Path Traversal Prevention:**
-   All target files are strictly validated against workspace boundaries (`validate_safe_path`). Any attempt to traverse outside the workspace root (`../`) is blocked.
-5. **No Network Calls in Plugin Code:**
-   The plugin makes no network calls in its code and operates 100% locally. Declares `requires_env: []`.
+1. **Zero Host Test Runner `subprocess.run`:**
+   `time_machine_recover` never executes user verification commands directly on the host. Instead, it diagnoses the failure, stages the recovery, and returns `suggested_verify_command` in its structured payload. The model then executes the test via Hermes's own `terminal` tool under the user's configured backend (Docker, SSH, or local host) with proper user approval and environment isolation.
 
----
+2. **Real Human Approval Guard:**
+   The model cannot unilaterally overwrite disk files by passing flags. All restorations default to `dry_run = True`. Physical disk updates require explicit human approval via the `/tm restore <id>` slash command or interactive user confirmation.
 
-## 🌟 Overview
+3. **Isolated Private Storage (`$HERMES_HOME/plugin-data/time-machine/`):**
+   All plugin snapshots and metadata are kept strictly in the plugin's private data directory:
+   - SQLite Ledger: `$HERMES_HOME/plugin-data/time-machine/ledger.db`
+   - Bare Git Store: `$HERMES_HOME/plugin-data/time-machine/store` (project refs at `refs/time-machine/{hash16}`)
+   The plugin never touches or mutates `$HERMES_HOME/state.db` or core checkpoint directories.
 
-`hermes-time-machine` transforms Hermes Agent into a fearless, zero-risk autonomous software developer. By bridging Hermes's native shadow-git filesystem checkpoints (`~/.hermes/checkpoints/store/`) with session message history (`~/.hermes/state.db`) into an atomic SQLite ledger (`time_machine.db`), it provides both human operators and autonomous agents with:
+4. **Surgical Blob Extraction (No `git checkout -f`):**
+   Files are restored by extracting individual blobs directly from the plugin's private bare git store (`git --git-dir=... show <commit>:<file>`) and writing them surgically to the target file. It never detaches `HEAD` or runs `git checkout -f` in the user's workspace.
 
-- **1-Call Autonomous Recovery with Auto-Verification (`time_machine_recover`):** Automatically correlates compiler/test errors with recent file edits, identifies root-cause culprits, surgically reverts only the broken files while preserving concurrent good features, unlinks newly created stray files, and re-runs the failed test suite inside the same tool call (`auto_verify=true`).
-- **"What Introduced This?" Diff & History Search (`time_machine_search`):** Full-text search across historical snapshot diffs, modified files, and tool arguments to pinpoint the exact snapshot ID, turn, and `+`/`-` line numbers.
-- **Safety Backup on Restore:** Automatically captures a `pre_restore_safety_backup` snapshot before any file rollback, ensuring restore keeps a safety backup.
-- **Surgical Per-File Restore & Newly-Created File Cleanup:** Revert only the specific broken files (`file_paths=['billing.py']`) while preserving untouched features and cleanly unlinking untracked temporary files from disk.
-- **Arbitrary `A ↔ B` & Live Drift Diffing:** Compare any historical snapshot against another or inspect live uncommitted working tree drift (`compare_to_id="WORKING_TREE"`).
-- **Interactive Visual Timeline Scrubber:** Horizontal step scrubber in Hermes Desktop with hover mini-diff previews, parent-child branch badges (`🌿 Forked`), 1-click **"⚡ Restore & Retry"**, and **"Snapshot"**.
-- **Storage Hygiene & Pruning:** Configurable retention (`max_snapshots_per_session: 50`) with protected baselines and safety backups.
-- **Instant Markdown Timeline Export:** Export structured audit logs via `/rewind export` or the Desktop UI.
-- **CLI Slash Command:** Full terminal suite `/rewind [list|diff|restore|recover|search|export|demo]`.
+5. **Path Traversal & Boundary Safety:**
+   All target files are strictly scoped to `ctx.session_cwd` and validated with `resolve()`. Paths traversing outside the workspace boundary are rejected.
+
+6. **Native Conversation State Handled by Core:**
+   Conversation branch creation and tree management are delegated to Hermes core's native `/rewind` and `/branch` commands.
 
 ---
 
-## 🏛️ Architecture
+## 🏛️ Repository Layout
 
 ```text
 hermes-time-machine/
-├── plugin.yaml          # Hermes unified plugin manifest (v2, 6 tools, 4 hooks)
-├── __init__.py          # Lifecycle hooks, slash command & self-heal middleware
-├── ledger.py            # SQLite ledger + shadow-git & state.db bridge
-├── schemas.py           # OpenAI-compatible function schemas (6 tools)
-├── tools.py             # Agent tool handlers with confirmation guards
+├── plugin.yaml          # Manifest declaring 5 tools, 4 hooks, and /tm command
+├── __init__.py          # Plugin lifecycle hooks, /tm slash command, and context bridge
+├── ledger.py            # SQLite ledger + private bare git store manager
+├── schemas.py           # Tool schemas (5 tools with dry-run default)
+├── tools.py             # Tool handlers strictly scoped to ctx.session_cwd
 ├── dashboard/
 │   ├── manifest.json    # Declares backend FastAPI extension router
-│   └── plugin_api.py    # REST endpoints (/status, /snapshots, /diff, /restore, /recover, /search, /export)
+│   ├── plugin_api.py    # REST endpoints (/status, /snapshots, /diff, /restore, /recover, /search)
+│   └── dist/
+│       └── index.js     # Web dashboard UI bundle registered with window.__HERMES_PLUGINS__
 ├── desktop/
-│   └── plugin.js        # Native Desktop UI via @hermes/plugin-sdk (Scrubber, Split Diff, Studio)
+│   └── plugin.js        # Desktop SDK UI (statusBar.right chip + panes timeline)
 ├── scripts/
-│   └── demo_walkthrough.py # 7-Step live end-to-end smoke test script
+│   └── demo_walkthrough.py # Standalone reproducible walkthrough script
 ├── tests/
-│   ├── test_plugin.py   # 31 Unit & integration tests (100% green: unittest + pytest)
-│   └── desktop_plugin.test.mjs # Automated Node.js smoke & XSS sanitization test
-├── DEMO_SCRIPT.md       # Official 75s video narration & walkthrough script
-├── catalog-entry.yaml   # Verified template for Nous Research plugin-catalog
+│   ├── test_plugin.py   # Unit & integration test suite
+│   └── desktop_plugin.test.mjs # Automated Node.js Desktop SDK test
 └── README.md
 ```
 
-### 1. Agent Toolset (`tools.py`)
-1. `time_machine_recover`: Autonomous self-healing diagnostic, surgical recovery, and test verification tool.
-2. `time_machine_search`: Search historical diffs, symbols, and +/- lines to pinpoint root-cause changes.
-3. `time_machine_list_snapshots`: Inspect captured checkpoints in the current session.
-4. `time_machine_diff`: View unified, structured, and arbitrary A ↔ B / live drift diffs.
-5. `time_machine_restore`: Surgically restore specific files or whole workspace with safety backup.
-6. `time_machine_branch`: Fork a new exploration session from a historical checkpoint.
-
-### 2. CLI Slash Command (`/rewind`)
-- `/rewind` or `/rewind list`: Formatted table of recent session checkpoints.
-- `/rewind diff <id> [compare_to]`: Diff snapshot vs parent, live working tree, or other snapshot.
-- `/rewind restore <id> [--files file1,file2]`: Instant surgical rollback.
-- `/rewind recover`: Run 1-call autonomous diagnosis and culprit rollback.
-- `/rewind search <query> [file_path]`: Search code diffs and snapshot metadata.
-- `/rewind export`: Output full session history formatted as Markdown.
-- `/rewind demo`: Run the reproducible 7-step live walkthrough.
-
-### 3. Native Hermes Desktop UI (`desktop/plugin.js`)
-- **Status Bar:** Dynamic 3-state badge (`🛡️ Safe Mode • X snaps`, `⚠️ Self-Heal Available • Revert Ready`, `✅ Recovered • Workspace Clean`).
-- **Horizontal Timeline Scrubber:** Interactive node track (`● ─── ● ─── ● ─── ⚠️ ─── 🌿 ─── ✅`) with hover mini-previews.
-- **Studio Diff Inspector:** Side-by-side split & unified diffs with line numbers and 1-click **"Revert"** headers.
-- **Action Buttons:** **"Snapshot"**, **"⚡ Restore & Retry"**, **"📥 Export"**, and **"Prune Old"**. On cards: **"Revert"** and **"Fork"**.
-
 ---
 
-## 🔒 Security & Core Internals Disclosure
+## 🔧 Tools & Commands
 
-In accordance with Hermes Plugin Admission guidelines:
-- **Zero Private Core Python Imports (Rule 9 Compliant):** The plugin imports zero internal modules (no `tools.checkpoint_manager` or private symbols).
-- **Native Shadow-Git & State Bridge with Standalone Fallback:** When present, `hermes-time-machine` bridges Hermes's internal checkpoint repository (`~/.hermes/checkpoints/store/refs/hermes/<hash16>`) via native git plumbing and reads `~/.hermes/state.db` solely to sync session branch points and conversation watermarks during rewind. In standalone or clean environments, it automatically falls back to workspace git.
-- **Strict Sandbox Bounds:** All file operations validate that paths resolve strictly within `Path(workspace_dir).resolve()`.
-- **No Network Calls in Plugin Code:** The plugin makes no network calls in its code (`requires_env: []`); all operations are local and offline.
+### 1. Agent Toolset (`tools.py`)
+- `time_machine_list_snapshots`: List snapshots captured during the current session.
+- `time_machine_diff`: View unified diff between a snapshot and current workspace (or between two snapshots).
+- `time_machine_restore`: Preview or surgically restore files from a snapshot (defaults to `dry_run=true`).
+- `time_machine_recover`: Diagnose test failures, identify culprit files, and return recovery diff + `suggested_verify_command`.
+- `time_machine_search`: Search code diffs across history by keyword or symbol.
+
+### 2. User Slash Command (`/tm`)
+- `/tm` or `/tm list`: Display recent session snapshots in a clean table.
+- `/tm diff <snapshot_id>`: Show unified diff of a snapshot against workspace.
+- `/tm restore <snapshot_id> [files...]`: Explicitly approve and execute surgical file restore.
+- `/tm recover`: Run self-healing diagnostic and display recommended recovery plan.
+- `/tm search <query>`: Search history for commits introducing specific lines or symbols.
+- `/tm export`: Export full session history formatted as Markdown.
+
+### 3. Core Commands for Conversation State
+- `/rewind`: Core Hermes command to rewind conversation turns and messages.
+- `/branch`: Core Hermes command to branch the session into a new conversation tree.
 
 ---
 
@@ -138,55 +118,15 @@ Tested against `hermes plugins validate` from Hermes core:
 ✓ security scan — safe
 ✓ no core override — no runtime rebinds of Hermes core
 ✓ desktop surface — stays inside the plugin SDK surface
+◆ Isolation — runs in the plugin host (plugins.isolation: host)
 
 Validation passed. (16/16 Checks Passed, 0 Errors, 0 Warnings)
 ```
 
-### Official Hermes Plugin Doctor
-```text
-Plugin Doctor: C:\Users\prasad.dammai\Hermes-time-machine
-  manifest: time-machine 0.3.0 (standalone)
-  OK: runtime discovery, manifest parsing, import, and registration passed
-  registrations: 6 tool(s), 4 hook(s)
-```
-
-### Unit & Integration Test Suite (`pytest` & `unittest`)
-All 31 tests pass 100% cleanly under both standard library `unittest` (zero external dependencies) and `pytest`:
-```text
-tests/test_plugin.py::test_api_recover_and_export_endpoints PASSED       [  3%]
-tests/test_plugin.py::test_api_search_endpoint PASSED                    [  7%]
-tests/test_plugin.py::test_arbitrary_and_working_tree_diff PASSED        [ 11%]
-tests/test_plugin.py::test_dashboard_api_endpoints PASSED               [ 15%]
-tests/test_plugin.py::test_demo_walkthrough_e2e PASSED                   [ 19%]
-tests/test_plugin.py::test_diagnose_failure_and_culprit_detection PASSED [ 23%]
-tests/test_plugin.py::test_ledger_record_and_self_heal PASSED            [ 26%]
-tests/test_plugin.py::test_newly_created_file_unlinked_on_restore PASSED [ 30%]
-tests/test_plugin.py::test_parse_unified_diff PASSED                     [ 34%]
-tests/test_plugin.py::test_path_traversal_rejection PASSED               [ 38%]
-tests/test_plugin.py::test_prune_snapshots_and_storage_stats PASSED      [ 42%]
-tests/test_plugin.py::test_recover_auto_verify_safe_allowlist PASSED     [ 46%]
-tests/test_plugin.py::test_search_snapshots_diff_content PASSED          [ 50%]
-tests/test_plugin.py::test_security_dry_run_preserves_disk_state PASSED [ 53%]
-tests/test_plugin.py::test_security_verify_command_allowlist_and_injection_blocks PASSED [ 57%]
-tests/test_plugin.py::test_security_zero_private_core_imports PASSED     [ 61%]
-tests/test_plugin.py::test_self_healing_transform_hint PASSED            [ 65%]
-tests/test_plugin.py::test_slash_command_recover_and_export PASSED       [ 69%]
-tests/test_plugin.py::test_slash_command_rewind PASSED                    [ 73%]
-tests/test_plugin.py::test_slash_command_rewind_demo PASSED              [ 76%]
-tests/test_plugin.py::test_slash_command_search PASSED                   [ 80%]
-tests/test_plugin.py::test_surgical_file_restore_and_safety_backup PASSED [ 84%]
-tests/test_plugin.py::test_time_machine_recover_auto_apply PASSED         [ 88%]
-tests/test_plugin.py::test_time_machine_recover_tool_handler PASSED      [ 92%]
-tests/test_plugin.py::test_time_machine_search_tool_handler PASSED       [ 96%]
-tests/test_plugin.py::test_tool_handlers_and_confirmation PASSED         [100%]
-
-tests/test_plugin.py::test_hook_sequence_recover_preserves_good_files_and_restores_broken PASSED
-tests/test_plugin.py::test_security_invalid_commit_aborts_without_deleting_files PASSED
-tests/test_plugin.py::test_command_error_detection_exit_code_authoritative PASSED
-tests/test_plugin.py::test_fastapi_restore_endpoint_pydantic_list_model PASSED
-tests/test_plugin.py::test_validate_verify_command_tightened_allowlist_rejects_exploits PASSED
-
-======================== 31 passed in 54.13s ========================
+### Official Hermes Plugin Catalog Validator
+```bash
+python scripts/validate_plugin_catalog.py plugin-catalog/time-machine.yaml
+OK: 1 file(s) valid
 ```
 
 ---
@@ -199,14 +139,8 @@ Clone into your Hermes plugins directory:
 git clone https://github.com/Prasad-PingFederate/hermes-time-machine.git ~/.hermes/plugins/time-machine
 ```
 
-### 2. Run Live Walkthrough
+### 2. Run Tests
 ```bash
-python ~/.hermes/plugins/time-machine/scripts/demo_walkthrough.py
+pytest tests/test_plugin.py -v
+node --test tests/desktop_plugin.test.mjs
 ```
-Or in chat:
-```text
-/rewind demo
-```
-
-### 3. Demo Video Guide
-See [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the exact step-by-step 75s video narration script.
