@@ -150,6 +150,10 @@ test('desktop pane diff toggle and preview restore state transitions', async () 
     dry_run: false,
     user_approved: true,
   });
+  assert.deepEqual(confirmRestoreBody([], true), {
+    dry_run: false,
+    user_approved: true,
+  });
   assert.equal(
     fileChangeLabel({ files_changed: 2, insertions: 4, deletions: 1, modified_files_count: 9 }),
     '2 file(s) +4/-1',
@@ -229,7 +233,9 @@ test('desktop pane diff toggle and preview restore state transitions', async () 
     rest: async (path, options) => {
       calls.push({ path, options });
       if (String(path).includes('/restore')) {
-        const body = options && options.body ? JSON.parse(options.body) : {};
+        const body = options && options.body
+          ? (typeof options.body === 'string' ? JSON.parse(options.body) : options.body)
+          : {};
         if (body.dry_run) {
           return {
             ok: true,
@@ -295,7 +301,10 @@ test('desktop pane diff toggle and preview restore state transitions', async () 
   const previewCall = calls.find((c) => String(c.path).endsWith('/restore') && c.options);
   assert.ok(previewCall, 'preview should POST');
   assert.equal(previewCall.options.method, 'POST');
-  assert.deepEqual(JSON.parse(previewCall.options.body), previewRestoreBody());
+  const previewBody = typeof previewCall.options.body === 'string'
+    ? JSON.parse(previewCall.options.body)
+    : previewCall.options.body;
+  assert.deepEqual(previewBody, previewRestoreBody());
 
   await byAction('search-checkpoints').props.onChange({ target: { value: 'marker' } });
   assert.ok(

@@ -211,14 +211,17 @@
 
     function onConfirm() {
       if (!restorePlan || !restorePlan.snapshotId) return;
+      var selected = restorePlan.selected || [];
+      if (!restorePlan.fullWorkspace && selected.length === 0) {
+        setNotice({ kind: 'error', message: 'Select at least one file, or check Restore entire workspace.' });
+        return;
+      }
+      var payload = { dry_run: false, user_approved: true };
+      if (!restorePlan.fullWorkspace) payload.file_paths = selected;
       fetchJSON(API + '/snapshots/' + encodeURIComponent(restorePlan.snapshotId) + '/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          file_paths: restorePlan.selected || [],
-          dry_run: false,
-          user_approved: true
-        })
+        body: JSON.stringify(payload)
       }).then(function (res) {
         var backupId = res.pre_restore_backup_id || null;
         setRestorePlan(Object.assign({}, restorePlan, { step: 'done', backupId: backupId }));
@@ -411,7 +414,18 @@
               'div',
               { className: 'mb-3 rounded-md border border-blue-500/30 bg-blue-500/5 p-3 space-y-2' },
               React.createElement('div', { className: 'text-xs font-semibold' }, 'Step 1 — choose files, then confirm'),
-              restorePlan.fullWorkspace && React.createElement('div', { className: 'text-xs text-muted-foreground' }, 'Full workspace restore is available. Checked paths are restored surgically.'),
+              React.createElement(
+                'label',
+                { className: 'flex items-center gap-2 text-xs' },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: !!restorePlan.fullWorkspace,
+                  onChange: function () {
+                    setRestorePlan(Object.assign({}, restorePlan, { fullWorkspace: !restorePlan.fullWorkspace }));
+                  }
+                }),
+                'Restore entire workspace'
+              ),
               fileChoices.map(function (item) {
                 var checked = (restorePlan.selected || []).indexOf(item.file) !== -1;
                 return React.createElement(
@@ -453,7 +467,7 @@
         React.createElement('div', null, '• Use ', React.createElement('code', { className: 'font-mono text-foreground' }, '/tm list'), ' to view session snapshots.'),
         React.createElement('div', null, '• Use ', React.createElement('code', { className: 'font-mono text-foreground' }, '/tm restore <snapshot_id>'), ' to restore files after human review.'),
         React.createElement('div', null, '• Use ', React.createElement('code', { className: 'font-mono text-foreground' }, '/tm recover'), ' to diagnose test failures and generate recovery plans.'),
-        React.createElement('div', null, '• Preview Restore stays a dry-run until Confirm & Restore Selected Files is clicked. v0.4.0')
+        React.createElement('div', null, '• Preview Restore stays a dry-run until Confirm is clicked. /tm commit, comment, clone, push, and pull never touch the project .git. v0.4.1')
       )
     );
   }

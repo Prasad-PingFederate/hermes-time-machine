@@ -1,7 +1,7 @@
 {
   "name": "time-machine",
   "title": "Time Machine",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Unified filesystem checkpoint & conversation rewind studio for Hermes Agent.",
   "icon": "history",
   "api": "plugin_api.py",

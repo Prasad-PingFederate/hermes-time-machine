@@ -42,7 +42,7 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __plugin_name__ = "time-machine"
 
 _last_safe_snapshot: Dict[str, str] = {}
@@ -291,7 +291,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                 fc = str(s.get("files_changed", 0))
                 diff_stat = f"+{s.get('insertions', 0)} / -{s.get('deletions', 0)}"
                 lines.append(f"{sid:<28} {tool:<14} {st:<8} {fc:<6} {diff_stat}")
-            lines.append("\nCommands: /tm diff <id> | /tm restore <id> [--files f1,f2] | /tm recover | /tm search <query>")
+            lines.append("\nCommands: /tm diff <id> | /tm restore <id> [--files f1,f2] | /tm commit <message> | /tm comment <id> <text> | /tm clone <id> <dir> | /tm push <file.bundle> | /tm pull <file.bundle> | /tm recover | /tm search <query>")
             return "\n".join(lines)
 
         elif subcmd == "diff":
@@ -316,11 +316,13 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                 return "Usage: /tm restore <snapshot_id> [--files file1,file2]"
             target_id = parts[1]
             target_files = None
-            for idx, p in enumerate(parts[2:]):
+            if "--files" in parts:
+                files_at = parts.index("--files")
+                if files_at + 1 < len(parts):
+                    target_files = [item.strip() for item in parts[files_at + 1].split(",") if item.strip()]
+            for p in parts[2:]:
                 if p.startswith("--files="):
-                    target_files = p.split("=", 1)[1].split(",")
-                elif p == "--files" and idx + 3 < len(parts):
-                    target_files = parts[idx + 3].split(",")
+                    target_files = [item.strip() for item in p.split("=", 1)[1].split(",") if item.strip()]
 
             # Since the user explicitly typed /tm restore, this is an authorized human restore
             res = cur_ledger.restore_snapshot(
@@ -381,6 +383,70 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
         elif subcmd == "export":
             return cur_ledger.export_timeline_markdown(session_id=session_id)
 
+        elif subcmd == "commit":
+            message = (raw_args or "").strip()
+            if message.lower().startswith("commit"):
+                message = message[len("commit"):].strip()
+            res = cur_ledger.manual_commit(message, session_id=session_id, working_dir=session_cwd)
+            if not res.get("ok"):
+                return f"❌ Commit failed: {res.get('error')}"
+            return (
+                f"✅ Checkpoint {res.get('snapshot_id')} recorded in the private store.\n"
+                f"Message: {res.get('message')}\n"
+                "The project git repository was not modified."
+            )
+
+        elif subcmd == "comment":
+            rest = (raw_args or "").strip()
+            if rest.lower().startswith("comment"):
+                rest = rest[len("comment"):].strip()
+            snap_id, _, text = rest.partition(" ")
+            res = cur_ledger.set_snapshot_comment(snap_id, text)
+            if not res.get("ok"):
+                return f"❌ Comment failed: {res.get('error')}"
+            return f"💬 Comment saved on {res.get('snapshot_id')}: {res.get('comment')}"
+
+        elif subcmd == "clone":
+            dry = "--dry-run" in parts
+            tokens = [p for p in parts[1:] if p != "--dry-run"]
+            if len(tokens) < 2:
+                return "Usage: /tm clone <snapshot_id> <new-directory> [--dry-run]"
+            res = cur_ledger.clone_snapshot(
+                tokens[0],
+                " ".join(tokens[1:]),
+                dry_run=dry,
+                user_approved=not dry,
+            )
+            if not res.get("ok"):
+                return f"❌ Clone failed: {res.get('error')}"
+            if res.get("dry_run"):
+                return f"📄 Clone dry run → {res.get('destination')} ({len(res.get('planned_files') or [])} files). Re-run without --dry-run to write."
+            return f"✅ Cloned snapshot into {res.get('destination')} ({res.get('files_written')} files). Project .git was not touched."
+
+        elif subcmd == "push":
+            dry = "--dry-run" in parts
+            tokens = [p for p in parts[1:] if p != "--dry-run"]
+            if not tokens:
+                return "Usage: /tm push <file.bundle> [--dry-run]"
+            res = cur_ledger.push_checkpoint_bundle(tokens[0], dry_run=dry, user_approved=not dry)
+            if not res.get("ok"):
+                return f"❌ Push failed: {res.get('error')}"
+            if res.get("dry_run"):
+                return f"📄 Push dry run would write {res.get('bundle')} (private store only, not git push)."
+            return f"✅ Pushed private checkpoints to {res.get('bundle')} ({res.get('snapshots')} snapshots). Project .git was not pushed."
+
+        elif subcmd == "pull":
+            dry = "--dry-run" in parts
+            tokens = [p for p in parts[1:] if p != "--dry-run"]
+            if not tokens:
+                return "Usage: /tm pull <file.bundle> [--dry-run]"
+            res = cur_ledger.pull_checkpoint_bundle(tokens[0], dry_run=dry, user_approved=not dry)
+            if not res.get("ok"):
+                return f"❌ Pull failed: {res.get('error')}"
+            if res.get("dry_run"):
+                return f"📄 Pull dry run for {res.get('bundle')}. The project repository was not pulled."
+            return f"✅ Pulled {res.get('imported_snapshots')} snapshot(s) into the private store from {res.get('bundle')}."
+
         elif subcmd == "demo":
             try:
                 from scripts.demo_walkthrough import run_demo
@@ -391,7 +457,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
             except Exception as d_err:
                 return f"❌ Demo error: {d_err}"
 
-        return "Usage: /tm [list | diff <id> | restore <id> [--files f1,f2] | recover | search <query> | export | demo]"
+        return "Usage: /tm [list | diff <id> | restore <id> [--files f1,f2] | commit <message> | comment <id> <text> | clone <id> <dir> | push <file.bundle> | pull <file.bundle> | recover | search <query> | export | demo]"
 
     # Register hooks
     ctx.register_hook("on_session_start", on_session_start)
@@ -408,7 +474,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
             name="tm",
             handler=handle_tm_command,
             description="Hermes Time Machine: inspect timeline, diff, or restore snapshots",
-            args_hint="[list|diff|restore|recover|search]",
+            args_hint="[list|diff|restore|commit|comment|clone|push|pull|recover|search]",
         )
 
     # Register system prompt section

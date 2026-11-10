@@ -1469,6 +1469,178 @@ new file mode 100644
         self.assertNotEqual(secret.returncode, 0)
         self.assertNotIn("supersecret", secret.stdout)
 
+    def test_empty_file_selection_does_not_full_restore(self):
+        """An explicit empty file list must not fall through into a full workspace restore."""
+        wdir = self.git_repo["dir"]
+        f1 = self.git_repo["f1"]
+        snap = self.ledger.record_pre_tool(
+            session_id="s_empty_sel",
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            working_dir=str(wdir),
+        )
+        f1.write_text("print('keep this edit')\n", encoding="utf-8")
+        res = self.ledger.restore_snapshot(
+            snapshot_id=snap["id"],
+            file_paths=[],
+            working_dir=str(wdir),
+            dry_run=False,
+            user_approved=True,
+        )
+        self.assertTrue(res.get("ok"), res)
+        self.assertFalse(res.get("files_restored"))
+        self.assertIn("keep this edit", f1.read_text(encoding="utf-8"))
+
+    def test_symlink_and_preexisting_untracked_survive_full_restore(self):
+        """A new symlink must be removed without deleting the preexisting file it points at."""
+        wdir = self.git_repo["dir"]
+        self.ledger._ensure_default_excludes()
+        exclude = self.ledger.store_dir / "info" / "exclude"
+        exclude.write_text(exclude.read_text(encoding="utf-8") + "\nkeep_local.txt\n", encoding="utf-8")
+        keep = wdir / "keep_local.txt"
+        keep.write_text("precious\n", encoding="utf-8")
+        self.ledger.record_pre_tool(
+            session_id="s_symlink",
+            tool_name="session_start",
+            working_dir=str(wdir),
+            reason="session_start",
+        )
+        snap = self.ledger.record_pre_tool(
+            session_id="s_symlink",
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            working_dir=str(wdir),
+        )
+        os.utime(keep, None)
+        link = wdir / "stray_link"
+        link.symlink_to(keep)
+        outside = self.base_test_dir / "outside_keep.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        outside_link = wdir / "outside_link"
+        outside_link.symlink_to(outside)
+
+        res = self.ledger.restore_snapshot(
+            snapshot_id=snap["id"],
+            working_dir=str(wdir),
+            dry_run=False,
+            user_approved=True,
+        )
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(keep.read_text(encoding="utf-8"), "precious\n")
+        self.assertFalse(link.exists())
+        self.assertFalse(outside_link.exists())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside\n")
+
+    def test_later_edit_error_does_not_hide_failed_command(self):
+        """A later failing edit must not replace the real failed test command."""
+        wdir = self.git_repo["dir"]
+        hooks = {}
+
+        class MockCtx:
+            def register_tool(self, *a, **k):
+                return None
+
+            def register_hook(self, event, fn, **k):
+                hooks[event] = fn
+
+            def register_command(self, *a, **k):
+                return None
+
+            def register_system_prompt_section(self, *a, **k):
+                return None
+
+        tm_plugin.register(MockCtx(), ledger=self.ledger)
+        sess = "s_keep_cmd"
+        hooks["on_session_start"](session_id=sess, working_dir=str(wdir))
+        hooks["pre_tool_call"](tool_name="terminal", args={"command": "pytest -q"}, session_id=sess, tool_call_id="term1")
+        hooks["post_tool_call"](
+            tool_name="terminal",
+            args={"command": "pytest -q"},
+            session_id=sess,
+            tool_call_id="term1",
+            status="error",
+        )
+        hooks["pre_tool_call"](tool_name="write_file", args={"path": "file_a.py"}, session_id=sess, tool_call_id="werr")
+        hooks["post_tool_call"](
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            session_id=sess,
+            tool_call_id="werr",
+            status="error",
+        )
+        from ledger import _GLOBAL_LAST_FAILED_COMMANDS
+        _GLOBAL_LAST_FAILED_COMMANDS.pop(sess, None)
+        rec = self.ledger.recover(session_id=sess, working_dir=str(wdir), dry_run=True, user_approved=False)
+        self.assertEqual(rec.get("suggested_verify_command"), "pytest -q")
+
+    def test_commit_comment_clone_push_pull_do_not_touch_user_git(self):
+        """commit/comment/clone/push/pull stay in the private store."""
+        import __init__ as tm_plugin
+
+        wdir = self.git_repo["dir"]
+        head = subprocess.run(
+            ["git", "-C", str(wdir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        class MockCtx:
+            def __init__(self):
+                self.handler = None
+
+            def register_tool(self, *a, **k):
+                return None
+
+            def register_hook(self, *a, **k):
+                return None
+
+            def register_command(self, name, handler=None, **k):
+                self.handler = handler
+
+            def register_system_prompt_section(self, *a, **k):
+                return None
+
+        ctx = MockCtx()
+        tm_plugin.register(ctx, ledger=self.ledger)
+        committed = ctx.handler("commit keep the billing fix", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("Checkpoint", committed)
+        self.assertIn("was not modified", committed)
+        snap_id = committed.split()[2]
+
+        commented = ctx.handler(f"comment {snap_id} green before the tax edit", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("Comment saved", commented)
+        listed = self.ledger.list_snapshots(session_id="s_gitops", limit=5)
+        self.assertEqual(listed[0].get("comment"), "green before the tax edit")
+
+        refused_remote = ctx.handler("clone https://github.com/example/repo.git /tmp/nope", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("does not run git clone", refused_remote)
+        refused_push = ctx.handler("push origin", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("does not git push", refused_push)
+        refused_pull = ctx.handler("pull origin", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("does not git pull", refused_pull)
+
+        dest = self.base_test_dir / "cloned_snapshot"
+        cloned = ctx.handler(f"clone {snap_id} {dest}", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("Cloned snapshot", cloned)
+        self.assertTrue((dest / "file_a.py").exists())
+        self.assertFalse((dest / ".git").exists())
+
+        inside = ctx.handler(f"clone {snap_id} {wdir / 'nested'}", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("Refusing", inside)
+
+        bundle = self.base_test_dir / "checkpoints.bundle"
+        pushed = ctx.handler(f"push {bundle}", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("Pushed private checkpoints", pushed)
+        self.assertTrue(bundle.exists())
+        self.assertTrue(bundle.with_suffix(".json").exists())
+        pulled = ctx.handler(f"pull {bundle} --dry-run", session_id="s_gitops", working_dir=str(wdir))
+        self.assertIn("Pull dry run", pulled)
+
+        head_after = subprocess.run(
+            ["git", "-C", str(wdir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(head, head_after)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,11 +33,12 @@ export function previewRestoreBody() {
   return { dry_run: true, user_approved: false };
 }
 
-export function confirmRestoreBody(selectedFiles) {
+export function confirmRestoreBody(selectedFiles, restoreWorkspace) {
+  const body = { dry_run: false, user_approved: true };
+  if (restoreWorkspace) return body;
   return {
+    ...body,
     file_paths: Array.isArray(selectedFiles) ? selectedFiles : [],
-    dry_run: false,
-    user_approved: true,
   };
 }
 
@@ -87,6 +88,12 @@ export function reducePaneState(state, action) {
         },
       };
     }
+    case 'toggle_full_workspace':
+      if (!current.restore) return current;
+      return {
+        ...current,
+        restore: { ...current.restore, fullWorkspace: !current.restore.fullWorkspace },
+      };
     case 'toggle_file': {
       if (!current.restore) return current;
       const has = current.restore.selected.indexOf(action.file) !== -1;
@@ -155,14 +162,18 @@ function TimeMachineStatusChip({ ctx }) {
 
   useEffect(() => {
     fetchStatus();
-    const timer = setInterval(() => {
+    const tick = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
         return;
       }
       fetchStatus();
-    }, 10000);
+    };
+    if (ctx && typeof ctx.setInterval === 'function') {
+      return ctx.setInterval(tick, 10000);
+    }
+    const timer = setInterval(tick, 10000);
     return () => clearInterval(timer);
-  }, [fetchStatus]);
+  }, [fetchStatus, ctx]);
 
   const snapCount = status?.snapshot_count ?? 0;
   const hasSelfHeal = !!status?.self_heal_available;
@@ -332,8 +343,7 @@ function TimeMachinePane({ ctx }) {
     try {
       const res = await pluginRest(ctx, `/snapshots/${encodeURIComponent(snap.id)}/restore`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(previewRestoreBody()),
+        body: previewRestoreBody(),
       });
       applyPane({
         type: 'preview_loaded',
@@ -359,11 +369,14 @@ function TimeMachinePane({ ctx }) {
     const plan = paneState.restore;
     if (!plan || !plan.snapshotId) return;
     const selected = plan.selected || [];
+    if (!plan.fullWorkspace && selected.length === 0) {
+      setActionNotice({ kind: 'warning', message: 'Select at least one file, or check Restore entire workspace.' });
+      return;
+    }
     try {
       const res = await pluginRest(ctx, `/snapshots/${encodeURIComponent(plan.snapshotId)}/restore`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(confirmRestoreBody(selected)),
+        body: confirmRestoreBody(selected, !!plan.fullWorkspace),
       });
       const backupId = res && res.pre_restore_backup_id;
       applyPane({ type: 'restore_confirmed', backupId });
@@ -534,8 +547,18 @@ function TimeMachinePane({ ctx }) {
                     className: 'mb-1.5 rounded border border-blue-500/30 bg-blue-500/10 p-1.5 space-y-1',
                     children: [
                       jsx('div', { className: 'text-[10px] text-blue-200 font-semibold', children: 'Step 1 — choose files, then confirm' }),
-                      restorePlan.fullWorkspace &&
-                        jsx('div', { className: 'text-[10px] text-white/50', children: 'Full workspace restore is available. Checked paths are restored surgically.' }),
+                      jsx('label', {
+                        className: 'flex items-center gap-1 text-[10px] text-blue-100',
+                        children: [
+                          jsx('input', {
+                            type: 'checkbox',
+                            'data-action': 'toggle-full-workspace',
+                            checked: !!restorePlan.fullWorkspace,
+                            onChange: () => applyPane({ type: 'toggle_full_workspace' }),
+                          }),
+                          jsx('span', { children: 'Restore entire workspace' }),
+                        ],
+                      }),
                       fileChoices.map((item) => jsxs('label', {
                         key: `${item.kind}:${item.file}`,
                         className: 'flex items-center gap-1 text-[10px] text-white/80 font-mono',
@@ -589,7 +612,7 @@ function TimeMachinePane({ ctx }) {
         className: 'p-2 border-t border-white/10 text-[10px] text-white/40 shrink-0 flex items-center justify-between',
         children: [
           jsx('span', { children: 'Slash commands: /tm list · /tm restore <id>' }),
-          jsx('span', { className: 'font-mono', children: 'v0.4.0' }),
+          jsx('span', { className: 'font-mono', children: 'v0.4.1' }),
         ],
       }),
     ],

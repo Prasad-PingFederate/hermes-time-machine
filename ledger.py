@@ -135,6 +135,75 @@ def validate_safe_path(working_dir: str, rel_path: str) -> Path:
     return target
 
 
+def lexical_workspace_path(working_dir: str, rel_path: str) -> Path:
+    """Path inside the workspace that does not follow a final symlink."""
+    root = Path(working_dir).expanduser().resolve()
+    raw = str(rel_path or "").replace("\\", "/").strip()
+    if not raw or raw.startswith("/") or raw.startswith("~"):
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}")
+    parts = Path(raw).parts
+    if any(part in ("..", ".git") or part.startswith(".git") for part in parts):
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}")
+    candidate = root.joinpath(*parts)
+    parent = candidate.parent
+    try:
+        parent_resolved = parent.resolve()
+    except OSError as exc:
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}") from exc
+    if parent_resolved != root and root not in parent_resolved.parents:
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}")
+    if candidate.is_symlink():
+        return candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}") from exc
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"Security Error: path {rel_path!r} escapes workspace root {root}")
+    return candidate
+
+
+def unlink_workspace_entry(working_dir: str, rel_path: str) -> bool:
+    """Unlink a file or symlink inside the workspace. Never follows a symlink to its target."""
+    candidate = lexical_workspace_path(working_dir, rel_path)
+    if candidate.is_symlink() or (candidate.exists() and candidate.is_file()):
+        candidate.unlink()
+        return True
+    return False
+
+
+def _is_remote_git_spec(value: str) -> bool:
+    """True for git URLs and scp-style remotes. Time Machine never pushes or clones those."""
+    text = (value or "").strip()
+    lowered = text.lower()
+    if not text:
+        return False
+    if "://" in text or lowered.startswith("git@") or lowered.startswith("ssh://"):
+        return True
+    if text in {"origin", "upstream"}:
+        return True
+    return False
+
+
+def _command_text_from_summary(summary: str) -> str:
+    """Pull a shell command out of a raw summary or a JSON tool-args blob."""
+    text = (summary or "").strip()
+    if not text:
+        return ""
+    if text.startswith("command="):
+        return text.split("=", 1)[1].strip()
+    if text.startswith("{") or text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return ""
+        if isinstance(parsed, dict):
+            cmd = parsed.get("command") or parsed.get("cmd") or parsed.get("script") or ""
+            return cmd.strip() if isinstance(cmd, str) else ""
+        return ""
+    return text
+
+
 def parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
     """Parse git unified diff output into structured per-file change entries."""
     if not diff_text or not diff_text.strip():
@@ -312,6 +381,25 @@ class TimeMachineLedger:
                     session_id TEXT PRIMARY KEY,
                     command TEXT NOT NULL,
                     updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snapshot_comments (
+                    snapshot_id TEXT PRIMARY KEY,
+                    comment TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspace_inventory (
+                    session_id TEXT NOT NULL,
+                    working_dir TEXT NOT NULL,
+                    rel_path TEXT NOT NULL,
+                    PRIMARY KEY (session_id, working_dir, rel_path)
                 )
                 """
             )
@@ -521,6 +609,11 @@ class TimeMachineLedger:
             )
 
         self._prune_old_snapshots(session_id)
+        if tool_name == "session_start":
+            try:
+                self._record_workspace_inventory(session_id, wdir)
+            except Exception as exc:
+                logger.debug("workspace inventory error: %s", exc)
 
         return {
             "id": snap_id,
@@ -636,7 +729,7 @@ class TimeMachineLedger:
                     insertions = CASE WHEN ? > 0 THEN ? ELSE insertions END,
                     deletions = CASE WHEN ? > 0 THEN ? ELSE deletions END,
                     self_heal_candidate = ?,
-                    recommended_snapshot_id = ?,
+                    recommended_snapshot_id = COALESCE(?, recommended_snapshot_id),
                     tool_args_summary = COALESCE(?, tool_args_summary)
                 WHERE id = ?
                 """,
@@ -694,6 +787,18 @@ class TimeMachineLedger:
             params.append(limit)
 
             rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+            if rows:
+                ids = [r.get("id") for r in rows if r.get("id")]
+                placeholders = ",".join("?" for _ in ids)
+                comments = {}
+                if ids:
+                    for crow in conn.execute(
+                        f"SELECT snapshot_id, comment FROM snapshot_comments WHERE snapshot_id IN ({placeholders})",
+                        ids,
+                    ).fetchall():
+                        comments[crow["snapshot_id"]] = crow["comment"]
+                for row in rows:
+                    row["comment"] = comments.get(row.get("id"))
 
         if not include_raw_checkpoints:
             return [r for r in rows if r.get("checkpoint_hash")]
@@ -897,6 +1002,62 @@ class TimeMachineLedger:
             return set()
         return self._list_commit_paths(row["checkpoint_hash"] or "")
 
+    def _iter_workspace_entries(self, root: Path):
+        """Yield (relative posix path, path) for files and symlinks. Does not follow links."""
+        if not root.is_dir():
+            return
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            base = Path(dirpath)
+            kept_dirs = []
+            for dirname in dirnames:
+                if dirname == ".git" or dirname.startswith(".git"):
+                    continue
+                dir_path = base / dirname
+                if dir_path.is_symlink():
+                    rel = dir_path.relative_to(root).as_posix()
+                    if ".git" not in Path(rel).parts:
+                        yield rel, dir_path
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+            for name in filenames:
+                path = base / name
+                try:
+                    rel = path.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                if not rel or ".git" in Path(rel).parts:
+                    continue
+                yield rel, path
+
+    def _record_workspace_inventory(self, session_id: str, working_dir: str) -> None:
+        """Remember files that already existed at session start so restore cannot delete them."""
+        root = Path(working_dir).expanduser().resolve()
+        paths = [rel for rel, _path in self._iter_workspace_entries(root)]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM workspace_inventory WHERE session_id = ? AND working_dir = ?",
+                (session_id, str(root)),
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO workspace_inventory (session_id, working_dir, rel_path) VALUES (?, ?, ?)",
+                [(session_id, str(root), rel) for rel in paths],
+            )
+
+    def _inventory_paths(self, session_id: Optional[str], working_dir: str) -> set:
+        if not session_id:
+            return set()
+        resolved = str(Path(working_dir).expanduser().resolve())
+        try:
+            with self._lock, self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT rel_path FROM workspace_inventory WHERE session_id = ? AND working_dir = ?",
+                    (session_id, resolved),
+                ).fetchall()
+        except Exception:
+            return set()
+        return {row["rel_path"] for row in rows if row["rel_path"]}
+
     @staticmethod
     def _is_default_excluded_rel(rel: str) -> bool:
         """True for secret/bloat paths the bare store refuses to snapshot."""
@@ -930,34 +1091,26 @@ class TimeMachineLedger:
         snap_time = float(snap.get("created_at") or 0.0)
         commit_paths = self._list_commit_paths(commit_hash)
         baseline_paths = self._session_start_baseline_paths(snap.get("session_id"), str(root))
+        inventory = self._inventory_paths(snap.get("session_id"), str(root))
         strays: List[str] = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d != ".git" and not d.startswith(".git")]
-            for name in filenames:
-                abs_path = Path(dirpath) / name
-                try:
-                    resolved = abs_path.resolve()
-                    rel = str(resolved.relative_to(root)).replace("\\", "/")
-                except Exception:
-                    continue
-                if not rel or rel == ".git" or rel.startswith(".git/") or "/.git/" in rel:
-                    continue
-                if rel in commit_paths or rel in baseline_paths:
-                    continue
-                if self._is_default_excluded_rel(rel):
-                    continue
-                try:
-                    validate_safe_path(str(root), rel)
-                except ValueError:
-                    continue
-                try:
-                    mtime = resolved.stat().st_mtime
-                except OSError:
-                    continue
-                # Only files that appeared or were rewritten after this snapshot.
-                if mtime < (snap_time - 0.5):
-                    continue
-                strays.append(rel)
+        for rel, path in self._iter_workspace_entries(root):
+            if not rel or rel == ".git" or rel.startswith(".git/") or "/.git/" in rel:
+                continue
+            if rel in commit_paths or rel in baseline_paths or rel in inventory:
+                continue
+            if self._is_default_excluded_rel(rel):
+                continue
+            try:
+                lexical_workspace_path(str(root), rel)
+            except ValueError:
+                continue
+            try:
+                mtime = path.lstat().st_mtime
+            except OSError:
+                continue
+            if mtime < (snap_time - 0.5):
+                continue
+            strays.append(rel)
         return sorted(set(strays))
 
     def get_diff(
@@ -1188,18 +1341,47 @@ class TimeMachineLedger:
         else:
             wdir = resolve_working_dir(snap_wdir)
 
-        target_files = []
-        if file_paths:
-            target_files.extend([f.strip() for f in file_paths if f and f.strip()])
-        if file_path and file_path.strip() not in target_files:
-            target_files.append(file_path.strip())
+        target_files: List[str] = []
+        # None means "whole workspace". An explicit list, even empty, is surgical
+        # and must never fall through into a full restore.
+        selection_explicit = file_paths is not None or bool(file_path and str(file_path).strip())
+        if file_paths is not None:
+            for raw in file_paths:
+                cleaned = str(raw).strip() if raw is not None else ""
+                if cleaned and cleaned != "(all files)" and cleaned not in target_files:
+                    target_files.append(cleaned)
+        if file_path and str(file_path).strip() and str(file_path).strip() not in target_files:
+            target_files.append(str(file_path).strip())
 
-        # Path Traversal Guard: ensure all target files resolve strictly within wdir
+        if selection_explicit and not target_files:
+            return {
+                "ok": True,
+                "dry_run": bool(dry_run or not user_approved),
+                "snapshot_id": snap["id"] if snap else snapshot_id,
+                "checkpoint_hash": commit_hash,
+                "working_dir": wdir,
+                "files_restored": False,
+                "planned_restored_files": [],
+                "planned_unlinked_files": [],
+                "planned_deleted_stray_files": [],
+                "restored_files": [],
+                "unlinked_new_files": [],
+                "message": "No files selected. Nothing was restored.",
+            }
+
+        # Path Traversal Guard: lexical paths, so a symlink cannot retarget the write.
         validated_targets = []
         for tf in target_files:
             try:
-                abs_target = validate_safe_path(wdir, tf)
+                abs_target = lexical_workspace_path(wdir, tf)
                 rel_target = str(abs_target.relative_to(Path(wdir).resolve())).replace("\\", "/")
+                if abs_target.is_symlink():
+                    return {
+                        "ok": False,
+                        "snapshot_id": snapshot_id,
+                        "working_dir": wdir,
+                        "error": f"Security Error: refusing to restore through symlink {tf!r}",
+                    }
                 validated_targets.append((rel_target, abs_target))
             except ValueError as val_err:
                 return {
@@ -1303,12 +1485,11 @@ class TimeMachineLedger:
                     else:
                         errors.append(f"Extract error on {rel_tf}: {res.stderr.decode('utf-8', 'replace')}")
                 else:
-                    if abs_tf.exists():
-                        try:
-                            abs_tf.unlink()
+                    try:
+                        if unlink_workspace_entry(wdir, rel_tf):
                             unlinked_files.append(rel_tf)
-                        except OSError as rm_err:
-                            errors.append(f"Could not remove {rel_tf}: {rm_err}")
+                    except (OSError, ValueError) as rm_err:
+                        errors.append(f"Could not remove {rel_tf}: {rm_err}")
         else:
             # Full restoration from store via git archive (safe, never detaches user's HEAD)
             import tarfile
@@ -1337,16 +1518,10 @@ class TimeMachineLedger:
                         if not rel or ".git" in Path(rel).parts:
                             continue
                         try:
-                            abs_tf = validate_safe_path(wdir, rel)
-                        except ValueError as val_err:
-                            errors.append(str(val_err))
-                            continue
-                        if abs_tf.is_file():
-                            try:
-                                abs_tf.unlink()
+                            if unlink_workspace_entry(wdir, rel):
                                 unlinked_files.append(rel)
-                            except OSError as rm_err:
-                                errors.append(f"Could not remove {rel}: {rm_err}")
+                        except (OSError, ValueError) as rm_err:
+                            errors.append(f"Could not remove {rel}: {rm_err}")
                 else:
                     errors.append(f"Full archive extraction failed: {archive_res.stderr.decode('utf-8', 'replace')}")
             except Exception as a_exc:
@@ -1396,8 +1571,9 @@ class TimeMachineLedger:
 
         for s in snaps:
             if s.get("status") == "error" or s.get("self_heal_candidate"):
-                if s.get("tool_args_summary"):
-                    last_failed_command = s.get("tool_args_summary")
+                extracted = _command_text_from_summary(s.get("tool_args_summary") or "")
+                if extracted:
+                    last_failed_command = extracted
                 break
 
         file_mut_snaps = [s for s in reversed(snaps) if s.get("tool_name") in FILE_MUTATING_TOOLS]
@@ -1687,3 +1863,336 @@ class TimeMachineLedger:
             if row:
                 return dict(row)
         return None
+
+    def manual_commit(
+        self,
+        message: str,
+        session_id: str = "default",
+        working_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Record a named checkpoint in the private store.
+
+        This is not `git commit` and it does not touch the project's .git.
+        """
+        text = (message or "").strip()
+        if not text:
+            return {"ok": False, "error": "A commit message is required. Usage: /tm commit <message>"}
+        if _is_remote_git_spec(text):
+            return {"ok": False, "error": "Refusing to treat a git remote as a commit message."}
+        text = text[:500]
+        wdir = resolve_working_dir(working_dir)
+        before = self._user_git_head(wdir)
+        snap = self.record_pre_tool(
+            session_id=session_id,
+            tool_name="commit",
+            tool_args_summary=text,
+            working_dir=wdir,
+            reason=text,
+        )
+        self.record_post_tool(
+            session_id=session_id,
+            tool_name="commit",
+            status="ok",
+            tool_args_summary=text,
+        )
+        after = self._user_git_head(wdir)
+        if before != after:
+            return {"ok": False, "error": "Refusing to continue: the project git HEAD changed."}
+        return {
+            "ok": True,
+            "snapshot_id": snap.get("id"),
+            "checkpoint_hash": snap.get("checkpoint_hash"),
+            "working_dir": wdir,
+            "message": text,
+            "user_git_head": after,
+        }
+
+    def set_snapshot_comment(self, snapshot_id: str, comment: str) -> Dict[str, Any]:
+        """Attach a human note to a snapshot. Does not write to the project repository."""
+        snap = self.get_snapshot(snapshot_id)
+        if not snap:
+            return {"ok": False, "error": f"Snapshot '{snapshot_id}' does not exist."}
+        text = (comment or "").strip()
+        if not text:
+            return {"ok": False, "error": "A comment is required. Usage: /tm comment <snapshot_id> <text>"}
+        text = text[:500]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO snapshot_comments (snapshot_id, comment, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                    comment = excluded.comment,
+                    updated_at = excluded.updated_at
+                """,
+                (snap["id"], text, time.time()),
+            )
+        return {"ok": True, "snapshot_id": snap["id"], "comment": text}
+
+    def clone_snapshot(
+        self,
+        snapshot_id: str,
+        destination: str,
+        *,
+        dry_run: bool = True,
+        user_approved: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Materialize a snapshot into a new directory.
+
+        This is not `git clone`. It refuses remotes, the session workspace, and any .git directory.
+        """
+        if _is_remote_git_spec(snapshot_id) or _is_remote_git_spec(destination or ""):
+            return {
+                "ok": False,
+                "error": "Time Machine clone copies a snapshot into a new folder. It does not run git clone.",
+            }
+        ok_snap, commit_hash, snap, err_snap = self._resolve_candidate_hash(snapshot_id)
+        if not ok_snap or not commit_hash:
+            return {"ok": False, "error": err_snap or f"Snapshot '{snapshot_id}' does not exist."}
+        workspace = (snap or {}).get("working_dir") or resolve_working_dir(None)
+        try:
+            dest = self._validate_clone_destination(destination, workspace)
+        except ValueError as exc:
+            return {"ok": False, "snapshot_id": snapshot_id, "error": str(exc)}
+        files = sorted(self._list_commit_paths(commit_hash))
+        if dry_run or not user_approved:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "snapshot_id": snap["id"] if snap else snapshot_id,
+                "checkpoint_hash": commit_hash,
+                "destination": str(dest),
+                "planned_files": files,
+                "message": "Dry run. No directory was created. Re-run /tm clone to write the folder.",
+            }
+        try:
+            self._extract_commit_to(commit_hash, dest)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "destination": str(dest)}
+        return {
+            "ok": True,
+            "dry_run": False,
+            "snapshot_id": snap["id"] if snap else snapshot_id,
+            "checkpoint_hash": commit_hash,
+            "destination": str(dest),
+            "files_written": len(files),
+            "user_git_head": self._user_git_head(workspace),
+        }
+
+    def push_checkpoint_bundle(
+        self,
+        destination: str,
+        *,
+        dry_run: bool = True,
+        user_approved: bool = False,
+    ) -> Dict[str, Any]:
+        """Write a private-store git bundle plus snapshot JSON. Never `git push`."""
+        if _is_remote_git_spec(destination or ""):
+            return {
+                "ok": False,
+                "error": "Time Machine push writes a .bundle file. It does not git push the project repository.",
+            }
+        try:
+            bundle = self._validate_bundle_path(destination)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        meta = bundle.with_suffix(".json")
+        if dry_run or not user_approved:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "bundle": str(bundle),
+                "metadata": str(meta),
+                "message": "Dry run. No bundle was written.",
+            }
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run(
+            ["git", f"--git-dir={self.store_dir}", "bundle", "create", str(bundle), "--all"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_minimal_git_env(),
+        )
+        if res.returncode != 0:
+            return {"ok": False, "error": (res.stderr or "git bundle create failed").strip()}
+        payload = self._export_checkpoint_payload()
+        meta.write_text(json.dumps(payload), encoding="utf-8")
+        return {"ok": True, "dry_run": False, "bundle": str(bundle), "metadata": str(meta), "snapshots": len(payload["snapshots"])}
+
+    def pull_checkpoint_bundle(
+        self,
+        source: str,
+        *,
+        dry_run: bool = True,
+        user_approved: bool = False,
+    ) -> Dict[str, Any]:
+        """Fetch a private checkpoint bundle into the private store. Never `git pull`."""
+        if _is_remote_git_spec(source or ""):
+            return {
+                "ok": False,
+                "error": "Time Machine pull reads a .bundle file. It does not git pull the project repository.",
+            }
+        try:
+            bundle = self._validate_bundle_path(source)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not bundle.is_file():
+            return {"ok": False, "error": f"Bundle not found: {bundle}"}
+        verify = subprocess.run(
+            ["git", f"--git-dir={self.store_dir}", "bundle", "verify", "--end-of-options", str(bundle)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_minimal_git_env(),
+        )
+        if verify.returncode != 0:
+            return {"ok": False, "error": (verify.stderr or "git bundle verify failed").strip()}
+        if dry_run or not user_approved:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "bundle": str(bundle),
+                "message": "Dry run. The private store was not changed.",
+            }
+        fetched = subprocess.run(
+            [
+                "git",
+                f"--git-dir={self.store_dir}",
+                "fetch",
+                "--end-of-options",
+                str(bundle),
+                "refs/time-machine/*:refs/tm-import/*",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_minimal_git_env(),
+        )
+        if fetched.returncode != 0:
+            return {"ok": False, "error": (fetched.stderr or "git fetch of bundle failed").strip()}
+        imported = self._import_checkpoint_payload(bundle.with_suffix(".json"))
+        return {"ok": True, "dry_run": False, "bundle": str(bundle), "imported_snapshots": imported}
+
+    def _user_git_head(self, working_dir: str) -> Optional[str]:
+        git_dir = Path(working_dir) / ".git"
+        if not git_dir.exists():
+            return None
+        res = subprocess.run(
+            ["git", "-C", working_dir, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_minimal_git_env(),
+        )
+        if res.returncode != 0:
+            return None
+        return (res.stdout or "").strip() or None
+
+    def _validate_clone_destination(self, destination: str, workspace: str) -> Path:
+        if not destination or not str(destination).strip():
+            raise ValueError("A destination directory is required. Usage: /tm clone <snapshot_id> <directory>")
+        dest = Path(destination).expanduser().resolve()
+        root = Path(workspace).expanduser().resolve()
+        if dest == root or root in dest.parents or dest in root.parents:
+            raise ValueError("Refusing to clone into the session workspace or one of its parents.")
+        if ".git" in dest.parts or dest.name == ".git":
+            raise ValueError("Refusing to write inside a .git directory.")
+        if (dest / ".git").exists():
+            raise ValueError("Refusing to clone into an existing git repository.")
+        if dest.exists() and any(dest.iterdir()):
+            raise ValueError("Destination already exists and is not empty.")
+        return dest
+
+    def _validate_bundle_path(self, destination: str) -> Path:
+        if not destination or not str(destination).strip():
+            raise ValueError("A .bundle path is required.")
+        path = Path(destination).expanduser().resolve()
+        if path.suffix != ".bundle":
+            raise ValueError("Bundle path must end with .bundle")
+        if ".git" in path.parts:
+            raise ValueError("Refusing to read or write inside a .git directory.")
+        return path
+
+    def _extract_commit_to(self, commit_hash: str, dest: Path) -> None:
+        import io
+        import tarfile
+
+        if not hasattr(tarfile, "data_filter"):
+            raise RuntimeError("tarfile.data_filter is required for safe extract")
+        archive_res = subprocess.run(
+            ["git", f"--git-dir={self.store_dir}", "archive", "--end-of-options", commit_hash],
+            capture_output=True,
+            timeout=30,
+            env=_minimal_git_env(),
+        )
+        if archive_res.returncode != 0:
+            raise RuntimeError(archive_res.stderr.decode("utf-8", "replace"))
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(archive_res.stdout)) as tf_archive:
+            tf_archive.extractall(path=dest, filter="data")
+
+    def _export_checkpoint_payload(self) -> Dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            snaps = [dict(row) for row in conn.execute("SELECT * FROM snapshots").fetchall()]
+            comments = [dict(row) for row in conn.execute("SELECT * FROM snapshot_comments").fetchall()]
+        return {"version": 1, "snapshots": snaps, "comments": comments}
+
+    def _import_checkpoint_payload(self, metadata: Path) -> int:
+        if not metadata.is_file():
+            return 0
+        try:
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        snaps = payload.get("snapshots") if isinstance(payload, dict) else None
+        comments = payload.get("comments") if isinstance(payload, dict) else None
+        imported = 0
+        with self._lock, self._connect() as conn:
+            for snap in snaps or []:
+                if not isinstance(snap, dict) or not snap.get("id"):
+                    continue
+                exists = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (snap["id"],)).fetchone()
+                if exists:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO snapshots (
+                        id, session_id, turn_id, tool_call_id, tool_name,
+                        tool_args_summary, working_dir, checkpoint_hash, post_checkpoint_hash,
+                        status, reason, files_changed, insertions, deletions, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snap.get("id"),
+                        snap.get("session_id") or "import",
+                        snap.get("turn_id"),
+                        snap.get("tool_call_id"),
+                        snap.get("tool_name") or "import",
+                        snap.get("tool_args_summary") or "",
+                        snap.get("working_dir") or "",
+                        snap.get("checkpoint_hash"),
+                        snap.get("post_checkpoint_hash"),
+                        snap.get("status") or "ok",
+                        snap.get("reason"),
+                        int(snap.get("files_changed") or 0),
+                        int(snap.get("insertions") or 0),
+                        int(snap.get("deletions") or 0),
+                        float(snap.get("created_at") or time.time()),
+                    ),
+                )
+                imported += 1
+            for comment in comments or []:
+                if not isinstance(comment, dict) or not comment.get("snapshot_id"):
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO snapshot_comments (snapshot_id, comment, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(snapshot_id) DO NOTHING
+                    """,
+                    (comment.get("snapshot_id"), comment.get("comment") or "", float(comment.get("updated_at") or time.time())),
+                )
+        return imported
+
