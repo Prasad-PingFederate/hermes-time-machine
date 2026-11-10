@@ -43,6 +43,27 @@ COMMAND_TOOLS = frozenset({
 
 MUTATING_TOOLS = FILE_MUTATING_TOOLS | COMMAND_TOOLS
 
+# Shared across TimeMachineLedger() instances created per hook/tool call.
+# Production register() builds a fresh ledger whenever ledger=None, so a
+# per-instance dict was discarded before time_machine_recover could read it.
+_GLOBAL_LAST_FAILED_COMMANDS: Dict[str, str] = {}
+
+# Default git exclude lines for the private bare store. Appended if missing;
+# never overwrite custom lines a user already added to info/exclude.
+_DEFAULT_GIT_EXCLUDES: Tuple[str, ...] = (
+    ".git/",
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "*.pem",
+    "*.key",
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    ".pytest_cache/",
+)
+
 SAFE_GIT_ENV_KEYS = frozenset({
     "PATH",
     "SYSTEMROOT",
@@ -228,7 +249,7 @@ class TimeMachineLedger:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.max_snapshots_per_session = max(10, int(max_snapshots_per_session or 100))
         self._lock = threading.Lock()
-        self._last_failed_commands: Dict[str, str] = {}
+        self._last_failed_commands = _GLOBAL_LAST_FAILED_COMMANDS
         self._ensure_store_dir()
         self._init_db()
         self._get_db = self._connect
@@ -285,6 +306,15 @@ class TimeMachineLedger:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_session ON snapshots(session_id, created_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tm_call_id ON snapshots(tool_call_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_failures (
+                    session_id TEXT PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def _ensure_store_dir(self) -> Path:
@@ -298,7 +328,65 @@ class TimeMachineLedger:
                 timeout=10,
                 env=_minimal_git_env(),
             )
+        self._ensure_default_excludes()
         return self.store_dir
+
+    def _ensure_default_excludes(self) -> None:
+        """Write default secret/bloat excludes without dropping custom user lines."""
+        exclude_path = self.store_dir / "info" / "exclude"
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        if exclude_path.exists():
+            try:
+                existing = exclude_path.read_text(encoding="utf-8")
+            except OSError:
+                existing = ""
+        present = set(existing.splitlines())
+        missing = [line for line in _DEFAULT_GIT_EXCLUDES if line not in present]
+        if not missing:
+            return
+        body = existing
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += "\n".join(missing) + "\n"
+        exclude_path.write_text(body, encoding="utf-8")
+
+    def remember_failed_command(self, session_id: str, command: str) -> None:
+        """Persist the last failed command for a session across processes and instances."""
+        cmd = (command or "").strip()
+        if not session_id or not cmd:
+            return
+        self._last_failed_commands[session_id] = cmd
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_failures (session_id, command, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    command = excluded.command,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, cmd, time.time()),
+            )
+
+    def _read_failed_command(self, session_id: str) -> str:
+        """Return the last failed command from memory, then the SQLite ledger."""
+        cached = self._last_failed_commands.get(session_id or "", "")
+        if cached:
+            return cached
+        if not session_id:
+            return ""
+        try:
+            with self._lock, self._connect() as conn:
+                row = conn.execute(
+                    "SELECT command FROM session_failures WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row and row["command"]:
+                    return str(row["command"])
+        except Exception:
+            return ""
+        return ""
 
     def _project_hash16(self, working_dir: str) -> str:
         abs_dir = str(Path(working_dir).expanduser().resolve())
@@ -455,9 +543,18 @@ class TimeMachineLedger:
         status: str = "ok",
         self_heal_candidate: bool = False,
         recommended_snapshot_id: Optional[str] = None,
+        tool_args_summary: Optional[str] = None,
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
-        now = time.time()
+        summary = tool_args_summary.strip() if isinstance(tool_args_summary, str) else None
+        if summary == "":
+            summary = None
+        if summary and tool_name in COMMAND_TOOLS and status == "error":
+            try:
+                self.remember_failed_command(session_id, summary)
+            except Exception as exc:
+                logger.debug("remember_failed_command error: %s", exc)
+
         with self._lock, self._connect() as conn:
             row = None
             if tool_call_id:
@@ -466,20 +563,32 @@ class TimeMachineLedger:
                     (tool_call_id,),
                 ).fetchone()
 
-            if not row and turn_id:
+            # Never attach a post-tool update to a different tool's snapshot.
+            # Prefer the still-pending pre-image for this tool, then the latest
+            # row of the same tool. If nothing matches (read-only tool when
+            # snapshot_on_every_tool is false), leave earlier snapshots alone.
+            if not row:
                 row = conn.execute(
-                    "SELECT id, working_dir, checkpoint_hash FROM snapshots WHERE session_id = ? AND turn_id = ? ORDER BY created_at DESC LIMIT 1",
-                    (session_id, turn_id),
+                    """
+                    SELECT id, working_dir, checkpoint_hash FROM snapshots
+                    WHERE session_id = ? AND tool_name = ? AND status = 'pending'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (session_id, tool_name),
                 ).fetchone()
 
             if not row:
                 row = conn.execute(
-                    "SELECT id, working_dir, checkpoint_hash FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
-                    (session_id,),
+                    """
+                    SELECT id, working_dir, checkpoint_hash FROM snapshots
+                    WHERE session_id = ? AND tool_name = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (session_id, tool_name),
                 ).fetchone()
 
             if not row:
-                return
+                return None
 
             snap_id = row["id"]
             wdir = row["working_dir"]
@@ -523,11 +632,12 @@ class TimeMachineLedger:
                     post_checkpoint_hash = COALESCE(?, post_checkpoint_hash),
                     status = ?,
                     duration_ms = ?,
-                    files_changed = ?,
-                    insertions = ?,
-                    deletions = ?,
+                    files_changed = CASE WHEN ? > 0 THEN ? ELSE files_changed END,
+                    insertions = CASE WHEN ? > 0 THEN ? ELSE insertions END,
+                    deletions = CASE WHEN ? > 0 THEN ? ELSE deletions END,
                     self_heal_candidate = ?,
-                    recommended_snapshot_id = ?
+                    recommended_snapshot_id = ?,
+                    tool_args_summary = COALESCE(?, tool_args_summary)
                 WHERE id = ?
                 """,
                 (
@@ -535,10 +645,14 @@ class TimeMachineLedger:
                     status,
                     duration_ms,
                     files_changed,
+                    files_changed,
                     insertions,
+                    insertions,
+                    deletions,
                     deletions,
                     1 if self_heal_candidate else 0,
                     recommended_snapshot_id,
+                    summary,
                     snap_id,
                 ),
             )
@@ -718,6 +832,134 @@ class TimeMachineLedger:
 
         return False, None, None, f"Snapshot '{candidate}' does not exist."
 
+    def _commit_trees_differ(self, left: str, right: str) -> bool:
+        """True when two commits in the private store have different trees."""
+        def _tree(rev: str) -> Optional[str]:
+            try:
+                res = subprocess.run(
+                    ["git", f"--git-dir={self.store_dir}", "rev-parse", "--verify", "--end-of-options", f"{rev}^{{tree}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=_minimal_git_env(),
+                )
+            except Exception:
+                return None
+            if res.returncode != 0:
+                return None
+            token = (res.stdout or "").strip()
+            if re.fullmatch(r"[0-9a-f]{7,64}", token):
+                return token
+            return None
+
+        left_tree = _tree(left)
+        right_tree = _tree(right)
+        if not left_tree or not right_tree:
+            return False
+        return left_tree != right_tree
+
+    def _list_commit_paths(self, commit_hash: str) -> set:
+        """List tracked paths in a private-store commit. Empty set on failure."""
+        if not commit_hash or not re.fullmatch(r"[0-9a-f]{7,64}", commit_hash):
+            return set()
+        try:
+            res = subprocess.run(
+                ["git", f"--git-dir={self.store_dir}", "ls-tree", "-r", "--name-only", "--end-of-options", commit_hash],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=_minimal_git_env(),
+            )
+        except Exception:
+            return set()
+        if res.returncode != 0:
+            return set()
+        return {line.strip().replace("\\", "/") for line in res.stdout.splitlines() if line.strip()}
+
+    def _session_start_baseline_paths(self, session_id: Optional[str], working_dir: str) -> set:
+        """Paths present in the earliest session_start commit for this workspace."""
+        if not session_id:
+            return set()
+        resolved = str(Path(working_dir).expanduser().resolve())
+        try:
+            with self._lock, self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT checkpoint_hash FROM snapshots
+                    WHERE session_id = ? AND tool_name = 'session_start' AND working_dir = ?
+                    ORDER BY created_at ASC LIMIT 1
+                    """,
+                    (session_id, resolved),
+                ).fetchone()
+        except Exception:
+            return set()
+        if not row:
+            return set()
+        return self._list_commit_paths(row["checkpoint_hash"] or "")
+
+    @staticmethod
+    def _is_default_excluded_rel(rel: str) -> bool:
+        """True for secret/bloat paths the bare store refuses to snapshot."""
+        import fnmatch
+
+        norm = rel.replace("\\", "/").lstrip("/")
+        if norm == ".env.example" or norm.endswith("/.env.example"):
+            return False
+        base = norm.split("/")[-1]
+        dir_names = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache"}
+        parts = norm.split("/")
+        if any(part in dir_names for part in parts):
+            return True
+        patterns = (".env", ".env.*", "*.pem", "*.key")
+        for pat in patterns:
+            if fnmatch.fnmatch(base, pat) or fnmatch.fnmatch(norm, pat):
+                return True
+        return False
+
+    def _collect_post_snapshot_strays(self, snap: Dict[str, Any], commit_hash: str, wdir: str) -> List[str]:
+        """
+        Files created after this snapshot that are not in commit_hash.
+
+        Never returns .git paths, secret/bloat excludes, or paths that already
+        existed in the session_start baseline commit (preexisting untracked
+        files that were part of that baseline tree stay on disk).
+        """
+        root = Path(wdir).expanduser().resolve()
+        if not root.is_dir() or not snap:
+            return []
+        snap_time = float(snap.get("created_at") or 0.0)
+        commit_paths = self._list_commit_paths(commit_hash)
+        baseline_paths = self._session_start_baseline_paths(snap.get("session_id"), str(root))
+        strays: List[str] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != ".git" and not d.startswith(".git")]
+            for name in filenames:
+                abs_path = Path(dirpath) / name
+                try:
+                    resolved = abs_path.resolve()
+                    rel = str(resolved.relative_to(root)).replace("\\", "/")
+                except Exception:
+                    continue
+                if not rel or rel == ".git" or rel.startswith(".git/") or "/.git/" in rel:
+                    continue
+                if rel in commit_paths or rel in baseline_paths:
+                    continue
+                if self._is_default_excluded_rel(rel):
+                    continue
+                try:
+                    validate_safe_path(str(root), rel)
+                except ValueError:
+                    continue
+                try:
+                    mtime = resolved.stat().st_mtime
+                except OSError:
+                    continue
+                # Only files that appeared or were rewritten after this snapshot.
+                if mtime < (snap_time - 0.5):
+                    continue
+                strays.append(rel)
+        return sorted(set(strays))
+
     def get_diff(
         self,
         snapshot_id: str,
@@ -742,7 +984,9 @@ class TimeMachineLedger:
 
         other_snap = None
         base_hash = None
+        right_hash = target_hash
         mode = "parent"
+        allow_show_fallback = False
 
         if compare_to_id == "WORKING_TREE":
             mode = "working_tree"
@@ -757,22 +1001,56 @@ class TimeMachineLedger:
                     "error": err_cmp or f"Invalid compare_to identifier '{compare_to_id}'.",
                 }
             mode = "arbitrary"
-        elif snap and snap.get("session_id"):
-            with self._lock, self._connect() as conn:
-                prev_row = conn.execute(
-                    """
-                    SELECT * FROM snapshots
-                    WHERE session_id = ? AND created_at < ? AND checkpoint_hash IS NOT NULL AND checkpoint_hash != ''
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    (snap["session_id"], snap["created_at"]),
-                ).fetchone()
+            # Explicit compare_to_id keeps the historical git-show fallback.
+            allow_show_fallback = True
+        else:
+            post_hash = snap.get("post_checkpoint_hash") if snap else None
+            pre_hash = (snap.get("checkpoint_hash") if snap else None) or target_hash
+            prev_row = None
+            if (
+                snap
+                and isinstance(post_hash, str)
+                and re.fullmatch(r"[0-9a-f]{7,64}", post_hash)
+                and isinstance(pre_hash, str)
+                and re.fullmatch(r"[0-9a-f]{7,64}", pre_hash)
+                and post_hash != pre_hash
+                and self._commit_trees_differ(pre_hash, post_hash)
+            ):
+                base_hash = pre_hash
+                right_hash = post_hash
+                mode = "turn_diff"
+            elif snap and snap.get("session_id"):
+                with self._lock, self._connect() as conn:
+                    prev_found = conn.execute(
+                        """
+                        SELECT * FROM snapshots
+                        WHERE session_id = ? AND created_at < ? AND checkpoint_hash IS NOT NULL AND checkpoint_hash != ''
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (snap["session_id"], snap["created_at"]),
+                    ).fetchone()
+                    if prev_found:
+                        prev_row = dict(prev_found)
                 if prev_row:
-                    prev_dict = dict(prev_row)
-                    p_hash = prev_dict.get("checkpoint_hash")
-                    if p_hash and re.fullmatch(r"[0-9a-f]{7,64}", p_hash):
+                    p_hash = prev_row.get("checkpoint_hash")
+                    snap_hash = snap.get("checkpoint_hash") or target_hash
+                    if (
+                        p_hash
+                        and re.fullmatch(r"[0-9a-f]{7,64}", p_hash)
+                        and p_hash != snap_hash
+                    ):
                         base_hash = p_hash
+                        right_hash = target_hash
                         mode = "parent_snapshot"
+                    else:
+                        mode = "parent_snapshot"
+                else:
+                    # No parent snapshot: show the commit itself, not an empty diff.
+                    mode = "initial"
+                    allow_show_fallback = True
+            else:
+                mode = "initial"
+                allow_show_fallback = True
 
         diff_text = ""
         store = self.store_dir
@@ -796,10 +1074,10 @@ class TimeMachineLedger:
                     diff_text = res.stdout.decode("utf-8", "replace")
             except Exception as exc:
                 logger.debug("working_tree diff error: %s", exc)
-        elif base_hash and base_hash != target_hash:
+        elif base_hash and right_hash and base_hash != right_hash:
             try:
                 res = subprocess.run(
-                    ["git", f"--git-dir={store}", "diff", "--end-of-options", base_hash, target_hash],
+                    ["git", f"--git-dir={store}", "diff", "--end-of-options", base_hash, right_hash],
                     capture_output=True,
                     timeout=15,
                     env=env,
@@ -809,7 +1087,10 @@ class TimeMachineLedger:
             except Exception as exc:
                 logger.debug("arbitrary diff error: %s", exc)
 
-        if not diff_text and mode != "working_tree":
+        # git show dumps the entire commit. Only use it when there is no parent
+        # snapshot to diff against, or when an explicit compare_to_id was given
+        # (historical behavior). A turn/parent diff that is empty must stay empty.
+        if not diff_text and allow_show_fallback and mode != "working_tree":
             try:
                 res = subprocess.run(
                     ["git", f"--git-dir={store}", "show", "--format=", "--end-of-options", target_hash],
@@ -826,10 +1107,19 @@ class TimeMachineLedger:
         tot_adds = sum(f["additions"] for f in files_structured)
         tot_dels = sum(f["deletions"] for f in files_structured)
 
+        if compare_to_id:
+            compare_label = compare_to_id
+        elif mode == "working_tree":
+            compare_label = "WORKING_TREE"
+        elif mode == "turn_diff":
+            compare_label = "turn_diff"
+        else:
+            compare_label = "parent"
+
         return {
             "ok": True,
             "snapshot_id": snap["id"] if snap else snapshot_id,
-            "compare_to_id": compare_to_id or ("WORKING_TREE" if mode == "working_tree" else "parent"),
+            "compare_to_id": compare_label,
             "checkpoint_hash": target_hash,
             "base_hash": base_hash,
             "working_dir": wdir,
@@ -939,13 +1229,18 @@ class TimeMachineLedger:
             }
 
         planned_restores = [vt[0] for vt in validated_targets] if validated_targets else ["(all files)"]
-        planned_unlinks = []
+        planned_unlinks: List[str] = []
 
-        # Identify files that did not exist in commit_hash (newly created files to unlink)
-        for rel_tf, abs_tf in validated_targets:
-            if not file_exists_in_commit(commit_hash, rel_tf, store):
-                if abs_tf.exists():
-                    planned_unlinks.append(rel_tf)
+        # Identify files that did not exist in commit_hash (newly created files to unlink).
+        # Full workspace restore also drops stray files created after this snapshot,
+        # but never .git, secret/bloat excludes, or baseline session_start paths.
+        if validated_targets:
+            for rel_tf, abs_tf in validated_targets:
+                if not file_exists_in_commit(commit_hash, rel_tf, store):
+                    if abs_tf.exists():
+                        planned_unlinks.append(rel_tf)
+        elif snap:
+            planned_unlinks = self._collect_post_snapshot_strays(snap, commit_hash, wdir)
 
         # DRY RUN MODE (Default): Return preview diff and instructions without touching disk
         if dry_run or not user_approved:
@@ -1038,6 +1333,20 @@ class TimeMachineLedger:
                     with tarfile.open(fileobj=io.BytesIO(archive_res.stdout)) as tf_archive:
                         tf_archive.extractall(path=wdir, filter="data")
                     restored_files.append("(all workspace files)")
+                    for rel in planned_unlinks:
+                        if not rel or ".git" in Path(rel).parts:
+                            continue
+                        try:
+                            abs_tf = validate_safe_path(wdir, rel)
+                        except ValueError as val_err:
+                            errors.append(str(val_err))
+                            continue
+                        if abs_tf.is_file():
+                            try:
+                                abs_tf.unlink()
+                                unlinked_files.append(rel)
+                            except OSError as rm_err:
+                                errors.append(f"Could not remove {rel}: {rm_err}")
                 else:
                     errors.append(f"Full archive extraction failed: {archive_res.stderr.decode('utf-8', 'replace')}")
             except Exception as a_exc:
@@ -1083,7 +1392,7 @@ class TimeMachineLedger:
         snaps = self.list_snapshots(session_id=sess, limit=50)
 
         err_msg = error_text or ""
-        last_failed_command = self._last_failed_commands.get(sess, "")
+        last_failed_command = self._read_failed_command(sess)
 
         for s in snaps:
             if s.get("status") == "error" or s.get("self_heal_candidate"):
@@ -1233,7 +1542,7 @@ class TimeMachineLedger:
 
         suggested_cmd = (
             diag.get("retry_command")
-            or self._last_failed_commands.get(session_id or "default", "")
+            or self._read_failed_command(session_id or "default")
         )
         if isinstance(suggested_cmd, str):
             s_str = suggested_cmd.strip()

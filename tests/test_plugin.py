@@ -1,5 +1,5 @@
 """
-Comprehensive Unit & Integration Test Suite for hermes-time-machine (v0.3.0).
+Comprehensive Unit & Integration Test Suite for hermes-time-machine (v0.4.0).
 Zero external test dependencies required — fully runnable with:
     python -m unittest discover -s tests -v
 AND:
@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1181,6 +1182,292 @@ new file mode 100644
             # 6. compare_to_id='WORKING_TREE' still works
             res_wt = self.ledger.get_diff(snapshot_id=real_id, compare_to_id="WORKING_TREE", working_dir=str(tmp))
             self.assertTrue(res_wt.get("ok"))
+
+    def test_recover_persists_failed_command_without_injected_ledger(self):
+        """Fresh TimeMachineLedger() instances must still know the last failed command."""
+        home = self.base_test_dir / "hermes_home_persist"
+        home.mkdir(parents=True, exist_ok=True)
+        old_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(home)
+        sess = "s_persist_failed_cmd"
+        try:
+            class MockCtx:
+                def __init__(self):
+                    self.tools = {}
+                    self.hooks = {}
+
+                def register_tool(self, name=None, toolset=None, schema=None, handler=None, description=None, **kwargs):
+                    self.tools[name] = handler
+
+                def register_hook(self, event, fn, **kwargs):
+                    self.hooks[event] = fn
+
+                def register_command(self, *args, **kwargs):
+                    return None
+
+                def register_system_prompt_section(self, *args, **kwargs):
+                    return None
+
+            ctx = MockCtx()
+            tm_plugin.register(ctx)  # ledger=None — a new ledger on every call
+            wdir = str(self.temp_dir)
+            ctx.hooks["on_session_start"](session_id=sess, working_dir=wdir)
+            ctx.hooks["pre_tool_call"](
+                tool_name="edit_file",
+                args={"path": "file_a.py"},
+                session_id=sess,
+                tool_call_id="call-edit",
+            )
+            ctx.hooks["post_tool_call"](
+                tool_name="edit_file",
+                args={"path": "file_a.py"},
+                session_id=sess,
+                tool_call_id="call-edit",
+                status="ok",
+            )
+            ctx.hooks["pre_tool_call"](
+                tool_name="terminal",
+                args={"command": "pytest -q"},
+                session_id=sess,
+                tool_call_id="call-term",
+            )
+            ctx.hooks["post_tool_call"](
+                tool_name="terminal",
+                args={"command": "pytest -q"},
+                session_id=sess,
+                tool_call_id="call-term",
+                status="error",
+            )
+
+            from ledger import TimeMachineLedger, _GLOBAL_LAST_FAILED_COMMANDS
+
+            self.assertEqual(_GLOBAL_LAST_FAILED_COMMANDS.get(sess), "pytest -q")
+            # Drop the in-process cache so recovery must read SQLite via a new ledger.
+            _GLOBAL_LAST_FAILED_COMMANDS.pop(sess, None)
+            fresh = TimeMachineLedger()
+            self.assertEqual(fresh._read_failed_command(sess), "pytest -q")
+
+            raw = ctx.tools["time_machine_recover"]({"session_id": sess}, session_id=sess)
+            res = json.loads(raw)
+            self.assertEqual(res.get("suggested_verify_command"), "pytest -q")
+        finally:
+            from ledger import _GLOBAL_LAST_FAILED_COMMANDS
+            _GLOBAL_LAST_FAILED_COMMANDS.pop(sess, None)
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
+
+    def test_post_tool_preserves_write_snapshot_stats(self):
+        """read_file and a failing terminal must not zero out the previous write_file diff."""
+        wdir = self.git_repo["dir"]
+        f1 = self.git_repo["f1"]
+
+        class MockCtx:
+            def register_tool(self, *a, **k):
+                return None
+
+            def register_hook(self, *a, **k):
+                return None
+
+            def register_command(self, *a, **k):
+                return None
+
+            def register_system_prompt_section(self, *a, **k):
+                return None
+
+        hooks = {}
+        ctx = MockCtx()
+        ctx.register_hook = lambda event, fn, **k: hooks.update({event: fn})
+        tm_plugin.register(ctx, ledger=self.ledger)
+
+        sess = "s_preserve_stats"
+        hooks["on_session_start"](session_id=sess, working_dir=str(wdir))
+        hooks["pre_tool_call"](
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            session_id=sess,
+            tool_call_id="w1",
+        )
+        f1.write_text("print('version 2 preserved stats')\n", encoding="utf-8")
+        hooks["post_tool_call"](
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            session_id=sess,
+            tool_call_id="w1",
+            status="ok",
+        )
+        hooks["pre_tool_call"](
+            tool_name="read_file",
+            args={"path": "file_a.py"},
+            session_id=sess,
+            tool_call_id="r1",
+        )
+        hooks["post_tool_call"](
+            tool_name="read_file",
+            args={"path": "file_a.py"},
+            session_id=sess,
+            tool_call_id="r1",
+            status="ok",
+        )
+        hooks["pre_tool_call"](
+            tool_name="terminal",
+            args={"command": "pytest -q"},
+            session_id=sess,
+            tool_call_id="t1",
+        )
+        hooks["post_tool_call"](
+            tool_name="terminal",
+            args={"command": "pytest -q"},
+            result={"exit_code": 1, "stderr": "FAILED"},
+            session_id=sess,
+            tool_call_id="t1",
+            status="error",
+        )
+
+        snaps = self.ledger.list_snapshots(session_id=sess, limit=20)
+        write_snaps = [s for s in snaps if s.get("tool_name") == "write_file"]
+        term_snaps = [s for s in snaps if s.get("tool_name") == "terminal"]
+        read_snaps = [s for s in snaps if s.get("tool_name") == "read_file"]
+        self.assertEqual(len(write_snaps), 1)
+        self.assertEqual(len(term_snaps), 1)
+        self.assertEqual(read_snaps, [])
+        self.assertGreater(write_snaps[0].get("files_changed") or 0, 0)
+        self.assertEqual(write_snaps[0].get("status"), "ok")
+        self.assertEqual(term_snaps[0].get("status"), "error")
+
+    def test_turn_diff_between_pre_and_post(self):
+        """Edits made between pre_tool and post_tool show up in get_diff and search."""
+        wdir = self.git_repo["dir"]
+        f1 = self.git_repo["f1"]
+        f1.write_text("print('version 1 A')\n", encoding="utf-8")
+        snap = self.ledger.record_pre_tool(
+            session_id="s_turn_diff",
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            working_dir=str(wdir),
+        )
+        f1.write_text("print('version 2 TURN_DIFF_MARKER')\n", encoding="utf-8")
+        self.ledger.record_post_tool(
+            session_id="s_turn_diff",
+            tool_name="write_file",
+            status="ok",
+        )
+
+        diff = self.ledger.get_diff(snap["id"], working_dir=str(wdir))
+        self.assertTrue(diff.get("ok"))
+        self.assertEqual(diff.get("mode"), "turn_diff")
+        self.assertIn("TURN_DIFF_MARKER", diff.get("diff") or "")
+        self.assertTrue(any(f.get("path") == "file_a.py" for f in diff.get("files") or []))
+
+        found = self.ledger.search_snapshots(
+            query="TURN_DIFF_MARKER",
+            session_id="s_turn_diff",
+            working_dir=str(wdir),
+        )
+        self.assertTrue(found.get("ok"))
+        self.assertGreaterEqual(found.get("total_matches") or 0, 1)
+        ids = [m.get("snapshot_id") for m in found.get("matches") or []]
+        self.assertIn(snap["id"], ids)
+
+    def test_full_workspace_restore_removes_only_new_strays(self):
+        """Full restore unlinks files created after the snapshot and keeps baseline files."""
+        wdir = self.git_repo["dir"]
+        notes = wdir / "notes.txt"
+        notes.write_text("keep me\n", encoding="utf-8")
+        envf = wdir / ".env"
+        envf.write_text("SECRET_KEY=preexisting\n", encoding="utf-8")
+        old = time.time() - 30
+        os.utime(notes, (old, old))
+        os.utime(envf, (old, old))
+
+        self.ledger.record_pre_tool(
+            session_id="s_full_stray",
+            tool_name="session_start",
+            working_dir=str(wdir),
+            reason="session_start",
+        )
+        snap = self.ledger.record_pre_tool(
+            session_id="s_full_stray",
+            tool_name="write_file",
+            args={"path": "file_a.py"},
+            working_dir=str(wdir),
+        )
+        stray = wdir / "stray_after.tmp"
+        stray.write_text("new junk\n", encoding="utf-8")
+        # Touch the secret AFTER the snapshot; it must still be kept.
+        os.utime(envf, None)
+
+        preview = self.ledger.restore_snapshot(
+            snapshot_id=snap["id"],
+            working_dir=str(wdir),
+            dry_run=True,
+            user_approved=False,
+        )
+        self.assertTrue(preview.get("ok"))
+        self.assertTrue(preview.get("dry_run"))
+        self.assertIn("stray_after.tmp", preview.get("planned_unlinked_files") or [])
+        self.assertNotIn("notes.txt", preview.get("planned_unlinked_files") or [])
+        self.assertNotIn(".env", preview.get("planned_unlinked_files") or [])
+        self.assertTrue(stray.exists())
+
+        res = self.ledger.restore_snapshot(
+            snapshot_id=snap["id"],
+            working_dir=str(wdir),
+            dry_run=False,
+            user_approved=True,
+        )
+        self.assertTrue(res.get("ok"), res)
+        self.assertFalse(stray.exists())
+        self.assertTrue(notes.exists())
+        self.assertEqual(notes.read_text(encoding="utf-8"), "keep me\n")
+        self.assertTrue(envf.exists())
+        self.assertIn("preexisting", envf.read_text(encoding="utf-8"))
+        self.assertIsNotNone(res.get("pre_restore_backup_id"))
+
+    def test_bare_store_excludes_dotenv_and_secrets_by_default(self):
+        """Untracked .env secrets stay out of the private bare store; examples do not."""
+        wdir = self.temp_dir
+        (wdir / ".env").write_text("SECRET_KEY=supersecret\n", encoding="utf-8")
+        (wdir / ".env.example").write_text("SECRET_KEY=changeme\n", encoding="utf-8")
+        (wdir / "app.py").write_text("print('hello')\n", encoding="utf-8")
+        (wdir / "node_modules").mkdir()
+        (wdir / "node_modules" / "leftpad.js").write_text("module.exports = 1;\n", encoding="utf-8")
+
+        snap = self.ledger.record_pre_tool(
+            session_id="s_exclude",
+            tool_name="write_file",
+            args={"path": "app.py"},
+            working_dir=str(wdir),
+        )
+        commit = snap.get("checkpoint_hash")
+        self.assertTrue(commit)
+
+        exclude_file = self.ledger.store_dir / "info" / "exclude"
+        self.assertTrue(exclude_file.exists())
+        exclude_text = exclude_file.read_text(encoding="utf-8")
+        self.assertIn(".env", exclude_text)
+        self.assertIn("!.env.example", exclude_text)
+
+        listed = subprocess.run(
+            ["git", f"--git-dir={self.ledger.store_dir}", "ls-tree", "-r", "--name-only", "--end-of-options", commit],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        names = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+        self.assertIn("app.py", names)
+        self.assertIn(".env.example", names)
+        self.assertNotIn(".env", names)
+        self.assertFalse(any(n == "node_modules/leftpad.js" or n.startswith("node_modules/") for n in names))
+
+        secret = subprocess.run(
+            ["git", f"--git-dir={self.ledger.store_dir}", "grep", "-I", "--full-name", "supersecret", commit],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(secret.returncode, 0)
+        self.assertNotIn("supersecret", secret.stdout)
 
 
 if __name__ == "__main__":

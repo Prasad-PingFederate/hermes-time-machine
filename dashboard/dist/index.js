@@ -66,6 +66,17 @@
     return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
   }
 
+  function fileChangeLabel(snap) {
+    var fileCount = snap.files_changed != null ? snap.files_changed : (snap.modified_files_count != null ? snap.modified_files_count : 0);
+    return fileCount + ' file(s) +' + (snap.insertions || 0) + '/-' + (snap.deletions || 0);
+  }
+
+  function diffUrl(id, mode) {
+    var base = API + '/snapshots/' + encodeURIComponent(id) + '/diff';
+    if (mode === 'working_tree') return base + '?compare_to=WORKING_TREE';
+    return base;
+  }
+
   function TimeMachineDashboard() {
     var statusState = useState(null);
     var status = statusState[0];
@@ -90,6 +101,22 @@
     var noticeState = useState(null);
     var notice = noticeState[0];
     var setNotice = noticeState[1];
+
+    var diffModeState = useState('turn');
+    var diffMode = diffModeState[0];
+    var setDiffMode = diffModeState[1];
+
+    var searchState = useState('');
+    var searchQuery = searchState[0];
+    var setSearchQuery = searchState[1];
+
+    var matchState = useState(null);
+    var matchIds = matchState[0];
+    var setMatchIds = matchState[1];
+
+    var planState = useState(null);
+    var restorePlan = planState[0];
+    var setRestorePlan = planState[1];
 
     var loadData = useCallback(function () {
       setLoading(true);
@@ -122,20 +149,103 @@
         setDiff(null);
         return;
       }
-      fetchJSON(API + '/snapshots/' + encodeURIComponent(selectedSnap.id) + '/diff')
+      fetchJSON(diffUrl(selectedSnap.id, diffMode))
         .then(function (res) {
           setDiff(res.diff || 'No filesystem differences recorded vs workspace.');
         })
         .catch(function () {
           setDiff('Diff unavailable.');
         });
-    }, [selectedSnap]);
+    }, [selectedSnap, diffMode]);
+
+    function onSearch(event) {
+      var q = event && event.target ? event.target.value : '';
+      setSearchQuery(q);
+      if (!q || !q.trim()) {
+        setMatchIds(null);
+        return;
+      }
+      fetchJSON(API + '/snapshots/search?q=' + encodeURIComponent(q.trim()))
+        .then(function (res) {
+          var ids = ((res && res.matches) || []).map(function (m) { return m.snapshot_id || m.id; }).filter(Boolean);
+          setMatchIds(ids);
+        })
+        .catch(function (err) {
+          setMatchIds([]);
+          setNotice({ kind: 'error', message: err.message || 'Search failed' });
+        });
+    }
+
+    function onPreview() {
+      if (!selectedSnap || !selectedSnap.id) return;
+      fetchJSON(API + '/snapshots/' + encodeURIComponent(selectedSnap.id) + '/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dry_run: true, user_approved: false })
+      }).then(function (res) {
+        var restored = (res.planned_restored_files || []).filter(function (f) { return f && f !== '(all files)'; });
+        var unlinked = (res.planned_unlinked_files || res.planned_deleted_stray_files || []).filter(Boolean);
+        setRestorePlan({
+          snapshotId: selectedSnap.id,
+          step: 'preview',
+          plannedRestored: restored,
+          plannedUnlinked: unlinked,
+          fullWorkspace: (res.planned_restored_files || []).indexOf('(all files)') !== -1,
+          selected: restored.concat(unlinked),
+          backupId: null
+        });
+        setNotice(null);
+      }).catch(function (err) {
+        setNotice({ kind: 'error', message: err.message || 'Preview restore failed' });
+      });
+    }
+
+    function toggleFile(file) {
+      if (!restorePlan) return;
+      var selected = restorePlan.selected.slice();
+      var idx = selected.indexOf(file);
+      if (idx === -1) selected.push(file);
+      else selected.splice(idx, 1);
+      setRestorePlan(Object.assign({}, restorePlan, { selected: selected }));
+    }
+
+    function onConfirm() {
+      if (!restorePlan || !restorePlan.snapshotId) return;
+      fetchJSON(API + '/snapshots/' + encodeURIComponent(restorePlan.snapshotId) + '/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          file_paths: restorePlan.selected || [],
+          dry_run: false,
+          user_approved: true
+        })
+      }).then(function (res) {
+        var backupId = res.pre_restore_backup_id || null;
+        setRestorePlan(Object.assign({}, restorePlan, { step: 'done', backupId: backupId }));
+        setNotice({
+          kind: 'info',
+          message: "Restored snapshot '" + restorePlan.snapshotId + "'. Safety backup: " + (backupId || 'n/a') + '.'
+        });
+        loadData();
+      }).catch(function (err) {
+        setNotice({ kind: 'error', message: err.message || 'Restore failed' });
+      });
+    }
+
+    var visible = matchIds == null
+      ? snapshots
+      : snapshots.filter(function (snap) { return matchIds.indexOf(snap.id) !== -1; });
+
+    var fileChoices = [];
+    if (restorePlan && restorePlan.step === 'preview') {
+      (restorePlan.plannedRestored || []).forEach(function (f) { fileChoices.push({ file: f, kind: 'restore' }); });
+      (restorePlan.plannedUnlinked || []).forEach(function (f) { fileChoices.push({ file: f, kind: 'unlink' }); });
+    }
 
     return React.createElement(
       'div',
       { className: 'space-y-6 p-6 max-w-6xl mx-auto' },
 
-      // Header Bar
       React.createElement(
         'div',
         { className: 'flex flex-wrap items-center justify-between gap-4 border-b border-border pb-4' },
@@ -152,11 +262,17 @@
         React.createElement(
           'div',
           { className: 'flex items-center gap-2' },
+          React.createElement('input', {
+            type: 'search',
+            placeholder: 'Search checkpoints',
+            value: searchQuery,
+            onChange: onSearch,
+            className: 'h-8 rounded-md border border-border bg-background px-2 text-xs'
+          }),
           React.createElement(Button, { onClick: loadData, disabled: loading }, loading ? 'Refreshing...' : 'Refresh')
         )
       ),
 
-      // Notice / Safety Banner
       notice &&
         React.createElement(
           'div',
@@ -170,7 +286,6 @@
           notice.message
         ),
 
-      // Stat Cards Grid
       React.createElement(
         'div',
         { className: 'grid grid-cols-2 sm:grid-cols-4 gap-4' },
@@ -214,12 +329,10 @@
         )
       ),
 
-      // Main Grid: Timeline + Diff
       React.createElement(
         'div',
         { className: 'grid grid-cols-1 md:grid-cols-2 gap-6' },
 
-        // Snapshot Timeline Card
         React.createElement(
           Card,
           null,
@@ -231,21 +344,23 @@
           React.createElement(
             CardContent,
             { className: 'space-y-2 max-h-[500px] overflow-y-auto pr-1' },
-            snapshots.length === 0 &&
+            visible.length === 0 &&
               React.createElement('div', { className: 'p-8 text-center text-muted-foreground text-sm' }, 'No checkpoints recorded yet.'),
-            snapshots.map(function (snap) {
+            visible.map(function (snap) {
               var isSelected = selectedSnap && selectedSnap.id === snap.id;
               var isAlert = snap.self_heal_candidate || snap.status === 'error';
+              var highlighted = matchIds != null && matchIds.indexOf(snap.id) !== -1;
               return React.createElement(
                 'div',
                 {
                   key: snap.id,
-                  onClick: function () { setSelectedSnap(snap); },
+                  onClick: function () { setSelectedSnap(snap); setRestorePlan(null); },
                   className:
                     'p-3 rounded-md border cursor-pointer transition-all ' +
                     (isSelected
                       ? 'border-primary bg-primary/10'
-                      : 'border-border/60 hover:border-border hover:bg-muted/50')
+                      : 'border-border/60 hover:border-border hover:bg-muted/50'),
+                  style: highlighted ? { boxShadow: 'inset 0 0 0 1px rgba(250, 204, 21, 0.8)' } : undefined
                 },
                 React.createElement(
                   'div',
@@ -259,41 +374,69 @@
                 ),
                 React.createElement(
                   'div',
-                  { className: 'mt-2 text-xs font-mono text-muted-foreground flex items-center justify-between' },
+                  { className: 'mt-2 text-xs font-mono text-muted-foreground flex items-center justify-between gap-2' },
                   React.createElement('span', { className: 'truncate max-w-[200px]', title: snap.id }, snap.id),
-                  snap.modified_files_count !== undefined &&
-                    React.createElement('span', null, snap.modified_files_count + ' file(s)')
+                  React.createElement('span', null, fileChangeLabel(snap))
                 )
               );
             })
           )
         ),
 
-        // Diff & Inspection Card
         React.createElement(
           Card,
           null,
           React.createElement(
             CardHeader,
-            { className: 'flex flex-row items-center justify-between pb-2' },
+            { className: 'flex flex-row items-center justify-between pb-2 gap-2' },
             React.createElement(CardTitle, null, selectedSnap ? 'Diff: ' + selectedSnap.id : 'Inspection'),
-            selectedSnap &&
-              React.createElement(
-                Button,
-                {
-                  onClick: function () {
-                    setNotice({
-                      kind: 'info',
-                      message: "To restore snapshot '" + selectedSnap.id + "', run '/tm restore " + selectedSnap.id + "' in chat or review the diff. Restorations require explicit user approval."
-                    });
-                  }
-                },
-                'Preview Restore'
-              )
+            selectedSnap && React.createElement(
+              'div',
+              { className: 'flex items-center gap-2' },
+              React.createElement(Button, {
+                onClick: function () { setDiffMode('turn'); },
+                className: diffMode === 'turn' ? 'bg-primary/20' : ''
+              }, 'Turn Diff'),
+              React.createElement(Button, {
+                onClick: function () { setDiffMode('working_tree'); },
+                className: diffMode === 'working_tree' ? 'bg-primary/20' : ''
+              }, 'Live Working Tree Drift'),
+              React.createElement(Button, { onClick: onPreview }, 'Preview Restore')
+            )
           ),
           React.createElement(
             CardContent,
             null,
+            restorePlan && restorePlan.step === 'preview' && React.createElement(
+              'div',
+              { className: 'mb-3 rounded-md border border-blue-500/30 bg-blue-500/5 p-3 space-y-2' },
+              React.createElement('div', { className: 'text-xs font-semibold' }, 'Step 1 — choose files, then confirm'),
+              restorePlan.fullWorkspace && React.createElement('div', { className: 'text-xs text-muted-foreground' }, 'Full workspace restore is available. Checked paths are restored surgically.'),
+              fileChoices.map(function (item) {
+                var checked = (restorePlan.selected || []).indexOf(item.file) !== -1;
+                return React.createElement(
+                  'label',
+                  { key: item.kind + ':' + item.file, className: 'flex items-center gap-2 text-xs font-mono' },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: checked,
+                    onChange: function () { toggleFile(item.file); }
+                  }),
+                  (item.kind === 'unlink' ? 'unlink ' : 'restore ') + item.file
+                );
+              }),
+              React.createElement(
+                'div',
+                { className: 'flex items-center gap-2 pt-1' },
+                React.createElement(Button, { onClick: onConfirm }, 'Confirm & Restore Selected Files'),
+                React.createElement(Button, { onClick: function () { setRestorePlan(null); } }, 'Cancel')
+              )
+            ),
+            restorePlan && restorePlan.step === 'done' && React.createElement(
+              'div',
+              { className: 'mb-3 text-xs text-emerald-500' },
+              'Safety backup ' + (restorePlan.backupId || 'recorded') + '.'
+            ),
             React.createElement(
               'pre',
               { className: 'p-3 rounded-md bg-muted font-mono text-xs overflow-auto max-h-[440px] whitespace-pre text-foreground/90' },
@@ -303,7 +446,6 @@
         )
       ),
 
-      // Footer Explanations
       React.createElement(
         'div',
         { className: 'p-4 rounded-md border border-border/40 text-xs text-muted-foreground space-y-1' },
@@ -311,7 +453,7 @@
         React.createElement('div', null, '• Use ', React.createElement('code', { className: 'font-mono text-foreground' }, '/tm list'), ' to view session snapshots.'),
         React.createElement('div', null, '• Use ', React.createElement('code', { className: 'font-mono text-foreground' }, '/tm restore <snapshot_id>'), ' to restore files after human review.'),
         React.createElement('div', null, '• Use ', React.createElement('code', { className: 'font-mono text-foreground' }, '/tm recover'), ' to diagnose test failures and generate recovery plans.'),
-        React.createElement('div', null, '• For conversation tree branching and rewind, use Hermes core ', React.createElement('code', { className: 'font-mono text-foreground' }, '/rewind'), ' and ', React.createElement('code', { className: 'font-mono text-foreground' }, '/branch'), '.')
+        React.createElement('div', null, '• Preview Restore stays a dry-run until Confirm & Restore Selected Files is clicked. v0.4.0')
       )
     );
   }

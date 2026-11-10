@@ -42,7 +42,7 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __plugin_name__ = "time-machine"
 
 _last_safe_snapshot: Dict[str, str] = {}
@@ -118,7 +118,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
     ) -> None:
         try:
             sess = session_id or task_id or "default"
-            should_snap = snapshot_on_every_tool or (tool_name in FILE_MUTATING_TOOLS)
+            should_snap = snapshot_on_every_tool or (tool_name in MUTATING_TOOLS)
             if should_snap:
                 if kwargs.get("working_dir"):
                     _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
@@ -176,14 +176,21 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
             self_heal = False
             rec_snap = None
             cur_ledger = _get_ledger()
+            cmd_str = ""
             if is_cmd_tool and has_error:
                 if kwargs.get("working_dir"):
                     _session_working_dirs[sess] = str(Path(kwargs["working_dir"]).expanduser().resolve())
                 wdir = kwargs.get("working_dir") or _get_session_cwd(ctx, sess)
-                cmd_str = ""
                 if args:
                     cmd_str = args.get("command") or args.get("cmd") or args.get("script") or ""
+                    if not isinstance(cmd_str, str):
+                        cmd_str = str(cmd_str)
                 cur_ledger._last_failed_commands[sess] = cmd_str
+                if cmd_str:
+                    try:
+                        cur_ledger.remember_failed_command(sess, cmd_str)
+                    except Exception as remember_exc:
+                        logger.debug("remember_failed_command error: %s", remember_exc)
                 diag = cur_ledger.diagnose_failure(session_id=sess, error_text=res_str, working_dir=wdir)
                 rec_snap = diag.get("recommended_snapshot_id") or _last_safe_snapshot.get(sess)
                 self_heal = bool(rec_snap)
@@ -197,6 +204,7 @@ def register(ctx: Any, ledger: Optional[TimeMachineLedger] = None) -> None:
                 status="error" if has_error else status,
                 self_heal_candidate=self_heal,
                 recommended_snapshot_id=rec_snap,
+                tool_args_summary=cmd_str if cmd_str else None,
             )
         except Exception as exc:
             logger.debug("hermes-time-machine post_tool_call error: %s", exc)

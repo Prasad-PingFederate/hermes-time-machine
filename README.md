@@ -4,7 +4,7 @@
 *Built for the Nous Research Hermes Agent Hackathon*
 
 [![Hermes Plugin Validate](https://img.shields.io/badge/hermes_plugin_validate-16%2F16_PASS-success.svg)](#official-hermes-admission-validator)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](plugin.yaml)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](plugin.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Prasad-PingFederate/hermes-time-machine/actions/workflows/ci.yml/badge.svg)](https://github.com/Prasad-PingFederate/hermes-time-machine/actions/workflows/ci.yml)
 
