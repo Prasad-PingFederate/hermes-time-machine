@@ -82,7 +82,7 @@ export function reducePaneState(state, action) {
           step: 'preview',
           plannedRestored: restored,
           plannedUnlinked: unlinked,
-          fullWorkspace: (action.plannedRestored || []).indexOf('(all files)') !== -1,
+          fullWorkspace: false,
           selected: restored.concat(unlinked),
           backupId: null,
         },

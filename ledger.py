@@ -2009,7 +2009,7 @@ class TimeMachineLedger:
             }
         bundle.parent.mkdir(parents=True, exist_ok=True)
         res = subprocess.run(
-            ["git", f"--git-dir={self.store_dir}", "bundle", "create", str(bundle), "--all"],
+            ["git", f"--git-dir={self.store_dir}", "bundle", "create", "--end-of-options", str(bundle), "--all"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -2076,19 +2076,26 @@ class TimeMachineLedger:
         return {"ok": True, "dry_run": False, "bundle": str(bundle), "imported_snapshots": imported}
 
     def _user_git_head(self, working_dir: str) -> Optional[str]:
+        """Read HEAD from the worktree files. Never invokes git on the project repository."""
         git_dir = Path(working_dir) / ".git"
-        if not git_dir.exists():
+        head_file = git_dir / "HEAD"
+        if not head_file.is_file():
             return None
-        res = subprocess.run(
-            ["git", "-C", working_dir, "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=_minimal_git_env(),
-        )
-        if res.returncode != 0:
+        try:
+            text = head_file.read_text(encoding="utf-8").strip()
+        except OSError:
             return None
-        return (res.stdout or "").strip() or None
+        if text.startswith("ref:"):
+            ref = text.split(":", 1)[1].strip()
+            if not ref or ref.startswith("/") or ".." in Path(ref).parts:
+                return text
+            ref_file = git_dir / ref
+            try:
+                if ref_file.is_file():
+                    return ref_file.read_text(encoding="utf-8").strip() or text
+            except OSError:
+                return text
+        return text or None
 
     def _validate_clone_destination(self, destination: str, workspace: str) -> Path:
         if not destination or not str(destination).strip():

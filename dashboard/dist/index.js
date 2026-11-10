@@ -190,7 +190,7 @@
           step: 'preview',
           plannedRestored: restored,
           plannedUnlinked: unlinked,
-          fullWorkspace: (res.planned_restored_files || []).indexOf('(all files)') !== -1,
+          fullWorkspace: false,
           selected: restored.concat(unlinked),
           backupId: null
         });

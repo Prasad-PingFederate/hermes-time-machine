@@ -37,8 +37,8 @@
    - Bare Git Store: `$HERMES_HOME/plugin-data/time-machine/store` (project refs at `refs/time-machine/{hash16}`)
    The plugin never touches or mutates `$HERMES_HOME/state.db` or core checkpoint directories.
 
-4. **Surgical Blob Extraction (No `git checkout -f`):**
-   Files are restored by extracting individual blobs directly from the plugin's private bare git store (`git --git-dir=... show <commit>:<file>`) and writing them surgically to the target file. It never detaches `HEAD` or runs `git checkout -f` in the user's workspace.
+4. **No git commands against the project repository:**
+   Snapshots, restore, commit, clone, push, and pull use only `git --git-dir=<plugin store>`. The plugin never runs `git commit`, `git checkout`, `git push`, `git pull`, or `git clone` in the user's repository. `.env`, `*.pem`, `*.key`, `node_modules`, and virtualenvs are left out of the private store. `.env.example` is kept.
 
 5. **Path Traversal & Boundary Safety:**
    All target files are strictly scoped to `ctx.session_cwd` and validated with `resolve()`. Paths traversing outside the workspace boundary are rejected.
@@ -86,7 +86,12 @@ hermes-time-machine/
 ### 2. User Slash Command (`/tm`)
 - `/tm` or `/tm list`: Display recent session snapshots in a clean table.
 - `/tm diff <snapshot_id>`: Show unified diff of a snapshot against workspace.
-- `/tm restore <snapshot_id> [files...]`: Explicitly approve and execute surgical file restore.
+- `/tm restore <snapshot_id> [--files f1,f2]`: Explicitly approve and execute a restore. Omit `--files` for a full workspace restore.
+- `/tm commit <message>`: Record a named checkpoint in the private store. This is not `git commit` and does not change the project repository.
+- `/tm comment <snapshot_id> <text>`: Attach a note to a snapshot in the private ledger.
+- `/tm clone <snapshot_id> <new-directory> [--dry-run]`: Copy that snapshot into a new folder. This is not `git clone`. It refuses remotes, the session workspace, and any `.git` directory.
+- `/tm push <file.bundle> [--dry-run]`: Write a private checkpoint bundle. This is not `git push`.
+- `/tm pull <file.bundle> [--dry-run]`: Import a bundle into the private store. This is not `git pull`.
 - `/tm recover`: Run self-healing diagnostic and display recommended recovery plan.
 - `/tm search <query>`: Search history for commits introducing specific lines or symbols.
 - `/tm export`: Export full session history formatted as Markdown.

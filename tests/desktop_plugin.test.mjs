@@ -180,8 +180,12 @@ test('desktop pane diff toggle and preview restore state transitions', async () 
   assert.equal(state.restore.snapshotId, 'snap-test-1');
   assert.deepEqual(state.restore.plannedRestored, ['file_a.py']);
   assert.deepEqual(state.restore.plannedUnlinked, ['stray_after.tmp']);
-  assert.ok(state.restore.fullWorkspace);
+  assert.equal(state.restore.fullWorkspace, false);
   assert.deepEqual(state.restore.selected, ['file_a.py', 'stray_after.tmp']);
+  state = reducePaneState(state, { type: 'toggle_full_workspace' });
+  assert.equal(state.restore.fullWorkspace, true);
+  state = reducePaneState(state, { type: 'toggle_full_workspace' });
+  assert.equal(state.restore.fullWorkspace, false);
 
   state = reducePaneState(state, { type: 'toggle_file', file: 'stray_after.tmp' });
   assert.deepEqual(state.restore.selected, ['file_a.py']);
